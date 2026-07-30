@@ -1,0 +1,263 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <link rel="icon" href="data:;base64,iVBORw0KGgo=">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Home | Search & Rescue Theory Software</title>
+  <link rel="stylesheet" href="styles.css" />
+  <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
+</head>
+<body data-page="home">
+  <div class="site-shell">
+    <header>
+      <div class="nav-wrap">
+        <div>
+          <div class="brand">Search & Rescue Theory Software</div>
+          <div class="file-badge">Current file: <span data-file-name>us-pill-data.json</span></div>
+        </div>
+                                                <nav>
+          <a href="home.html" id="nav-home" class="active" title="Home"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg></a>
+          <a href="index.html" id="nav-regions" class="" title="Regions"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="12 2 2 7 12 12 22 7 12 2"></polyline><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></a>
+          <a href="page2.html" id="nav-segments" class="" title="Segments"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 9l4 11h12l4-11-10-7z"></path></svg></a>
+          <a href="page3.html" id="nav-personnel" class="" title="Personnel"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg></a>
+          <a href="page4.html" id="nav-search-log" class="" title="Search Log"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" x2="3.01" y1="18" y2="18"></line></svg><div class="par-check-dot" id="par-check-dot"></div></a>
+          <a href="page5.html" id="nav-forms" class="" title="Forms"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg></a>
+          <a href="page6.html" id="nav-profile" class="" title="Incident"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></a>
+          <a href="page10.html" id="nav-maps" class="" title="Maps"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"></polygon><line x1="8" y1="2" x2="8" y2="18"></line><line x1="16" y1="6" x2="16" y2="22"></line></svg></a>
+          <a href="page7.html" id="nav-uploads" class="" title="Uploads"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></a>
+          <a href="page8.html?tab=manage" id="nav-users" class="" title="Users" style="display: none;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg></a>
+          <a href="#" id="profile-btn" class="profile-nav-btn "><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg></a>
+          <a href="settings.html" id="nav-settings" class="" title="Settings"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle;"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg></a><div class="notification-bell" id="notif-bell"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle;"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg><div class="notification-dot" id="notif-dot"></div></div>
+        </nav>
+      </div>
+    </header>
+
+    
+      <main>
+
+    
+        <section class="hero">
+          <div class="hero-columns">
+            <div class="hero-col-left">
+              <h1>Home</h1>
+              <p>All table data across the site is stored together as one exportable file. Export it anytime, rename it, import it back later, or reset to a blank file.</p>
+            </div>
+            <div class="hero-col-right" style="display: flex; justify-content: flex-end; align-items: center;">
+              <button id="print-search-file-btn" class="clear-btn" style="white-space: nowrap;">Search File Printout</button>
+            </div>
+          </div>
+        </section>
+
+      <section class="table-card home-card">
+        <div id="home-dashboard-view" class="dashboard-grid">
+          <!-- Row 1: Full Width -->
+          <div class="home-panel full-width">
+            <h2>Project Overview</h2>
+            <p style="color: var(--muted); font-size: 0.95rem; line-height: 1.5;">
+              Welcome to the Search & Rescue Theory Software dashboard. All table data across the site?including regions, segments, personnel rosters, and search logs?is stored within a single exportable JSON file. Use this dashboard to manage your project data, track operational statistics, and ensure data persistence.
+            </p>
+          </div>
+
+          <div class="home-panel full-width mobile-only">
+            <h2>Quick Navigation</h2>
+            <div class="mobile-quick-links" style="display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-top: 10px;">
+              <a href="index.html" class="clear-btn" style="text-align: center; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="12 2 2 7 12 12 22 7 12 2"></polyline><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+                Regions
+              </a>
+              <a href="page2.html" class="clear-btn" style="text-align: center; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 9l4 11h12l4-11-10-7z"></path></svg>
+                Segments
+              </a>
+              <a href="page3.html" class="clear-btn" style="text-align: center; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle></svg>
+                Personnel
+              </a>
+              <a href="page4.html" class="clear-btn" style="text-align: center; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line></svg>
+                Log
+              </a>
+              <a href="page5.html" class="clear-btn" style="text-align: center; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path></svg>
+                Forms
+              </a>
+              <a href="page10.html" class="clear-btn" style="text-align: center; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"></polygon></svg>
+                Maps
+              </a>
+              <a href="settings.html" class="clear-btn" style="text-align: center; text-decoration: none; display: flex; align-items: center; justify-content: center; gap: 8px;">
+                <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg>
+                Settings
+              </a>
+            </div>
+          </div>
+
+          <div class="home-panel" style="grid-row: span 2;">
+            <h2>File Actions & Stats</h2>
+            <div class="home-row" style="margin-bottom: 15px;">
+              <input id="bundle-file-name" class="pill-input" type="text" placeholder="us-pill-data.json" style="min-width: 150px; flex-grow: 1;" />
+              <button id="save-file-name" class="clear-btn" type="button">Save</button>
+              <button id="create-new-search-btn" class="clear-btn" type="button">New</button>
+              <button id="import-search-btn" class="clear-btn" type="button">Import</button>
+            </div>
+            <div id="home-status" style="margin-bottom: 15px; color: var(--accent); font-size: 0.85rem; min-height: 1.2em;"></div>
+            <input type="file" id="import-search-input" style="display: none;" accept=".json">
+
+            <div id="dashboard-stats" style="display: grid; grid-template-columns: 1fr; gap: 10px; color: var(--muted); font-size: 0.95rem;">
+              <div style="background: rgba(255,255,255,0.02); padding: 10px; border-radius: 999px; border: 1px solid var(--line);">Regions: <span id="stat-regions" style="color: var(--text); font-weight: bold; float: right;">0</span></div>
+              <div style="background: rgba(255,255,255,0.02); padding: 10px; border-radius: 999px; border: 1px solid var(--line);">Segments: <span id="stat-segments" style="color: var(--text); font-weight: bold; float: right;">0</span></div>
+              <div style="background: rgba(255,255,255,0.02); padding: 10px; border-radius: 999px; border: 1px solid var(--line);">Personnel: <span id="stat-personnel" style="color: var(--text); font-weight: bold; float: right;">0</span></div>
+              <div style="background: rgba(255,255,255,0.02); padding: 10px; border-radius: 999px; border: 1px solid var(--line);">Tasks Logged: <span id="stat-tasks" style="color: var(--text); font-weight: bold; float: right;">0</span></div>
+            </div>
+          </div>
+
+          <!-- Charts Column - Now side-by-side and tall -->
+          <div class="home-panel" style="grid-row: span 2; grid-column: span 2;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+                <h2 style="margin:0;">Operational Charts</h2>
+                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                    <div style="display: flex; align-items: center; gap: 4px;">
+                        <label style="font-size: 0.75rem; color: var(--muted);">Start:</label>
+                        <input type="datetime-local" id="chart-start-datetime" class="mini-pill" style="padding: 2px 8px;">
+                    </div>
+                    <div style="display: flex; align-items: center; gap: 4px;">
+                        <label style="font-size: 0.75rem; color: var(--muted);">End:</label>
+                        <input type="datetime-local" id="chart-end-datetime" class="mini-pill" style="padding: 2px 8px;">
+                    </div>
+                </div>
+            </div>
+
+              <div class="chart-stack-row">
+                <div style="flex: 1; display: flex; flex-direction: column;">
+                    <h2 style="font-size: 0.9rem; margin-bottom: 8px; color: var(--muted);">PSRc Sum Chart</h2>
+                    <div id="psrc-chart-container" style="flex: 1; background: rgba(0,0,0,0.1); border-radius: 24px; display: flex; align-items: flex-end; padding: 10px; gap: 2px; height: 100%;">
+                        <!-- SVG/Div Chart bars/lines will be injected here -->
+                    </div>
+                </div>
+                <div style="flex: 1; display: flex; flex-direction: column;">
+                    <h2 id="pos-chart-title" style="font-size: 0.9rem; margin-bottom: 8px; color: var(--muted);">POS Sum Chart</h2>
+                    <div id="activity-chart-container" style="flex: 1; background: rgba(0,0,0,0.1); border-radius: 24px; display: flex; align-items: flex-end; padding: 10px; gap: 2px; height: 100%;">
+                        <!-- SVG/Div Chart bars/lines will be injected here -->
+                    </div>
+                </div>
+            </div>
+          </div>
+
+
+
+          <!-- Row 4: Full Width Recent Activity -->
+          <div class="home-panel full-width">
+            <h2>Recent Activity</h2>
+            <div id="recent-logs" style="color: var(--muted); font-size: 0.95rem;">
+              <p>No recent activity logs.</p>
+            </div>
+          </div>
+
+          <div class="home-panel full-width">
+            <div style="display: flex; justify-content: space-between; align-items: center;">
+              <h2>Saved Search Files</h2>
+              <button id="backup-all-zip-btn" class="clear-btn" type="button" style="font-size: 0.8rem; padding: 5px 10px;">Backup All (ZIP)</button>
+            </div>
+            <div style="overflow-x: auto; margin-top: 15px;">
+              <table class="grid-table" style="width: 100%;">
+                <thead>
+                  <tr>
+                    <th style="text-align: left;">File Name</th>
+                    <th style="text-align: left;">Last Modified</th>
+                    <th style="text-align: left;">File Size</th>
+                    <th style="text-align: center;">Actions</th>
+                  </tr>
+                </thead>
+                <tbody id="saved-files-body">
+                  <tr><td colspan="4" style="text-align: center; color: var(--muted); padding: 20px;">No saved search files yet.</td></tr>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </div>
+
+        <div id="home-metrics-view" style="display: none;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 20px;">
+            <h2 style="margin:0;">Hourly Metrics - <span id="metrics-date-title"></span></h2>
+            <button id="back-to-dashboard-btn" class="mini-pill">Back to Dashboard</button>
+          </div>
+          <div style="overflow-x: auto;">
+            <table class="grid-table" style="min-width: 900px;">
+              <thead>
+                <tr>
+                  <th>Hour</th>
+                  <th>Searcher Spacing (ft)</th>
+                  <th>Coverage</th>
+                  <th>POD</th>
+                  <th>POS</th>
+                  <th>POC After</th>
+                  <th>PSR</th>
+                </tr>
+              </thead>
+              <tbody id="metrics-table-body">
+              </tbody>
+            </table>
+          </div>
+        </div>
+      </section>
+    </main>
+
+    <footer></footer>
+                    <nav class="bottom-nav">
+        <a href="home.html" class="active">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+          <span>Home</span>
+        </a>
+        <a href="index.html" class="">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><polyline points="12 2 2 7 12 12 22 7 12 2"></polyline><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+          <span>Regions</span>
+        </a>
+        <a href="page10.html" class="">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"></polygon><line x1="8" x2="8" y1="2" y2="18"></line><line x1="16" x2="16" y1="6" y2="22"></line></svg>
+          <span>Maps</span>
+        </a>
+        <a href="page5.html" class="">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>
+          <span>Forms</span>
+        </a>
+        <a href="more.html" class="">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle><circle cx="5" cy="12" r="1"></circle></svg>
+          <span>More</span>
+        </a>
+    </nav>
+  </div>
+  <script src="app.js"></script>
+
+    <div class="notification-sidebar" id="notif-sidebar">
+      <div class="notification-header">
+        <h2 style="margin:0;">Notifications</h2>
+        <button class="clear-btn" id="close-notif" style="padding: 5px 10px;">?</button>
+      </div>
+      <div class="notification-list" id="notif-list">
+        <!-- Notifications will be injected here -->
+      </div>
+    </div>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

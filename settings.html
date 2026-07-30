@@ -1,0 +1,261 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <link rel="icon" href="data:;base64,iVBORw0KGgo=">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Settings | Search & Rescue Theory Software</title>
+  <link rel="stylesheet" href="styles.css" />
+</head>
+<body data-page="settings">
+  <div class="site-shell">
+    <header>
+      <div class="nav-wrap">
+        <div>
+          <div class="brand">Search & Rescue Theory Software</div>
+          <div class="file-badge">Current file: <span data-file-name>us-pill-data.json</span></div>
+        </div>
+                                                <nav>
+          <a href="home.html" id="nav-home" class="" title="Home"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg></a>
+          <a href="index.html" id="nav-regions" class="" title="Regions"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="12 2 2 7 12 12 22 7 12 2"></polyline><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg></a>
+          <a href="page2.html" id="nav-segments" class="" title="Segments"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2L2 9l4 11h12l4-11-10-7z"></path></svg></a>
+          <a href="page3.html" id="nav-personnel" class="" title="Personnel"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg></a>
+          <a href="page4.html" id="nav-search-log" class="" title="Search Log"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"></line><line x1="8" y1="12" x2="21" y2="12"></line><line x1="8" y1="18" x2="21" y2="18"></line><line x1="3" y1="6" x2="3.01" y2="6"></line><line x1="3" y1="12" x2="3.01" y2="12"></line><line x1="3" x2="3.01" y1="18" y2="18"></line></svg><div class="par-check-dot" id="par-check-dot"></div></a>
+          <a href="page5.html" id="nav-forms" class="" title="Forms"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg></a>
+          <a href="page6.html" id="nav-profile" class="" title="Incident"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="11" cy="11" r="8"></circle><line x1="21" y1="21" x2="16.65" y2="16.65"></line></svg></a>
+          <a href="page10.html" id="nav-maps" class="" title="Maps"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"></polygon><line x1="8" y1="2" x2="8" y2="18"></line><line x1="16" y1="6" x2="16" y2="22"></line></svg></a>
+          <a href="page7.html" id="nav-uploads" class="" title="Uploads"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle;"><path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path><polyline points="17 8 12 3 7 8"></polyline><line x1="12" y1="3" x2="12" y2="15"></line></svg></a>
+          <a href="page8.html?tab=manage" id="nav-users" class="" title="Users" style="display: none;"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg></a>
+          <a href="#" id="profile-btn" class="profile-nav-btn "><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg></a>
+          <a href="settings.html" id="nav-settings" class="active" title="Settings"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle;"><circle cx="12" cy="12" r="3"></circle><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1 0 2.83 2 2 0 0 1-2.83 0l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-2 2 2 2 0 0 1-2-2v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83 0 2 2 0 0 1 0-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1-2-2 2 2 0 0 1 2-2h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 0-2.83 2 2 0 0 1 2.83 0l.06.06a1.65 1.65 0 0 0 1.82.33H9a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 2-2 2 2 0 0 1 2 2v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 0 2 2 0 0 1 0 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82V9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 2 2 2 2 0 0 1-2 2h-.09a1.65 1.65 0 0 0-1.51 1z"></path></svg></a><div class="notification-bell" id="notif-bell"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="vertical-align: middle;"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg><div class="notification-dot" id="notif-dot"></div></div>
+        </nav>
+      </div>
+    </header>
+
+    
+      <main>
+
+    
+        <section class="hero">
+        <h1>Settings</h1>
+        <p>Configure global application behavior. Settings are saved automatically as part of your data file.</p>
+      </section>
+
+      <section class="table-card home-card">
+        <div class="home-grid">
+          <div class="home-panel">
+            <h2>Delete Mode</h2>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              When ON, rows are deleted immediately. When OFF, you will be asked for confirmation.
+            </p>
+            <div class="home-row">
+              <label class="toggle-switch">
+                <input type="checkbox" id="delete-mode-toggle">
+                <span class="slider"></span>
+              </label>
+              <span id="delete-mode-label">Delete Mode is OFF</span>
+            </div>
+          </div>
+
+          <div class="home-panel">
+            <h2>Background Image</h2>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              Choose a new background image for the application. The image is stored within your data file.
+            </p>
+            <div class="home-actions">
+              <label class="clear-btn upload-btn">
+                <span>Choose Image</span>
+                <input type="file" id="bg-image-input" accept="image/*">
+              </label>
+              <button class="clear-btn" id="reset-bg-btn" type="button">Use Default</button>
+            </div>
+          </div>
+
+          <div class="home-panel">
+            <h2>Theme</h2>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              Switch between Dark Mode and Grey Mode.
+            </p>
+            <div class="home-row">
+              <label class="toggle-switch">
+                <input type="checkbox" id="theme-toggle">
+                <span class="slider"></span>
+              </label>
+              <span id="theme-label">Dark Mode</span>
+            </div>
+          </div>
+
+          <div class="home-panel">
+            <h2>Tips Display</h2>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              When ON, informational text tips are displayed throughout the site. When OFF, they are hidden.
+            </p>
+            <div class="home-row">
+              <label class="toggle-switch">
+                <input type="checkbox" id="tips-toggle">
+                <span class="slider"></span>
+              </label>
+              <span id="tips-label">Tips are ON</span>
+            </div>
+          </div>
+
+          <div class="home-panel">
+            <h2>Par Check Frequency</h2>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              Set the reminder frequency for Par Checks in minutes. Default is 20 minutes.
+            </p>
+            <div class="home-row">
+              <input type="number" id="par-freq-input" class="pill-cell" style="width: 80px; text-align: center;" min="1" step="1">
+              <span id="par-freq-label" style="margin-left: 10px;">minutes</span>
+            </div>
+          </div>
+
+          <div class="home-panel full-width">
+            <h2>Segment Color Scale</h2>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              Control how segment colors are calculated on the map overlays. Segments always use their current PSRc for
+              color placement, while this toggle decides whether the scale tops out at the highest PSRc or the highest
+              PSRi from the Segments page.
+            </p>
+            <div class="home-row" style="margin-bottom: 15px;">
+              <label class="toggle-switch">
+                <input id="segment-scale-max-toggle" type="checkbox">
+                <span class="slider"></span>
+              </label>
+              <span id="segment-scale-max-label">Scale max uses highest PSRc</span>
+            </div>
+            <div class="home-row" style="flex-wrap: wrap; gap: 16px; align-items: flex-end; margin-bottom: 15px;">
+              <label style="display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem;">
+                <span>Low Color (0)</span>
+                <input id="segment-scale-low-color-input" type="color" value="#40c057">
+              </label>
+              <label style="display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem;">
+                <span>Mid Color (50%)</span>
+                <input id="segment-scale-mid-color-input" type="color" value="#ffd43b">
+              </label>
+              <label style="display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem;">
+                <span>High Color (100%)</span>
+                <input id="segment-scale-high-color-input" type="color" value="#fa5252">
+              </label>
+            </div>
+            <div class="home-row" style="flex-wrap: wrap; gap: 12px; align-items: center;">
+              <label for="segment-search-opacity-input">Opacity of Segments Activly Being Searched</label>
+              <input class="pill-cell no-spinner-number-input" id="segment-search-opacity-input" inputmode="numeric"
+                     max="100"
+                     min="0" step="1" style="width: 90px; text-align: center;" type="number" value="50">
+              <span id="segment-search-opacity-label">%</span>
+            </div>
+          </div>
+
+          <div class="home-panel full-width">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+              <h2 style="margin: 0;">CalTopo Proxy Settings</h2>
+              <div id="proxy-status-container"
+                   style="font-size: 0.9rem; display: flex; align-items: center; gap: 8px; background: rgba(0,0,0,0.05); padding: 5px 12px; border-radius: 20px;">
+                <span id="proxy-status-dot"
+                      style="width: 10px; height: 10px; border-radius: 50%; background: #ccc;"></span>
+                <span id="proxy-status-text">Checking...</span>
+              </div>
+              <button class="clear-btn" id="start-walkthrough-btn"
+                      style="background: var(--accent); color: white; border: none;">Help Me Setup
+              </button>
+            </div>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+                CalTopo Team API requests should be signed by your proxy, not sent browser-direct to CalTopo.
+                Enter the Web Proxy URL below (e.g.,
+              <code>https://sarwebtheory2-production.up.railway.app/api/proxy</code>).
+            </p>
+            <div class="home-row">
+              <input class="pill-input" id="caltopo-proxy-input"
+                     placeholder="e.g., https://sarwebtheory2-production.up.railway.app/api/proxy" style="flex-grow: 1;"
+                       type="text">
+              <button id="save-proxy-btn" class="clear-btn" type="button">Save Proxy Settings</button>
+              <button class="clear-btn" id="test-proxy-btn" style="margin-left: 10px; border-color: var(--accent); color: var(--accent);"
+                      type="button">Test Connection
+              </button>
+            </div>
+          </div>
+
+          <div class="home-panel full-width">
+            <h2>Data Synchronization</h2>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              Enter your Sync Server URL (from Railway) and a unique Bucket ID to synchronize data across devices.
+              Phones and computers must use the <b>same</b> Server and Bucket ID to talk to each other.
+            </p>
+            <div class="home-row" style="flex-wrap: wrap; gap: 10px;">
+              <input class="pill-input" id="sync-url-input" placeholder="Sync Server URL (e.g., https://my-sync-server.railway.app)" style="flex: 1; min-width: 250px;"
+                     type="text">
+              <input class="pill-input" id="sync-bucket-input" placeholder="Bucket ID (e.g., my-private-bucket)" style="flex: 1; min-width: 200px;"
+                     type="text">
+              <button class="clear-btn" id="save-sync-url-btn" style="white-space: nowrap;" type="button">Save Sync
+                Settings
+              </button>
+            </div>
+            <div id="sync-status-msg" style="margin-top: 10px; font-size: 0.85rem; color: var(--accent);"></div>
+          </div>
+        </div>
+
+        <div class="status" id="settings-status">Ready.</div>
+      </section>
+    </main>
+
+    <footer></footer>
+                    <nav class="bottom-nav">
+        <a href="home.html" class="">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg>
+          <span>Home</span>
+        </a>
+        <a href="index.html" class="">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><polyline points="12 2 2 7 12 12 22 7 12 2"></polyline><polyline points="2 17 12 22 22 17"></polyline><polyline points="2 12 12 17 22 12"></polyline></svg>
+          <span>Regions</span>
+        </a>
+        <a href="page10.html" class="">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><polygon points="1 6 1 22 8 18 16 22 23 18 23 2 16 6 8 2 1 6"></polygon><line x1="8" x2="8" y1="2" y2="18"></line><line x1="16" x2="16" y1="6" y2="22"></line></svg>
+          <span>Maps</span>
+        </a>
+        <a href="page5.html" class="">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><path d="M16 4h2a2 2 0 0 1 2 2v14a2 2 0 0 1-2 2H6a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2h2"></path><rect x="8" y="2" width="8" height="4" rx="1" ry="1"></rect></svg>
+          <span>Forms</span>
+        </a>
+        <a href="more.html" class="">
+          <svg fill="none" stroke="currentColor" stroke-linecap="round" stroke-linejoin="round" stroke-width="2" viewBox="0 0 24 24"><circle cx="12" cy="12" r="1"></circle><circle cx="19" cy="12" r="1"></circle><circle cx="5" cy="12" r="1"></circle></svg>
+          <span>More</span>
+        </a>
+    </nav>
+  </div>
+  <script src="map-segment-utils.js"></script>
+  <script src="app.js"></script>
+
+    <div class="notification-sidebar" id="notif-sidebar">
+      <div class="notification-header">
+        <h2 style="margin:0;">Notifications</h2>
+        <button class="clear-btn" id="close-notif" style="padding: 5px 10px;">?</button>
+      </div>
+      <div class="notification-list" id="notif-list">
+        <!-- Notifications will be injected here -->
+      </div>
+    </div>
+</body>
+</html>
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

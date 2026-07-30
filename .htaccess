@@ -1,0 +1,10 @@
+# .htaccess - Route requests to proxy.php for PHP environments
+RewriteEngine On
+
+# Ensure api/proxy and fetch-map point to proxy.php
+RewriteRule ^api/proxy$ proxy.php [L,QSA]
+RewriteRule ^api/health$ proxy.php?health=1 [L,QSA]
+RewriteRule ^fetch-map$ proxy.php [L,QSA]
+
+# Prevent directory listing
+Options -Indexes

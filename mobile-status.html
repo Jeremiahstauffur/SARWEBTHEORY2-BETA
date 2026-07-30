@@ -1,0 +1,278 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <link rel="icon" href="data:;base64,iVBORw0KGgo=">
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Mobile Status Update | Search & Rescue Theory Software</title>
+  <link rel="stylesheet" href="styles.css" />
+  <style>
+    .mobile-status-container {
+      padding: 15px;
+      display: flex;
+      flex-direction: column;
+      gap: 20px;
+    }
+    .member-select-wrapper {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .member-select-wrapper label {
+      font-weight: 800;
+      font-size: 0.75rem;
+      color: var(--muted);
+      text-transform: uppercase;
+      margin-left: 2px;
+    }
+    #member-dropdown {
+      appearance: none;
+      background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='24' height='24' viewBox='0 0 24 24' fill='none' stroke='%237dc6ff' stroke-width='2' stroke-linecap='round' stroke-linejoin='round'%3E%3Cpolyline points='6 9 12 15 18 9'%3E%3C/polyline%3E%3C/svg%3E");
+      background-repeat: no-repeat;
+      background-position: right 12px center;
+      background-size: 18px;
+      padding-right: 40px;
+    }
+    #member-dropdown option {
+      background: var(--popup-bg);
+      color: var(--text);
+    }
+    .status-list {
+      display: flex;
+      flex-direction: column;
+      gap: 12px;
+    }
+    .status-item {
+      background: rgba(255, 255, 255, 0.05);
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 12px;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+    .status-item-header {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+    }
+    .status-time-pill {
+      font-size: 0.8rem;
+      background: var(--pill-bg);
+      padding: 4px 8px;
+      border-radius: 6px;
+      border: 1px solid var(--line);
+    }
+    .status-action-text {
+      font-size: 0.95rem;
+    }
+    .edit-btn {
+      font-size: 0.8rem;
+      color: var(--accent);
+      background: none;
+      border: none;
+      padding: 4px;
+      cursor: pointer;
+    }
+  </style>
+</head>
+<body data-page="mobile-status">
+  <div class="site-shell">
+    <header>
+      <div class="nav-wrap">
+        <div>
+          <div class="brand">Status Update</div>
+        </div>
+        <nav>
+          <a href="home.html" id="nav-home" class="" title="Home"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg></a>
+          <a href="page3.html" id="nav-personnel" class="" title="Personnel"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"></path><circle cx="9" cy="7" r="4"></circle><path d="M23 21v-2a4 4 0 0 0-3-3.87"></path><path d="M16 3.13a4 4 0 0 1 0 7.75"></path></svg></a>
+        </nav>
+      </div>
+    </header>
+
+    <main>
+      <section class="hero">
+        <h1>Mobile Status</h1>
+        <p>Update your status and view history.</p>
+      </section>
+
+      <div class="mobile-status-container">
+        <div class="member-select-wrapper">
+          <label for="member-dropdown">Select Member</label>
+          <select id="member-dropdown" class="form-input" style="width: 100%; height: 45px; border-radius: 10px;">
+            <option value="">-- Choose Name --</option>
+          </select>
+        </div>
+
+        <div id="status-history-container">
+          <h2 style="font-size: 1rem; margin-bottom: 10px; color: var(--muted); text-transform: uppercase;">Incident Times</h2>
+          <div id="incident-times-container" class="incident-times-container">
+            <div style="text-align: center; opacity: 0.5; padding: 20px;">Select a member to view incident times</div>
+          </div>
+        </div>
+
+        <div id="activity-history-container" style="margin-top: 20px;">
+          <h2 style="font-size: 1rem; margin-bottom: 10px; color: var(--muted); text-transform: uppercase;">Recent History</h2>
+          <div id="status-list" class="status-list">
+            <div style="text-align: center; opacity: 0.5; padding: 20px;">Select a member to view history</div>
+          </div>
+        </div>
+      </div>
+    </main>
+  </div>
+
+  <script src="app.js"></script>
+  <script>
+    // Local script for mobile-status page logic
+    document.addEventListener('DOMContentLoaded', () => {
+      const dropdown = document.getElementById('member-dropdown');
+      const statusList = document.getElementById('status-list');
+
+      // 1. Populate dropdown
+      const bundle = loadBundle();
+      const personnel = bundle.pages.page3 || [];
+      const memberNames = personnel.map(row => row[0]).filter(n => n).sort();
+
+      memberNames.forEach(name => {
+        const opt = document.createElement('option');
+        opt.value = name;
+        opt.textContent = name;
+        dropdown.appendChild(opt);
+      });
+
+      // Select preselected member or current user by default if they are in the list
+      const preselected = sessionStorage.getItem('mobile-status-member');
+      if (preselected) {
+        let match = memberNames.find(n => n === preselected);
+        if (match) {
+          dropdown.value = match;
+          sessionStorage.removeItem('mobile-status-member');
+          renderIncidentTimes(match);
+          renderHistory(match);
+        }
+      } else {
+        const currentUser = getCurrentUser();
+        if (currentUser) {
+          const fullName = (currentUser.firstName + ' ' + (currentUser.lastName || '')).trim();
+          let match = memberNames.find(n => n === fullName || n === currentUser.handle);
+          if (match) {
+            dropdown.value = match;
+            renderIncidentTimes(match);
+            renderHistory(match);
+          }
+        }
+      }
+
+      // 2. Handle selection change
+      dropdown.onchange = () => {
+        const selectedMember = dropdown.value;
+        if (selectedMember) {
+          renderIncidentTimes(selectedMember);
+          renderHistory(selectedMember);
+        } else {
+          document.getElementById('incident-times-container').innerHTML = '<div style="text-align: center; opacity: 0.5; padding: 20px;">Select a member to view incident times</div>';
+          statusList.innerHTML = '<div style="text-align: center; opacity: 0.5; padding: 20px;">Select a member to view history</div>';
+        }
+      };
+
+      function renderIncidentTimes(memberName) {
+        const container = document.getElementById('incident-times-container');
+        if (typeof renderMemberIncidentCards === 'function') {
+            renderMemberIncidentCards(memberName, container);
+        } else {
+            container.innerHTML = '<div style="text-align: center; color: #eb5757;">Error: renderMemberIncidentCards not found in app.js</div>';
+        }
+      }
+
+      function renderHistory(memberName) {
+        const b = loadBundle();
+        const logs = b.activityLog || [];
+        const statusKeywords = ['Enroute', 'On-Scene', 'Hotel', 'Returning Home', 'Arrived Home', 'Off Duty', 'on scene', 'enroute', 'home', 'returning home', 'arrived home', 'off duty', 'status changed', 'time set', 'time updated', 'time cleared'];
+        
+        const filtered = logs.filter(log => {
+          if (!log.members) return false;
+          const members = log.members.split(', ').map(m => m.replace('*', '').trim());
+          if (!members.includes(memberName)) return false;
+          const actionLower = log.action.toLowerCase();
+          return statusKeywords.some(keyword => actionLower.includes(keyword.toLowerCase()));
+        });
+
+        statusList.innerHTML = '';
+        if (filtered.length === 0) {
+          statusList.innerHTML = '<div style="text-align: center; opacity: 0.5; padding: 20px;">No status records found</div>';
+          return;
+        }
+
+        filtered.reverse().forEach(entry => {
+          const item = document.createElement('div');
+          item.className = 'status-item';
+          const header = document.createElement('div');
+          header.className = 'status-item-header';
+          const timePill = document.createElement('div');
+          timePill.className = 'status-time-pill';
+          timePill.textContent = `${entry.date} ${entry.time}`;
+          header.appendChild(timePill);
+          const editBtn = document.createElement('button');
+          editBtn.className = 'edit-btn';
+          editBtn.textContent = 'Edit';
+          editBtn.onclick = () => showFullEditPopup(entry, memberName);
+          header.appendChild(editBtn);
+          item.appendChild(header);
+          const actionText = document.createElement('div');
+          actionText.className = 'status-action-text';
+          actionText.textContent = entry.action;
+          item.appendChild(actionText);
+          statusList.appendChild(item);
+        });
+      }
+
+      function showFullEditPopup(entry, memberName) {
+        const popup = createPopup('Edit Status Post');
+        const content = popup.querySelector('.popup-content');
+        const btnContainer = popup.querySelector('.popup-buttons');
+        const fields = document.createElement('div');
+        fields.style.display = 'flex';
+        fields.style.flexDirection = 'column';
+        fields.style.gap = '15px';
+        fields.style.marginBottom = '20px';
+        const dateRow = document.createElement('div');
+        dateRow.style.display = 'flex';
+        dateRow.style.gap = '10px';
+        const dateInput = document.createElement('input');
+        dateInput.className = 'form-input';
+        dateInput.value = entry.date;
+        setupAutoFormatDate(dateInput);
+        dateRow.appendChild(dateInput);
+        const timeInput = document.createElement('input');
+        timeInput.className = 'form-input';
+        timeInput.value = entry.time;
+        setupAutoFormatTime(timeInput);
+        dateRow.appendChild(timeInput);
+        fields.appendChild(dateRow);
+        const actionInput = document.createElement('textarea');
+        actionInput.className = 'form-input';
+        actionInput.style.height = '80px';
+        actionInput.value = entry.action;
+        fields.appendChild(actionInput);
+        content.insertBefore(fields, btnContainer);
+        const saveBtn = document.createElement('button');
+        saveBtn.className = 'popup-btn primary';
+        saveBtn.textContent = 'Save Changes';
+        saveBtn.onclick = () => {
+          const b = loadBundle();
+          const idx = b.activityLog.findIndex(l => l.id === entry.id || (l.timestamp === entry.timestamp && l.action === entry.action));
+          if (idx > -1) {
+            b.activityLog[idx].date = dateInput.value;
+            b.activityLog[idx].time = timeInput.value;
+            b.activityLog[idx].action = actionInput.value;
+            saveBundle(b);
+            renderHistory(memberName);
+          }
+          popup.remove();
+        };
+        btnContainer.appendChild(saveBtn);
+      }
+    });
+  </script>
+</body>
+</html>
