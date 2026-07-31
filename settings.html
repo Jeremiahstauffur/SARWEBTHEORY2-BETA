@@ -179,8 +179,8 @@
           <div class="home-panel full-width">
             <h2>Data Synchronization</h2>
             <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
-              Your data is stored on the sync server under your login. Enter your Sync Server URL (from Railway) below.
-              You sign in with a username and password; the username identifies your own private data.
+              Enter your Sync Server URL (from Railway) to synchronize data across devices.
+              All devices logged in with the same username will share data automatically.
             </p>
             <div class="home-row" style="flex-wrap: wrap; gap: 10px;">
               <input class="pill-input" id="sync-url-input" placeholder="Sync Server URL (e.g., https://my-sync-server.railway.app)" style="flex: 1; min-width: 250px;"
@@ -188,10 +188,9 @@
               <button class="clear-btn" id="save-sync-url-btn" style="white-space: nowrap;" type="button">Save Sync
                 Settings
               </button>
-            </div>
-            <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 15px;">
-              <span style="color: var(--muted); font-size: 0.95rem;">Logged in as <b id="current-account-name">&mdash;</b></span>
-              <button class="clear-btn" id="settings-logout-btn" type="button" style="border-color: rgba(235, 87, 87, 0.4); color: #fa5252;">Log Out</button>
+              <button class="clear-btn" id="test-sync-btn" style="margin-left: 10px; border-color: var(--accent); color: var(--accent);"
+                      type="button">Test Connection
+              </button>
             </div>
             <div id="sync-status-msg" style="margin-top: 10px; font-size: 0.85rem; color: var(--accent);"></div>
           </div>

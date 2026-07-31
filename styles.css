@@ -223,8 +223,28 @@ button {
     border-spacing: 0 !important;
   }
 
+  /* Keep the header row visible in the wrapped layout so the per-column
+     show/hide toggles (and rename/delete controls) stay inside the header cells. */
   .force-mobile-layout .grid-table thead {
-    display: none !important;
+    display: block !important;
+  }
+
+  .force-mobile-layout .grid-table thead tr {
+    background: rgba(125, 198, 255, 0.08) !important;
+  }
+
+  .force-mobile-layout .grid-table th {
+    display: block !important;
+    width: auto !important;
+    /* Header pills are a bit wider than data pills so the name + toggle + delete fit. */
+    flex: 1 1 calc(20% - 8px) !important;
+    min-width: 130px !important;
+    padding: 0 !important;
+    align-self: center !important;
+  }
+
+  .force-mobile-layout .grid-table th.fixed-header {
+    font-size: 0.8rem !important;
   }
 
   .force-mobile-layout .grid-table tr {
@@ -243,13 +263,25 @@ button {
   .force-mobile-layout .grid-table td.regions-td {
     display: block !important;
     width: auto !important;
-    flex: 1 1 150px !important;
+    /* ~10 pill cells per row before wrapping to the next line. */
+    flex: 1 1 calc(10% - 8px) !important;
     padding: 0 !important;
-    min-width: 120px;
+    min-width: 70px !important;
   }
 
   .force-mobile-layout .grid-table .pill-cell {
     width: 100% !important;
+    /* Smaller pill buttons to match the tighter multi-column layout. */
+    min-height: 34px !important;
+    padding: 7px 12px !important;
+    font-size: 0.85rem !important;
+  }
+
+  .force-mobile-layout .grid-table .header-pill {
+    width: 100% !important;
+    min-height: 34px !important;
+    padding: 7px 52px 7px 12px !important;
+    font-size: 0.85rem !important;
   }
 
   .force-mobile-layout .grid-table td.regions-td[data-label]::before {
@@ -262,6 +294,25 @@ button {
     text-transform: uppercase !important;
     font-weight: 700 !important;
   }
+
+/* Regions page: compact pill styling on headers and data cells so up to
+   10 columns fit in the normal table before switching to the wrapped grid. */
+body[data-page="index"] .grid-table {
+  border-spacing: 8px 8px;
+}
+
+body[data-page="index"] .grid-table .pill-cell {
+  min-height: 34px;
+  padding: 6px 12px;
+  font-size: 0.85rem;
+}
+
+body[data-page="index"] .grid-table .header-pill {
+  min-height: 34px;
+  padding-top: 6px;
+  padding-bottom: 6px;
+  font-size: 0.85rem;
+}
 
 .grid-table th {
   text-align: left;
@@ -3130,4 +3181,34 @@ tr.log-sweeps-due::after {
   font-size: 0.9rem;
   font-weight: 600;
   color: var(--muted);
+}
+
+
+/* Regions page (mobile): keep the header row visible so the per-column
+   show/hide toggles stay inside the header cells even when the grid wraps. */
+@media (max-width: 768px) {
+  body[data-page="index"] .grid-table thead {
+    display: block;
+  }
+
+  body[data-page="index"] .grid-table thead tr {
+    background: rgba(125, 198, 255, 0.08);
+  }
+
+  body[data-page="index"] .grid-table th {
+    display: block;
+    width: auto;
+    flex: 1 1 calc(50% - 8px);
+    min-width: 140px;
+    padding: 0;
+    align-self: center;
+  }
+
+  body[data-page="index"] .grid-table .header-pill {
+    width: 100%;
+    min-height: 34px;
+    padding-top: 7px;
+    padding-bottom: 7px;
+    font-size: 0.85rem;
+  }
 }

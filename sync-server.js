@@ -4,6 +4,7 @@ const express = require('express');
 const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
+const mysql = require('mysql2');
 
 const createCredentialHelperFallback = () => {
     const serverEnvironmentState = {
@@ -214,441 +215,227 @@ if (!fs.existsSync(DATA_DIR)) {
     fs.mkdirSync(DATA_DIR);
 }
 
-app.use(cors({
-    origin: '*',
-    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Name', 'X-User-Pin', 'X-Last-Modified']
-}));
-app.use(express.json({limit: '50mb'}));
-
-// ===========================================================================
-// MySQL persistence layer (username/password accounts + fully-normalized
-// per-user data storage). The bucket in the sync API === the account username,
-// and the X-User-Pin header === that account's access code (password).
-// ===========================================================================
-const mysql = require('mysql2/promise');
-
-const SUPER_ADMIN_USERNAME = 'SuperAdmin';
-const SUPER_ADMIN_ACCESS_CODE = '1976';
-
-let dbPool = null;
-
-const buildMysqlPoolOptions = () => {
-    const baseOptions = {
+// Initialize Database (MySQL on Railway)
+//
+// The frontend uses a small sqlite-style callback API (db.run/db.get/db.all).
+// To keep every endpoint below unchanged we back that API with a MySQL
+// connection pool (mysql2). Connection settings come from the Railway MySQL
+// service environment variables (MYSQL_URL / MYSQLHOST / MYSQLUSER / ...).
+const buildMysqlPool = () => {
+    const commonOptions = {
         waitForConnections: true,
         connectionLimit: 10,
+        queueLimit: 0,
+        enableKeepAlive: true,
         charset: 'utf8mb4'
     };
 
-    const connectionString = getTrimmedString(
-        process.env.MYSQL_URL || process.env.DATABASE_URL || process.env.MYSQL_PUBLIC_URL || ''
-    );
-    if (connectionString) {
-        return {uri: connectionString, ...baseOptions};
-    }
+    // Prefer a full connection URL when Railway provides one. Inside Railway's
+    // private network use MYSQL_URL; MYSQL_PUBLIC_URL works from anywhere.
+    const connectionUrl = (process.env.MYSQL_URL
+        || process.env.MYSQL_PUBLIC_URL
+        || process.env.DATABASE_URL
+        || '').trim();
 
-    const host = getTrimmedString(process.env.MYSQLHOST || process.env.MYSQL_HOST || '');
-    const user = getTrimmedString(process.env.MYSQLUSER || process.env.MYSQL_USER || '');
-    const database = getTrimmedString(process.env.MYSQLDATABASE || process.env.MYSQL_DATABASE || '');
-    if (host && user && database) {
-        return {
-            host,
-            user,
-            database,
-            password: process.env.MYSQLPASSWORD || process.env.MYSQL_PASSWORD || '',
-            port: Number(process.env.MYSQLPORT || process.env.MYSQL_PORT || 3306),
-            ...baseOptions
-        };
-    }
-
-    return null;
-};
-
-const createSchema = async () => {
-    const statements = [
-        `CREATE TABLE IF NOT EXISTS users (
-            username VARCHAR(190) NOT NULL PRIMARY KEY,
-            access_code VARCHAR(190) NOT NULL,
-            is_super_admin TINYINT(1) NOT NULL DEFAULT 0,
-            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-        `CREATE TABLE IF NOT EXISTS user_files (
-            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            username VARCHAR(190) NOT NULL,
-            file_key VARCHAR(190) NOT NULL,
-            file_name VARCHAR(255) NULL,
-            data_json LONGTEXT NOT NULL,
-            updated_by VARCHAR(190) NULL,
-            is_super_admin TINYINT(1) NOT NULL DEFAULT 0,
-            last_modified DATETIME NULL,
-            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-            UNIQUE KEY uniq_user_file (username, file_key),
-            KEY idx_user (username)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-        `CREATE TABLE IF NOT EXISTS column_headers (
-            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            username VARCHAR(190) NOT NULL,
-            file_name VARCHAR(255) NOT NULL,
-            page_key VARCHAR(64) NOT NULL,
-            col_index INT NOT NULL,
-            label TEXT NULL,
-            UNIQUE KEY uniq_header (username, file_name, page_key, col_index)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-        `CREATE TABLE IF NOT EXISTS data_cells (
-            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            username VARCHAR(190) NOT NULL,
-            file_name VARCHAR(255) NOT NULL,
-            page_key VARCHAR(64) NOT NULL,
-            row_index INT NOT NULL,
-            col_index INT NOT NULL,
-            col_key VARCHAR(190) NULL,
-            value LONGTEXT NULL,
-            updated_by VARCHAR(190) NULL,
-            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            KEY idx_cells_file (username, file_name, page_key)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-        `CREATE TABLE IF NOT EXISTS settings (
-            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            username VARCHAR(190) NOT NULL,
-            file_name VARCHAR(255) NOT NULL,
-            setting_key VARCHAR(190) NOT NULL,
-            value LONGTEXT NULL,
-            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE KEY uniq_setting (username, file_name, setting_key)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-        `CREATE TABLE IF NOT EXISTS profile_fields (
-            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            username VARCHAR(190) NOT NULL,
-            file_name VARCHAR(255) NOT NULL,
-            field_key VARCHAR(190) NOT NULL,
-            value LONGTEXT NULL,
-            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE KEY uniq_profile (username, file_name, field_key)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
-        `CREATE TABLE IF NOT EXISTS form_fields (
-            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
-            username VARCHAR(190) NOT NULL,
-            file_name VARCHAR(255) NOT NULL,
-            task_num VARCHAR(190) NOT NULL,
-            field_key VARCHAR(190) NOT NULL,
-            value LONGTEXT NULL,
-            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-            UNIQUE KEY uniq_form (username, file_name, task_num, field_key)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
-    ];
-
-    for (const statement of statements) {
-        await dbPool.query(statement);
-    }
-};
-
-const seedSuperAdmin = async () => {
-    await dbPool.query(
-        'INSERT INTO users (username, access_code, is_super_admin) VALUES (?, ?, 1) ON DUPLICATE KEY UPDATE access_code = VALUES(access_code), is_super_admin = 1',
-        [SUPER_ADMIN_USERNAME, SUPER_ADMIN_ACCESS_CODE]
-    );
-};
-
-const initDatabase = async () => {
-    const options = buildMysqlPoolOptions();
-    if (!options) {
-        console.warn('[DB] No MySQL configuration found. Set MYSQL_URL (or MYSQLHOST/MYSQLUSER/MYSQLPASSWORD/MYSQLDATABASE). Login and data storage will be unavailable until configured.');
-        return;
-    }
-
-    dbPool = mysql.createPool(options);
-
-    const connection = await dbPool.getConnection();
-    try {
-        await connection.query('SELECT 1');
-    } finally {
-        connection.release();
-    }
-
-    await createSchema();
-    await seedSuperAdmin();
-    console.log(`[DB] MySQL connected. Schema ready and "${SUPER_ADMIN_USERNAME}" account ensured.`);
-};
-
-// --- Persistence helpers ---------------------------------------------------
-const dbUnavailable = (res) => {
-    res.status(503).json({
-        error: 'Database not configured',
-        message: 'The sync server is not connected to MySQL. Set MYSQL_URL and restart the server.'
-    });
-};
-
-const getUserRow = async (username) => {
-    const [rows] = await dbPool.query(
-        'SELECT username, access_code, is_super_admin FROM users WHERE username = ? LIMIT 1',
-        [username]
-    );
-    return rows && rows.length ? rows[0] : null;
-};
-
-// Verify the request may access a bucket. The bucket === the account username;
-// the requester must present that account's access code via X-User-Pin.
-const authenticateBucket = async (req, res) => {
-    const bucket = req.params.bucket;
-    const providedCode = req.headers['x-user-pin'] != null ? String(req.headers['x-user-pin']) : '';
-    const user = await getUserRow(bucket);
-    if (!user) {
-        res.status(404).json({error: 'Unknown account', message: `No account named "${bucket}".`});
-        return null;
-    }
-    if (String(user.access_code) !== providedCode) {
-        res.status(403).json({error: 'Forbidden', message: 'Invalid access code for this account.'});
-        return null;
-    }
-    return {bucket, isSuperAdmin: !!user.is_super_admin};
-};
-
-const requireSuperAdmin = async (req, res) => {
-    const username = getTrimmedString(req.headers['x-user-name']);
-    const code = req.headers['x-user-pin'] != null ? String(req.headers['x-user-pin']) : '';
-    const user = await getUserRow(username);
-    if (!user || !user.is_super_admin || String(user.access_code) !== code) {
-        res.status(403).json({error: 'Forbidden', message: 'Super-Admin credentials are required for this action.'});
-        return false;
-    }
-    return true;
-};
-
-const deriveFileName = (key, body) => {
-    if (body && typeof body === 'object' && !Array.isArray(body) && body.fileName) {
-        return String(body.fileName);
-    }
-    return String(key);
-};
-
-const computeIncomingLastModified = (req) => {
-    if (req.headers['x-last-modified']) {
-        const headerTime = new Date(req.headers['x-last-modified']).getTime();
-        if (!Number.isNaN(headerTime)) return headerTime;
-    }
-    const body = req.body;
-    if (body && typeof body === 'object') {
-        if (body.lastModified) {
-            const bodyTime = new Date(body.lastModified).getTime();
-            if (!Number.isNaN(bodyTime)) return bodyTime;
-        }
-        let maxTime = 0;
-        let found = false;
-        for (const key of Object.keys(body)) {
-            const entry = body[key];
-            if (entry && entry.lastModified) {
-                const entryTime = new Date(entry.lastModified).getTime();
-                if (!Number.isNaN(entryTime) && entryTime > maxTime) {
-                    maxTime = entryTime;
-                    found = true;
-                }
-            }
-        }
-        if (found) return maxTime;
-    }
-    return Date.now();
-};
-
-const toCellString = (value) => {
-    if (value === null || value === undefined) return '';
-    if (typeof value === 'object') return JSON.stringify(value);
-    return String(value);
-};
-
-// Flatten a form object into [path, value] pairs, e.g. teamMembers[0].name.
-const flattenFormValue = (prefix, value, out) => {
-    if (value === null || value === undefined) {
-        if (prefix) out.push([prefix, '']);
-    } else if (Array.isArray(value)) {
-        if (value.length === 0) {
-            if (prefix) out.push([prefix, '[]']);
-        } else {
-            value.forEach((item, index) => flattenFormValue(`${prefix}[${index}]`, item, out));
-        }
-    } else if (typeof value === 'object') {
-        const keys = Object.keys(value);
-        if (keys.length === 0) {
-            if (prefix) out.push([prefix, '{}']);
-        } else {
-            keys.forEach((key) => flattenFormValue(prefix ? `${prefix}.${key}` : key, value[key], out));
-        }
-    } else {
-        out.push([prefix || 'value', String(value)]);
-    }
-};
-
-// Project a single file's bundle into the normalized tables. This is a
-// derived view for organized querying; the authoritative copy lives in
-// user_files.data_json, so a projection error never loses data.
-const decomposeBundle = async (username, fileName, bundle, updatedBy) => {
-    if (!bundle || typeof bundle !== 'object') return;
-    const fname = String(fileName || 'bundle').slice(0, 255);
-
-    const cellRows = [];
-    const headerRows = [];
-    const settingRows = [];
-    const profileRows = [];
-    const formRows = [];
-
-    const pages = bundle.pages && typeof bundle.pages === 'object' ? bundle.pages : {};
-    for (const [pageKey, pageData] of Object.entries(pages)) {
-        const pk = String(pageKey).slice(0, 64);
-        if (pageData && !Array.isArray(pageData) && Array.isArray(pageData.rows)) {
-            // Regions-style page: { headers, rows, voterVisibility }
-            const headers = Array.isArray(pageData.headers) ? pageData.headers : [];
-            headers.forEach((header, colIndex) => {
-                headerRows.push([username, fname, pk, colIndex, toCellString(header)]);
-            });
-            pageData.rows.forEach((row, rowIndex) => {
-                const cols = Array.isArray(row) ? row : [row];
-                cols.forEach((cellValue, colIndex) => {
-                    const colKey = (headers[colIndex] != null ? toCellString(headers[colIndex]) : `col_${colIndex}`).slice(0, 190);
-                    cellRows.push([username, fname, pk, rowIndex, colIndex, colKey, toCellString(cellValue), updatedBy]);
-                });
-            });
-            if (Array.isArray(pageData.voterVisibility)) {
-                settingRows.push([username, fname, `${pk}.voterVisibility`.slice(0, 190), JSON.stringify(pageData.voterVisibility)]);
-            }
-        } else if (Array.isArray(pageData)) {
-            // Standard page: array of row-arrays
-            pageData.forEach((row, rowIndex) => {
-                const cols = Array.isArray(row) ? row : [row];
-                cols.forEach((cellValue, colIndex) => {
-                    cellRows.push([username, fname, pk, rowIndex, colIndex, `col_${colIndex}`, toCellString(cellValue), updatedBy]);
-                });
-            });
-        }
-    }
-
-    const scalarSettingKeys = [
-        'fileName', 'lastModified', 'deleteMode', 'theme', 'showTips', 'background',
-        'parCheckFrequency', 'segmentColorScaleUsePsriMax', 'segmentColorScaleLowColor',
-        'segmentColorScaleMidColor', 'segmentColorScaleHighColor', 'segmentActiveSearchOpacityPercent'
-    ];
-    scalarSettingKeys.forEach((settingKey) => {
-        if (bundle[settingKey] !== undefined) {
-            settingRows.push([username, fname, settingKey, toCellString(bundle[settingKey])]);
-        }
-    });
-
-    if (bundle.profile && typeof bundle.profile === 'object') {
-        Object.entries(bundle.profile).forEach(([fieldKey, value]) => {
-            profileRows.push([username, fname, String(fieldKey).slice(0, 190), toCellString(value)]);
+    if (/^mysql:\/\//i.test(connectionUrl)) {
+        const parsed = new URL(connectionUrl);
+        return mysql.createPool({
+            host: decodeURIComponent(parsed.hostname),
+            port: parsed.port ? Number(parsed.port) : 3306,
+            user: decodeURIComponent(parsed.username || 'root'),
+            password: decodeURIComponent(parsed.password || ''),
+            database: decodeURIComponent((parsed.pathname || '').replace(/^\//, '')) || 'railway',
+            ...commonOptions
         });
     }
 
-    if (bundle.forms && typeof bundle.forms === 'object') {
-        Object.entries(bundle.forms).forEach(([taskNum, form]) => {
-            const pairs = [];
-            flattenFormValue('', form, pairs);
-            pairs.forEach(([fieldKey, value]) => {
-                formRows.push([username, fname, String(taskNum).slice(0, 190), String(fieldKey || 'value').slice(0, 190), value]);
-            });
-        });
-    }
-
-    const connection = await dbPool.getConnection();
-    try {
-        await connection.beginTransaction();
-        await connection.query('DELETE FROM data_cells WHERE username = ? AND file_name = ?', [username, fname]);
-        await connection.query('DELETE FROM column_headers WHERE username = ? AND file_name = ?', [username, fname]);
-        await connection.query('DELETE FROM settings WHERE username = ? AND file_name = ?', [username, fname]);
-        await connection.query('DELETE FROM profile_fields WHERE username = ? AND file_name = ?', [username, fname]);
-        await connection.query('DELETE FROM form_fields WHERE username = ? AND file_name = ?', [username, fname]);
-
-        if (headerRows.length) await connection.query('INSERT INTO column_headers (username, file_name, page_key, col_index, label) VALUES ?', [headerRows]);
-        if (cellRows.length) await connection.query('INSERT INTO data_cells (username, file_name, page_key, row_index, col_index, col_key, value, updated_by) VALUES ?', [cellRows]);
-        if (settingRows.length) await connection.query('INSERT INTO settings (username, file_name, setting_key, value) VALUES ?', [settingRows]);
-        if (profileRows.length) await connection.query('INSERT INTO profile_fields (username, file_name, field_key, value) VALUES ?', [profileRows]);
-        if (formRows.length) await connection.query('INSERT INTO form_fields (username, file_name, task_num, field_key, value) VALUES ?', [formRows]);
-
-        await connection.commit();
-    } catch (err) {
-        try { await connection.rollback(); } catch (rollbackErr) { /* ignore */ }
-        throw err;
-    } finally {
-        connection.release();
-    }
+    return mysql.createPool({
+        host: process.env.MYSQLHOST || process.env.MYSQL_HOST || 'localhost',
+        port: Number(process.env.MYSQLPORT || process.env.MYSQL_PORT || 3306),
+        user: process.env.MYSQLUSER || process.env.MYSQL_USER || 'root',
+        password: process.env.MYSQLPASSWORD || process.env.MYSQL_PASSWORD || process.env.MYSQL_ROOT_PASSWORD || '',
+        database: process.env.MYSQLDATABASE || process.env.MYSQL_DATABASE || 'railway',
+        ...commonOptions
+    });
 };
 
-// --- Authentication routes -------------------------------------------------
-// Login only validates against the users table; there is no registration.
-app.post('/api/auth/login', async (req, res) => {
-    if (!dbPool) return dbUnavailable(res);
-    const username = getTrimmedString(req.body && req.body.username);
-    const password = req.body && req.body.password != null ? String(req.body.password) : '';
+const pool = buildMysqlPool();
+
+// SQLite used "INSERT OR REPLACE"; MySQL's equivalent is "REPLACE".
+const translateSql = (sql) => sql.replace(/INSERT\s+OR\s+REPLACE/gi, 'REPLACE');
+
+// Preserve the sqlite error text that register() looks for on duplicate keys.
+const normalizeDbError = (err) => {
+    if (err && err.code === 'ER_DUP_ENTRY' && !/UNIQUE constraint failed/i.test(err.message || '')) {
+        err.message = `UNIQUE constraint failed: ${err.message}`;
+    }
+    return err;
+};
+
+// sqlite3-compatible wrapper so existing endpoint code keeps working unchanged.
+const db = {
+    run(sql, params, cb) {
+        if (typeof params === 'function') { cb = params; params = []; }
+        pool.query(translateSql(sql), params || [], function (err, result) {
+            if (err) {
+                if (cb) { cb.call({}, normalizeDbError(err)); }
+                else { console.error('[DB] run error:', err.message); }
+                return;
+            }
+            if (cb) { cb.call({ lastID: result.insertId, changes: result.affectedRows }, null); }
+        });
+    },
+    get(sql, params, cb) {
+        if (typeof params === 'function') { cb = params; params = []; }
+        pool.query(translateSql(sql), params || [], (err, rows) => {
+            if (err) { return cb(normalizeDbError(err)); }
+            cb(null, rows && rows.length ? rows[0] : undefined);
+        });
+    },
+    all(sql, params, cb) {
+        if (typeof params === 'function') { cb = params; params = []; }
+        pool.query(translateSql(sql), params || [], (err, rows) => {
+            if (err) { return cb(normalizeDbError(err)); }
+            cb(null, rows || []);
+        });
+    },
+    serialize(fn) { if (typeof fn === 'function') { fn(); } }
+};
+
+const initDatabaseSchema = () => {
+    db.serialize(() => {
+        db.run(`CREATE TABLE IF NOT EXISTS store (
+            bucket VARCHAR(191) NOT NULL,
+            \`key\` VARCHAR(191) NOT NULL,
+            value LONGTEXT,
+            userName VARCHAR(255),
+            userPin VARCHAR(255),
+            updatedAt VARCHAR(64),
+            PRIMARY KEY (bucket, \`key\`)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS users (
+            username VARCHAR(191) NOT NULL,
+            password VARCHAR(255),
+            pin VARCHAR(255),
+            PRIMARY KEY (username)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS user_buckets (
+            username VARCHAR(191) NOT NULL,
+            bucket VARCHAR(191) NOT NULL,
+            lastAccessed VARCHAR(64),
+            PRIMARY KEY (username, bucket)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+        db.run(`CREATE TABLE IF NOT EXISTS user_settings (
+            username VARCHAR(191) NOT NULL,
+            settings LONGTEXT,
+            PRIMARY KEY (username)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+    });
+};
+
+initDatabaseSchema();
+
+app.use(cors({
+    origin: '*',
+    methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Name', 'X-User-Pin', 'X-User-Password', 'X-Last-Modified']
+}));
+app.use(express.json({limit: '50mb'}));
+
+// Auth Endpoints
+app.post('/api/auth/register', (req, res) => {
+    const {username, pin} = req.body;
+    if (!username || !pin) {
+        return res.status(400).json({error: 'Username and PIN are required'});
+    }
+
+    const hashedPassword = crypto.createHash('sha256').update(pin).digest('hex');
+
+    db.run("INSERT INTO users (username, password, pin) VALUES (?, ?, ?)", 
+        [username, hashedPassword, pin], (err) => {
+        if (err) {
+            if (err.message.includes('UNIQUE constraint failed')) {
+                return res.status(400).json({error: 'User already exists'});
+            }
+            return res.status(500).json({error: err.message});
+        }
+        res.json({success: true, user: {username, pin}});
+    });
+});
+
+app.post('/api/auth/login', (req, res) => {
+    const {username, pin} = req.body;
+    if (!username || !pin) {
+        return res.status(400).json({error: 'Username and PIN are required'});
+    }
+
+    db.get("SELECT * FROM users WHERE username = ? AND pin = ?", [username, pin], (err, row) => {
+        if (err) {
+            return res.status(500).json({error: err.message});
+        }
+        if (!row) {
+            return res.status(401).json({error: 'no matching login found'});
+        }
+        res.json({success: true, user: {username: row.username, pin: row.pin}});
+    });
+});
+
+// Auth Middleware
+const authMiddleware = (req, res, next) => {
+    const username = req.headers['x-user-name'];
+    const password = req.headers['x-user-password'] || req.headers['x-user-pin'];
 
     if (!username || !password) {
-        return res.status(400).json({success: false, error: 'Username and password are required.'});
+        return res.status(401).json({error: 'Not authenticated'});
     }
 
-    try {
-        const user = await getUserRow(username);
-        if (!user || String(user.access_code) !== password) {
-            return res.status(401).json({success: false, error: 'Invalid username or password.'});
+    const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
+    db.get("SELECT * FROM users WHERE username = ? AND password = ?", [username, hashedPassword], (err, row) => {
+        if (err) return res.status(500).json({error: err.message});
+        if (!row) return res.status(401).json({error: 'Invalid credentials'});
+        req.user = row;
+        next();
+    });
+};
+
+app.get('/api/auth/history', authMiddleware, (req, res) => {
+    db.all("SELECT bucket, lastAccessed FROM user_buckets WHERE username = ? ORDER BY lastAccessed DESC", [req.user.username], (err, rows) => {
+        if (err) {
+            return res.status(500).json({error: err.message});
         }
-        res.json({success: true, username: user.username, isSuperAdmin: !!user.is_super_admin});
-    } catch (err) {
-        console.error('[AUTH] Login failed:', err.message);
-        res.status(500).json({success: false, error: 'Login failed due to a server error.'});
-    }
-});
-
-// Super-Admin only: list / create / delete accounts.
-app.get('/api/auth/users', async (req, res) => {
-    if (!dbPool) return dbUnavailable(res);
-    try {
-        if (!(await requireSuperAdmin(req, res))) return;
-        const [rows] = await dbPool.query('SELECT username, is_super_admin, created_at FROM users ORDER BY is_super_admin DESC, username ASC');
         res.json(rows);
-    } catch (err) {
-        console.error('[AUTH] List users failed:', err.message);
-        res.status(500).json({error: 'Failed to list users.'});
-    }
+    });
 });
 
-app.post('/api/auth/users', async (req, res) => {
-    if (!dbPool) return dbUnavailable(res);
-    try {
-        if (!(await requireSuperAdmin(req, res))) return;
-        const username = getTrimmedString(req.body && req.body.username);
-        const password = req.body && req.body.password != null ? String(req.body.password) : '';
-        if (!username || !password) {
-            return res.status(400).json({error: 'Username and password are required.'});
+// User Settings Endpoints
+app.get('/api/auth/settings', authMiddleware, (req, res) => {
+    db.get("SELECT settings FROM user_settings WHERE username = ?", [req.user.username], (err, row) => {
+        if (err) return res.status(500).json({error: err.message});
+        try {
+            res.json(row ? JSON.parse(row.settings) : {});
+        } catch (e) {
+            res.json({});
         }
-        if (username.length > 190) {
-            return res.status(400).json({error: 'Username is too long.'});
-        }
-        await dbPool.query(
-            'INSERT INTO users (username, access_code, is_super_admin) VALUES (?, ?, 0) ON DUPLICATE KEY UPDATE access_code = VALUES(access_code)',
-            [username, password]
-        );
-        res.json({success: true, username});
-    } catch (err) {
-        console.error('[AUTH] Create user failed:', err.message);
-        res.status(500).json({error: 'Failed to save user.'});
-    }
+    });
 });
 
-app.delete('/api/auth/users/:username', async (req, res) => {
-    if (!dbPool) return dbUnavailable(res);
-    try {
-        if (!(await requireSuperAdmin(req, res))) return;
-        const target = req.params.username;
-        if (target === SUPER_ADMIN_USERNAME) {
-            return res.status(400).json({error: 'The SuperAdmin account cannot be deleted.'});
-        }
-        for (const table of ['user_files', 'data_cells', 'column_headers', 'settings', 'profile_fields', 'form_fields']) {
-            await dbPool.query(`DELETE FROM ${table} WHERE username = ?`, [target]);
-        }
-        await dbPool.query('DELETE FROM users WHERE username = ?', [target]);
+app.put('/api/auth/settings', authMiddleware, (req, res) => {
+    const settings = JSON.stringify(req.body || {});
+    db.run("INSERT OR REPLACE INTO user_settings (username, settings) VALUES (?, ?)", [req.user.username, settings], (err) => {
+        if (err) return res.status(500).json({error: err.message});
         res.json({success: true});
-    } catch (err) {
-        console.error('[AUTH] Delete user failed:', err.message);
-        res.status(500).json({error: 'Failed to delete user.'});
-    }
+    });
 });
+
+// Helper to track bucket access
+const trackBucketAccess = (username, bucket) => {
+    if (!username || !bucket) return;
+    const now = new Date().toISOString();
+    db.run("INSERT OR REPLACE INTO user_buckets (username, bucket, lastAccessed) VALUES (?, ?, ?)", [username, bucket, now]);
+};
 
 const ensureHttpsDomain = (domain) => {
     const normalized = (domain || CALTOPO_DEFAULT_DOMAIN).trim().toLowerCase();
@@ -792,129 +579,149 @@ const fetchPublicCalTopoState = async (targetUrl) => {
     return normalizeCalTopoState(response.data);
 };
 
-// Keys that hold a full data bundle (eligible for normalized decomposition).
-const isBundlePayload = (key, body) => {
-    if (key === 'all-files') return false;
-    if (/^user-/.test(key)) return false;
-    return !!(body && typeof body === 'object' && !Array.isArray(body) && (body.pages || body.profile || body.fileName));
+// Helper to get file path
+const getFilePath = (bucket, key) => {
+    const bucketDir = path.join(DATA_DIR, bucket);
+    if (!fs.existsSync(bucketDir)) {
+        fs.mkdirSync(bucketDir);
+    }
+    // Sanitize key to prevent directory traversal
+    const safeKey = key.replace(/[^a-z0-9_-]/gi, '_');
+    return path.join(bucketDir, `${safeKey}.json`);
 };
 
-// List all stored keys for a user (bucket === account username)
-app.get('/api/v1/:bucket', async (req, res) => {
-    if (!dbPool) return dbUnavailable(res);
-    try {
-        const auth = await authenticateBucket(req, res);
-        if (!auth) return;
-        const [rows] = await dbPool.query('SELECT file_key FROM user_files WHERE username = ?', [auth.bucket]);
-        res.json(rows.map(row => row.file_key));
-    } catch (err) {
-        console.error('[DATA] List failed:', err.message);
-        res.status(500).json({error: 'Failed to list keys'});
-    }
+// Get all files for a bucket
+app.get('/api/v1/:bucket/all-files', authMiddleware, (req, res) => {
+    const {bucket} = req.params;
+    trackBucketAccess(req.user.username, bucket);
+    db.all("SELECT `key`, updatedAt FROM store WHERE bucket = ?", [bucket], (err, rows) => {
+        if (err) return res.status(500).json({error: 'Failed to query database'});
+        const files = {};
+        rows.forEach(row => {
+            files[row.key] = { lastModified: row.updatedAt };
+        });
+        res.json(files);
+    });
 });
 
-// Get the most recently updated data bundle for a user
-app.get('/api/v1/:bucket/latest', async (req, res) => {
-    if (!dbPool) return dbUnavailable(res);
-    try {
-        const auth = await authenticateBucket(req, res);
-        if (!auth) return;
-        const [rows] = await dbPool.query(
-            "SELECT data_json FROM user_files WHERE username = ? AND file_key <> 'all-files' AND file_key NOT LIKE 'user-%' ORDER BY last_modified DESC, updated_at DESC LIMIT 1",
-            [auth.bucket]
-        );
-        if (!rows.length) return res.status(404).json({error: 'No data files found'});
-        res.json(JSON.parse(rows[0].data_json));
-    } catch (err) {
-        console.error('[DATA] Latest failed:', err.message);
-        res.status(500).json({error: 'Internal server error'});
-    }
-});
-
-// Get a stored value by key
-app.get('/api/v1/:bucket/:key', async (req, res) => {
-    if (!dbPool) return dbUnavailable(res);
-    try {
-        const auth = await authenticateBucket(req, res);
-        if (!auth) return;
-        const [rows] = await dbPool.query(
-            'SELECT data_json FROM user_files WHERE username = ? AND file_key = ? LIMIT 1',
-            [auth.bucket, req.params.key]
-        );
-        if (!rows.length) return res.status(404).json({error: 'Not found'});
-        res.json(JSON.parse(rows[0].data_json));
-    } catch (err) {
-        console.error('[DATA] Read failed:', err.message);
-        res.status(500).json({error: 'Failed to read data'});
-    }
-});
-
-// Store a value by key, then project bundles into the normalized tables
-app.put('/api/v1/:bucket/:key', async (req, res) => {
-    if (!dbPool) return dbUnavailable(res);
-    try {
-        const auth = await authenticateBucket(req, res);
-        if (!auth) return;
-        const bucket = auth.bucket;
-        const key = req.params.key;
-        const userName = getTrimmedString(req.headers['x-user-name']) || bucket;
-        const incoming = computeIncomingLastModified(req);
-
-        const [existing] = await dbPool.query(
-            'SELECT last_modified FROM user_files WHERE username = ? AND file_key = ? LIMIT 1',
-            [bucket, key]
-        );
-        if (existing.length && existing[0].last_modified) {
-            const existingMs = new Date(existing[0].last_modified).getTime();
-            if (incoming && !Number.isNaN(existingMs) && incoming < existingMs) {
-                return res.status(403).json({error: 'Conflict', message: 'Incoming data is older than server data.'});
-            }
-        }
-
-        const saveDate = new Date(incoming && incoming > 0 ? incoming : Date.now());
-        const fileName = deriveFileName(key, req.body);
-
-        await dbPool.query(
-            `INSERT INTO user_files (username, file_key, file_name, data_json, updated_by, is_super_admin, last_modified)
-             VALUES (?, ?, ?, ?, ?, ?, ?)
-             ON DUPLICATE KEY UPDATE data_json = VALUES(data_json), file_name = VALUES(file_name), updated_by = VALUES(updated_by), is_super_admin = VALUES(is_super_admin), last_modified = VALUES(last_modified)`,
-            [bucket, key, fileName, JSON.stringify(req.body), userName, auth.isSuperAdmin ? 1 : 0, saveDate]
-        );
-
-        // Project into normalized tables (best-effort; never blocks the authoritative save).
+// Get latest bundle for a bucket
+app.get('/api/v1/:bucket/latest', authMiddleware, (req, res) => {
+    const {bucket} = req.params;
+    db.get("SELECT value FROM store WHERE bucket = ? ORDER BY updatedAt DESC LIMIT 1", [bucket], (err, row) => {
+        if (err) return res.status(500).json({error: 'Failed to query database'});
+        if (!row) return res.status(404).json({error: 'No data found'});
         try {
-            if (key === 'all-files' && req.body && typeof req.body === 'object') {
-                for (const [fname, info] of Object.entries(req.body)) {
-                    if (info && info.bundle) {
-                        await decomposeBundle(bucket, fname, info.bundle, userName);
-                    }
-                }
-            } else if (isBundlePayload(key, req.body)) {
-                await decomposeBundle(bucket, fileName, req.body, userName);
-            }
-        } catch (decompErr) {
-            console.warn('[DATA] Normalized projection skipped:', decompErr.message);
+            res.json(JSON.parse(row.value));
+        } catch (e) {
+            res.status(500).json({error: 'Failed to parse stored data'});
         }
-
-        res.json({success: true});
-    } catch (err) {
-        console.error('[DATA] Save failed:', err.message);
-        res.status(500).json({error: 'Failed to save data'});
-    }
+    });
 });
 
-// Delete a stored value
-app.delete('/api/v1/:bucket/:key', async (req, res) => {
-    if (!dbPool) return dbUnavailable(res);
-    try {
-        const auth = await authenticateBucket(req, res);
-        if (!auth) return;
-        await dbPool.query('DELETE FROM user_files WHERE username = ? AND file_key = ?', [auth.bucket, req.params.key]);
-        res.json({success: true});
-    } catch (err) {
-        console.error('[DATA] Delete failed:', err.message);
-        res.status(500).json({error: 'Failed to delete data'});
+// Get a specific key
+app.get('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
+    const {bucket, key} = req.params;
+    db.get("SELECT value FROM store WHERE bucket = ? AND `key` = ?", [bucket, key], (err, row) => {
+        if (err) return res.status(500).json({error: 'Failed to query database'});
+        if (!row) return res.status(404).json({error: 'Not found'});
+        try {
+            res.json(JSON.parse(row.value));
+        } catch (e) {
+            res.status(500).json({error: 'Failed to parse stored data'});
+        }
+    });
+});
+
+// Set a value
+// Delete a value
+app.delete('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
+    const {bucket, key} = req.params;
+    const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
+    const isSuperAdmin = userPin === '1976';
+
+    db.get("SELECT userPin FROM store WHERE bucket = ? AND `key` = ?", [bucket, key], (err, row) => {
+        if (err) return res.status(500).json({error: 'Failed to query db'});
+        if (!row) return res.json({success: true}); // already gone
+        
+        if (row.userPin === '1976' && !isSuperAdmin) {
+            return res.status(403).json({
+                error: 'Conflict',
+                message: 'Cannot delete Super-Admin created files.'
+            });
+        }
+        
+        db.run("DELETE FROM store WHERE bucket = ? AND `key` = ?", [bucket, key], (err) => {
+            if (err) return res.status(500).json({error: 'Failed to delete data'});
+            res.json({success: true});
+        });
+    });
+});
+
+app.put('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
+    const {bucket, key} = req.params;
+    const userName = req.user.username || 'Unknown';
+    trackBucketAccess(req.user.username, bucket);
+    const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
+    const isSuperAdmin = userPin === '1976';
+
+    let incomingLastModified = Date.now();
+    if (req.headers['x-last-modified']) {
+        incomingLastModified = new Date(req.headers['x-last-modified']).getTime();
+    } else if (req.body) {
+        if (req.body.lastModified) {
+            incomingLastModified = new Date(req.body.lastModified).getTime();
+        } else if (typeof req.body === 'object' && req.body !== null) {
+            let found = false;
+            let maxM = 0;
+            for (const k in req.body) {
+                if (req.body[k] && req.body[k].lastModified) {
+                    const m = new Date(req.body[k].lastModified).getTime();
+                    if (m > maxM) maxM = m;
+                    found = true;
+                }
+            }
+            if (found) incomingLastModified = maxM;
+        }
     }
+
+    db.get("SELECT userPin, updatedAt FROM store WHERE bucket = ? AND `key` = ?", [bucket, key], (err, row) => {
+        if (err) return res.status(500).json({error: 'Failed to query database'});
+
+        if (row) {
+            const currentIsSuperAdmin = row.userPin === '1976';
+            const existingLastModified = new Date(row.updatedAt).getTime();
+
+            // Super-Admin priority
+            if (currentIsSuperAdmin && !isSuperAdmin) {
+                return res.status(403).json({
+                    error: 'Conflict',
+                    message: 'Changes by Super-Admin cannot be overwritten by a regular user.'
+                });
+            }
+
+            // Conflict resolution
+            if (isSuperAdmin === currentIsSuperAdmin) {
+                if (incomingLastModified < existingLastModified) {
+                    return res.status(403).json({
+                        error: 'Conflict',
+                        message: 'Incoming data is older than server data.'
+                    });
+                }
+            }
+        }
+
+        const saveTime = (incomingLastModified && incomingLastModified > 0) 
+            ? new Date(incomingLastModified).toISOString() 
+            : new Date().toISOString();
+
+        db.run(`INSERT OR REPLACE INTO store (bucket, \`key\`, value, userName, userPin, updatedAt)
+                VALUES (?, ?, ?, ?, ?, ?)`,
+                [bucket, key, JSON.stringify(req.body), userName, userPin, saveTime],
+                (err) => {
+                    if (err) return res.status(500).json({error: 'Failed to save data'});
+                    res.json({success: true});
+                });
+    });
 });
 
 // Root endpoint for health check
@@ -928,9 +735,8 @@ app.get('/api/health', (req, res) => {
     const envInfo = getServerEnvironmentInfo();
     res.json({
         status: 'ok',
-        version: '1.4.0',
+        version: '1.3.0',
         service: 'SAR Proxy + Sync',
-        databaseConfigured: !!dbPool,
         message: creds.configured
             ? 'Unified server is live and ready to sign CalTopo Team API requests using backend credentials.'
             : getCredentialConfigurationHelp(),
@@ -1220,15 +1026,6 @@ app.post('/fetch-map', fetchMapHandler); // Alias for compatibility
 
 logCredentialConfigurationStatus();
 
-// Connect to MySQL, ensure the schema + SuperAdmin exist, then start serving.
-// The server still boots (health + proxy) even if the database is unavailable;
-// data + auth endpoints will return 503 until MYSQL_URL is configured.
-initDatabase()
-    .catch((err) => {
-        console.error('[DB] Initialization failed. Login and data storage will be unavailable until MySQL is reachable:', err.message);
-    })
-    .finally(() => {
-        app.listen(PORT, '0.0.0.0', () => {
-            console.log(`Sync server v1.4.0 listening on port ${PORT}`);
-        });
-    });
+app.listen(PORT, '0.0.0.0', () => {
+    console.log(`Sync server v1.3.0 listening on port ${PORT}`);
+});
