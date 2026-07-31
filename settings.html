@@ -179,17 +179,19 @@
           <div class="home-panel full-width">
             <h2>Data Synchronization</h2>
             <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
-              Enter your Sync Server URL (from Railway) and a unique Bucket ID to synchronize data across devices.
-              Phones and computers must use the <b>same</b> Server and Bucket ID to talk to each other.
+              Your data is stored on the sync server under your login. Enter your Sync Server URL (from Railway) below.
+              You sign in with a username and password; the username identifies your own private data.
             </p>
             <div class="home-row" style="flex-wrap: wrap; gap: 10px;">
               <input class="pill-input" id="sync-url-input" placeholder="Sync Server URL (e.g., https://my-sync-server.railway.app)" style="flex: 1; min-width: 250px;"
                      type="text">
-              <input class="pill-input" id="sync-bucket-input" placeholder="Bucket ID (e.g., my-private-bucket)" style="flex: 1; min-width: 200px;"
-                     type="text">
               <button class="clear-btn" id="save-sync-url-btn" style="white-space: nowrap;" type="button">Save Sync
                 Settings
               </button>
+            </div>
+            <div style="display: flex; align-items: center; gap: 12px; flex-wrap: wrap; margin-top: 15px;">
+              <span style="color: var(--muted); font-size: 0.95rem;">Logged in as <b id="current-account-name">&mdash;</b></span>
+              <button class="clear-btn" id="settings-logout-btn" type="button" style="border-color: rgba(235, 87, 87, 0.4); color: #fa5252;">Log Out</button>
             </div>
             <div id="sync-status-msg" style="margin-top: 10px; font-size: 0.85rem; color: var(--accent);"></div>
           </div>

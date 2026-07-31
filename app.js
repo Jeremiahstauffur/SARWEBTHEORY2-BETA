@@ -400,82 +400,22 @@ function getSyncBucket() {
     return localStorage.getItem(SYNC_BUCKET_STORAGE_KEY) || '';
 }
 
+// Auth headers sent with every sync request. The bucket === the logged-in
+// username and the pin === that account's access code (password), so the
+// server only serves data belonging to the authenticated user.
+function getSyncAuthHeaders(extra) {
+    const user = getCurrentUser();
+    const headers = {
+        'X-User-Name': getSyncBucket(),
+        'X-User-Pin': user && user.pin != null ? String(user.pin) : ''
+    };
+    return extra ? Object.assign(headers, extra) : headers;
+}
+
+// The old Bucket ID popup has been replaced by the username/password login
+// popup. This alias keeps any legacy callers working.
 function showBucketPromptPopup() {
-    const onCancel = () => {
-        if (!getSyncBucket()) {
-            // We need a slight delay because createPopup handles its own close which might conflict with immediate reshhow
-            setTimeout(() => {
-                if (!getSyncBucket()) {
-                    alert('A Bucket ID is required to synchronize data.');
-                    showBucketPromptPopup();
-                }
-            }, 300);
-        }
-    };
-    const popup = createPopup('Set Bucket ID', null, onCancel);
-    const content = popup.querySelector('.popup-content');
-    const btnContainer = popup.querySelector('.popup-buttons');
-
-    // Override the default flex-direction: column for popup-buttons to make them side-by-side if we want,
-    // but the issue said "very short and wide", and standard popup-buttons are column.
-    // Given they are "popup-btn", they will have good padding now.
-    
-    const inputs = document.createElement('div');
-    inputs.className = 'popup-input-container';
-    inputs.style.flexDirection = 'column';
-    inputs.style.gap = '15px';
-
-    const promptText = document.createElement('p');
-    promptText.textContent = 'Please enter a unique Bucket ID to synchronize your data across devices.';
-    promptText.style.textAlign = 'center';
-    promptText.style.marginBottom = '10px';
-    inputs.appendChild(promptText);
-
-    const bucketInput = document.createElement('input');
-    bucketInput.type = 'text';
-    bucketInput.placeholder = 'e.g., my-team-bucket';
-    bucketInput.className = 'pill-input';
-    bucketInput.style.textAlign = 'center';
-    bucketInput.style.width = '100%';
-    bucketInput.style.padding = '16px';
-    bucketInput.style.fontSize = '1.1rem';
-    bucketInput.style.marginTop = '10px';
-    inputs.appendChild(bucketInput);
-
-    content.insertBefore(inputs, btnContainer);
-
-    const setBtn = document.createElement('button');
-    setBtn.className = 'popup-btn primary';
-    setBtn.style.padding = '16px'; // Extra padding for emphasis
-    setBtn.textContent = 'Set Bucket ID & Reload';
-    setBtn.onclick = () => {
-        const val = bucketInput.value.trim();
-        if (val) {
-            localStorage.setItem(SYNC_BUCKET_STORAGE_KEY, val);
-            closePopup(popup);
-            window.location.reload();
-        } else {
-            alert('Please enter a valid Bucket ID');
-        }
-    };
-    btnContainer.appendChild(setBtn);
-
-    const cancelBtn = document.createElement('button');
-    cancelBtn.className = 'popup-btn';
-    cancelBtn.textContent = 'Cancel';
-    cancelBtn.onclick = () => {
-        onCancel();
-        closePopup(popup);
-    };
-    btnContainer.appendChild(cancelBtn);
-
-    bucketInput.onkeydown = (e) => {
-        if (e.key === 'Enter') {
-            setBtn.click();
-        }
-    };
-
-    setTimeout(() => bucketInput.focus(), 100);
+    return showLoginPopup();
 }
 
 function normalizeCalTopoProxyUrl(url) {
@@ -1050,36 +990,22 @@ function setCurrentUser(user) {
     syncMobileBottomNav();
 }
 
+// Log the current user out and return to the login popup, forcing a fresh
+// login before the website can be used again.
+function logout() {
+    setCurrentUser(null);
+    localStorage.removeItem(SYNC_BUCKET_STORAGE_KEY);
+    window.location.reload();
+}
+
 function checkAccess() {
   const user = getCurrentUser();
-  const page = pageKey();
-  const bundle = loadBundle();
-
   if (!user) {
-    const superAdmin = (bundle.accounts || []).find(a => a.pin === '1976');
-    if (superAdmin) {
-        setCurrentUser(superAdmin);
-        return;
-    }
-    if (page !== 'index') navigateToPage('index.html');
+    // Not logged in — force the login popup before any website use.
+    showLoginPopup();
     return;
   }
-
-  // Refresh user data from bundle to ensure visiblePages are up to date
-  const actualUser = (bundle.accounts || []).find(a => a.pin === user.pin);
-  if (actualUser) {
-      setCurrentUser(actualUser);
-      if (isUserAdmin(actualUser)) return; // Admin has access to everything
-  }
-
-  if (page === 'page9') {
-      // Everyone is an admin now
-      return;
-  }
-
-    if (actualUser && actualUser.visiblePages) {
-        // Everyone is allowed access to everything now
-    }
+  // Single-user model: the logged-in account always has full access.
 }
 
 function defaultSearchLogData() {
@@ -4686,82 +4612,136 @@ function logCreation(type, name, bundle = null) {
   addActivityLogEntry('System', `Created ${type}: ${name || 'unknown'}`, bundle);
 }
 
+// Validate a username/password against the sync server's users table.
+async function performLogin(username, password) {
+  const serverUrl = getSyncServerUrl().replace(/\/$/, '');
+  try {
+    const resp = await fetch(`${serverUrl}/api/auth/login`, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ username, password })
+    });
+    const data = await resp.json().catch(() => ({}));
+    if (resp.ok && data.success) {
+      return { success: true, username: data.username || username, isSuperAdmin: !!data.isSuperAdmin };
+    }
+    return { success: false, error: data.error || `Login failed (status ${resp.status}).` };
+  } catch (err) {
+    return { success: false, error: 'Could not reach the sync server. Check your connection and the Sync Server URL in Settings.' };
+  }
+}
+
+// Username/password login popup. There is no registration: credentials are
+// checked against the MySQL users table on the server. The username becomes
+// the sync bucket and the password becomes the access code.
 function showLoginPopup() {
   const onCancel = () => {
     if (!getCurrentUser()) {
-        alert('You must select a team member to continue');
-        showLoginPopup();
+      setTimeout(() => {
+        if (!getCurrentUser()) {
+          alert('You must log in to use the website.');
+          showLoginPopup();
+        }
+      }, 300);
     }
   };
-  const popup = createPopup('Select Team Member', null, onCancel);
+  const popup = createPopup('Log In', null, onCancel);
   const content = popup.querySelector('.popup-content');
   const btnContainer = popup.querySelector('.popup-buttons');
-  
-  const bundle = loadBundle();
-  const accounts = bundle.accounts || [];
-  let selectedUser = getCurrentUser();
 
   const inputs = document.createElement('div');
   inputs.className = 'popup-input-container';
   inputs.style.flexDirection = 'column';
   inputs.style.gap = '15px';
-  
-  const userSelectContainer = document.createElement('div');
-  userSelectContainer.style.width = '100%';
-  userSelectContainer.style.display = 'flex';
-  userSelectContainer.style.flexDirection = 'column';
-  userSelectContainer.style.alignItems = 'center';
 
-  const userSearchInput = document.createElement('input');
-  userSearchInput.type = 'text';
-  userSearchInput.placeholder = 'Type to search...';
-  userSearchInput.className = 'pill-input';
-  userSearchInput.style.textAlign = 'center';
-  userSearchInput.value = '';
-  userSelectContainer.appendChild(userSearchInput);
+  const promptText = document.createElement('p');
+  promptText.textContent = 'Enter your username and password to access your data.';
+  promptText.style.textAlign = 'center';
+  promptText.style.marginBottom = '10px';
+  inputs.appendChild(promptText);
 
-  const pillsContainer = document.createElement('div');
-  pillsContainer.style.display = 'flex';
-  pillsContainer.style.flexWrap = 'wrap';
-  pillsContainer.style.justifyContent = 'center';
-  pillsContainer.style.gap = '5px';
-  pillsContainer.style.marginTop = '10px';
-  userSelectContainer.appendChild(pillsContainer);
+  const usernameInput = document.createElement('input');
+  usernameInput.type = 'text';
+  usernameInput.placeholder = 'Username';
+  usernameInput.className = 'pill-input';
+  usernameInput.style.textAlign = 'center';
+  usernameInput.style.width = '100%';
+  usernameInput.style.padding = '16px';
+  usernameInput.style.fontSize = '1.1rem';
+  usernameInput.autocomplete = 'username';
+  usernameInput.value = getSyncBucket() || '';
+  inputs.appendChild(usernameInput);
 
-  const updatePills = () => {
-    pillsContainer.innerHTML = '';
-    const query = userSearchInput.value.toLowerCase();
-    const filtered = accounts.filter(acc => 
-      `${acc.firstName} ${acc.lastName}`.toLowerCase().includes(query)
-    );
+  const passwordInput = document.createElement('input');
+  passwordInput.type = 'password';
+  passwordInput.placeholder = 'Password';
+  passwordInput.className = 'pill-input';
+  passwordInput.style.textAlign = 'center';
+  passwordInput.style.width = '100%';
+  passwordInput.style.padding = '16px';
+  passwordInput.style.fontSize = '1.1rem';
+  passwordInput.autocomplete = 'current-password';
+  inputs.appendChild(passwordInput);
 
-    filtered.forEach(acc => {
-      const pill = document.createElement('button');
-      pill.className = 'mini-pill';
-      pill.textContent = `${acc.firstName} ${acc.lastName}`;
-      if (selectedUser && selectedUser.firstName === acc.firstName && selectedUser.lastName === acc.lastName) {
-          pill.style.background = 'var(--pill-bg-hover)';
-          pill.style.borderColor = 'var(--accent)';
-      }
-      pill.onclick = () => {
-        setCurrentUser(acc);
-        closePopup(popup);
-        window.location.reload();
+  const statusMsg = document.createElement('div');
+  statusMsg.style.textAlign = 'center';
+  statusMsg.style.minHeight = '18px';
+  statusMsg.style.fontSize = '0.9rem';
+  statusMsg.style.color = '#fa5252';
+  inputs.appendChild(statusMsg);
+
+  content.insertBefore(inputs, btnContainer);
+  btnContainer.innerHTML = '';
+
+  const loginBtn = document.createElement('button');
+  loginBtn.className = 'popup-btn primary';
+  loginBtn.style.padding = '16px';
+  loginBtn.textContent = 'Log In';
+
+  const doLogin = async () => {
+    const username = usernameInput.value.trim();
+    const password = passwordInput.value;
+    if (!username || !password) {
+      statusMsg.style.color = '#fa5252';
+      statusMsg.textContent = 'Please enter both a username and password.';
+      return;
+    }
+    loginBtn.disabled = true;
+    statusMsg.style.color = 'var(--accent)';
+    statusMsg.textContent = 'Signing in...';
+    const result = await performLogin(username, password);
+    if (result.success) {
+      localStorage.setItem(SYNC_BUCKET_STORAGE_KEY, result.username);
+      const user = {
+        username: result.username,
+        firstName: result.username,
+        lastName: '',
+        handle: result.username,
+        pin: password,
+        isSuperAdmin: result.isSuperAdmin,
+        isFileManager: true,
+        theme: (loadBundle().theme) || 'dark',
+        visiblePages: ['index', 'page2', 'page3', 'page4', 'page5', 'page6', 'page7', 'settings', 'home', 'page8', 'page9', 'page10']
       };
-      pillsContainer.appendChild(pill);
-    });
+      setCurrentUser(user);
+      closePopup(popup);
+      window.location.reload();
+    } else {
+      loginBtn.disabled = false;
+      statusMsg.style.color = '#fa5252';
+      statusMsg.textContent = result.error || 'Login failed.';
+      passwordInput.value = '';
+      passwordInput.focus();
+    }
   };
 
-  userSearchInput.oninput = updatePills;
-  updatePills();
-  inputs.appendChild(userSelectContainer);
-  
-  content.insertBefore(inputs, btnContainer);
-  
-  // Remove the Login button from btnContainer as selection immediately switches user
-  btnContainer.innerHTML = '';
-  
-  userSearchInput.focus();
+  loginBtn.onclick = doLogin;
+  btnContainer.appendChild(loginBtn);
+
+  passwordInput.onkeydown = (e) => { if (e.key === 'Enter') doLogin(); };
+  usernameInput.onkeydown = (e) => { if (e.key === 'Enter') passwordInput.focus(); };
+
+  setTimeout(() => usernameInput.focus(), 100);
 }
 
 function showAccountManager() {
@@ -4847,8 +4827,7 @@ function showAccountManager() {
   logoutBtn.style.marginTop = '10px';
   logoutBtn.textContent = 'Logout';
   logoutBtn.onclick = () => {
-      setCurrentUser(null);
-      window.location.reload();
+      logout();
   };
   btnContainer.appendChild(logoutBtn);
 }
@@ -5125,8 +5104,7 @@ function showProfileSettingsPopup(user) {
     logoutBtn.style.marginTop = '10px';
     logoutBtn.textContent = 'Logout';
     logoutBtn.onclick = () => {
-        setCurrentUser(null);
-        window.location.reload();
+        logout();
     };
     btnContainer.appendChild(logoutBtn);
 }
@@ -7341,31 +7319,37 @@ function buildSettingsPage() {
     }
 
   if (syncUrlInput && saveSyncBtn) {
-    const syncBucketInput = document.getElementById('sync-bucket-input');
       syncUrlInput.value = getSyncServerUrl();
-    if (syncBucketInput) syncBucketInput.value = getSyncBucket();
+
+    // Show who is logged in and wire the logout button.
+    const accountNameEl = document.getElementById('current-account-name');
+    if (accountNameEl) {
+        const cu = getCurrentUser();
+        accountNameEl.textContent = (getSyncBucket() || 'Unknown') + (cu && cu.isSuperAdmin ? ' (SuperAdmin)' : '');
+    }
+    const settingsLogoutBtn = document.getElementById('settings-logout-btn');
+    if (settingsLogoutBtn) settingsLogoutBtn.onclick = () => logout();
 
     saveSyncBtn.onclick = async () => {
         await withSaveButtonFeedback(saveSyncBtn, async () => {
             const serverUrl = syncUrlInput.value.trim();
-            const bucket = syncBucketInput ? syncBucketInput.value.trim() : getSyncBucket();
+            const bucket = getSyncBucket();
 
             if (serverUrl && bucket) {
                 localStorage.setItem(SYNC_URL_STORAGE_KEY, serverUrl);
-                localStorage.setItem(SYNC_BUCKET_STORAGE_KEY, bucket);
                 syncStatusMsg.textContent = 'Sync settings saved! Testing connection...';
 
                 try {
                     const apiBase = `${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}`;
                     const [resp, listResp] = await Promise.all([
-                        fetch(`${apiBase}/bundle?_=${Date.now()}`),
-                        fetch(`${apiBase}/all-files?_=${Date.now()}`)
+                        fetch(`${apiBase}/bundle?_=${Date.now()}`, { headers: getSyncAuthHeaders() }),
+                        fetch(`${apiBase}/all-files?_=${Date.now()}`, { headers: getSyncAuthHeaders() })
                     ]);
 
                     if (resp.ok || listResp.ok) {
                         syncStatusMsg.textContent = 'Sync connection successful! Data found.';
                     } else if (resp.status === 404 && listResp.status === 404) {
-                        syncStatusMsg.textContent = 'Connected! New bucket created on server.';
+                        syncStatusMsg.textContent = 'Connected! No data stored yet for this login.';
                     } else {
                         syncStatusMsg.textContent = `Server returned status ${resp.status}/${listResp.status}.`;
                     }
@@ -7373,8 +7357,10 @@ function buildSettingsPage() {
                 } catch (err) {
                     syncStatusMsg.textContent = 'Could not reach sync server. Check the URL and your connection.';
                 }
+            } else if (!serverUrl) {
+                syncStatusMsg.textContent = 'Please enter the Sync Server URL.';
             } else {
-                syncStatusMsg.textContent = 'Please enter both Server URL and Bucket ID.';
+                syncStatusMsg.textContent = 'You are not logged in. Please log in first.';
             }
         });
     };
@@ -10265,9 +10251,9 @@ function initPageTransitions() {
 document.addEventListener('DOMContentLoaded', async () => {
     initPageTransitions();
     
-    if (!getSyncBucket()) {
-        showBucketPromptPopup();
-        return; // Stop initialization until bucket is set
+    if (!getSyncBucket() || !getCurrentUser()) {
+        showLoginPopup();
+        return; // Stop initialization until the user logs in
     }
     
     // For new devices, attempt an immediate sync to get the latest file from the server
@@ -10283,18 +10269,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     updateHeaderProfile();
     syncMobileBottomNav();
 
-    const currentUser = getCurrentUser();
-    if (!currentUser) {
-        const superAdmin = (bundle.accounts || []).find(a => a.pin === '1976');
-        if (superAdmin) {
-            setCurrentUser(superAdmin);
-            checkAccess();
-        } else {
-            showLoginPopup();
-        }
-    } else {
-        checkAccess();
-    }
+    checkAccess();
 
   const bell = document.getElementById('notif-bell');
   const sidebar = document.getElementById('notif-sidebar');
@@ -11996,6 +11971,225 @@ function renderFeaturesList() {
 }
 
 function buildUserAccountPage() {
+    // Single-user model: show only the current user's preferences + logout,
+    // plus a login-management panel for the SuperAdmin.
+    const container = document.getElementById('user-account-container');
+    const tabContainer = document.getElementById('user-tabs');
+    if (!container) return;
+    if (tabContainer) tabContainer.style.display = 'none';
+
+    const currentUser = getCurrentUser();
+    if (!currentUser) { showLoginPopup(); return; }
+
+    const bundle = loadBundle();
+    const account = (bundle.accounts || []).find(a => a.pin === currentUser.pin);
+    const displayName = getSyncBucket() || currentUser.username || getAccountName(currentUser) || 'User';
+    let selectedTheme = (bundle.theme === 'light') ? 'light' : 'dark';
+    let selectedColor = (account && account.color) || currentUser.color || 'none';
+
+    container.innerHTML = `
+        <div class="profile-form" style="max-width: 800px; margin: 0 auto; background: rgba(0,0,0,0.2); padding: 30px; border-radius: 32px; border: 1px solid rgba(255,255,255,0.1);">
+            <div class="form-group large">
+                <label style="display: block; margin-bottom: 8px; color: var(--text); font-weight: bold;">Logged in as</label>
+                <div class="pill-cell readonly-pill" style="padding: 14px; font-size: 1.1rem;">${displayName}${currentUser.isSuperAdmin ? ' (SuperAdmin)' : ''}</div>
+            </div>
+            <div class="form-group large">
+                <label style="display: block; margin-bottom: 8px; color: var(--text); font-weight: bold;">Theme Preference</label>
+                <div style="display: flex; gap: 10px;">
+                    <button id="theme-dark-btn" class="mini-pill ${selectedTheme !== 'light' ? 'active' : ''}" style="flex: 1;">Dark Mode</button>
+                    <button id="theme-light-btn" class="mini-pill ${selectedTheme === 'light' ? 'active' : ''}" style="flex: 1;">Grey Mode</button>
+                </div>
+            </div>
+            <div class="form-group large">
+                <label style="display: block; margin-bottom: 12px; color: var(--text); font-weight: bold;">Highlight Color</label>
+                <div id="color-selection" style="display: flex; flex-wrap: wrap; gap: 12px; justify-content: center;"></div>
+            </div>
+            <div class="tool-actions" style="margin-top: 20px; justify-content: center;">
+                <button id="save-user-btn" class="update-pill" style="padding: 12px 40px; font-size: 1rem;">Save Preferences</button>
+                <button id="logout-btn" class="mini-pill" style="padding: 12px 20px; font-size: 1rem; margin-left: 10px; background: rgba(235, 87, 87, 0.1); border-color: rgba(235, 87, 87, 0.4);">Logout</button>
+            </div>
+        </div>
+        <div id="admin-user-mgmt" style="max-width: 800px; margin: 30px auto 0;"></div>
+    `;
+
+    const colors = ['none', 'orange', 'yellow', 'red', 'blue', 'green', 'purple', 'brown', 'black', 'white', 'grey', 'maroon'];
+    const colorContainer = document.getElementById('color-selection');
+    colors.forEach(c => {
+        const btn = document.createElement('button');
+        btn.className = 'pill-cell-btn';
+        btn.style.width = '36px';
+        btn.style.height = '36px';
+        btn.style.borderRadius = '50%';
+        btn.style.padding = '0';
+        btn.style.cursor = 'pointer';
+        btn.style.transition = 'transform 0.2s ease';
+        const markSelected = () => {
+            Array.from(colorContainer.children).forEach(b => {
+                b.style.border = '1px solid rgba(255,255,255,0.3)';
+                b.style.transform = 'scale(1)';
+            });
+            btn.style.border = '3px solid white';
+            btn.style.transform = 'scale(1.2)';
+        };
+        if (selectedColor === c) {
+            btn.style.border = '3px solid white';
+            btn.style.transform = 'scale(1.2)';
+        } else {
+            btn.style.border = '1px solid rgba(255,255,255,0.3)';
+        }
+        if (c === 'none') {
+            btn.style.background = 'transparent';
+            btn.innerHTML = '<span style="color: white; font-size: 20px;">×</span>';
+        } else {
+            btn.style.background = HIGHLIGHT_COLORS[c];
+        }
+        btn.onclick = () => { selectedColor = c; markSelected(); };
+        colorContainer.appendChild(btn);
+    });
+
+    const darkBtn = document.getElementById('theme-dark-btn');
+    const lightBtn = document.getElementById('theme-light-btn');
+    if (darkBtn && lightBtn) {
+        darkBtn.onclick = () => {
+            selectedTheme = 'dark';
+            darkBtn.classList.add('active');
+            lightBtn.classList.remove('active');
+            const b = loadBundle(); b.theme = 'dark'; applyTheme(b);
+        };
+        lightBtn.onclick = () => {
+            selectedTheme = 'light';
+            lightBtn.classList.add('active');
+            darkBtn.classList.remove('active');
+            const b = loadBundle(); b.theme = 'light'; applyTheme(b);
+        };
+    }
+
+    const logoutBtn = document.getElementById('logout-btn');
+    if (logoutBtn) logoutBtn.onclick = () => logout();
+
+    const saveBtn = document.getElementById('save-user-btn');
+    if (saveBtn) saveBtn.onclick = () => {
+        const b = loadBundle();
+        b.theme = selectedTheme;
+        const acc = (b.accounts || []).find(a => a.pin === currentUser.pin);
+        if (acc) acc.color = selectedColor;
+        saveBundle(b);
+        setCurrentUser(Object.assign({}, currentUser, { theme: selectedTheme, color: selectedColor }));
+        applyTheme(b);
+        updateHeaderProfile();
+        const status = document.getElementById('save-status');
+        if (status) {
+            status.textContent = 'Preferences saved!';
+            status.style.color = '#4caf50';
+            setTimeout(() => { status.textContent = 'Ready.'; }, 3000);
+        }
+    };
+
+    if (currentUser.isSuperAdmin) {
+        renderLoginManagement(document.getElementById('admin-user-mgmt'));
+    }
+    return;
+}
+
+// SuperAdmin-only panel to create and remove username/password logins on the
+// server. Uses the SuperAdmin's own credentials (sent via sync auth headers).
+function renderLoginManagement(container) {
+    if (!container) return;
+    container.innerHTML = `
+        <div class="table-card" style="background: rgba(0,0,0,0.2); border-radius: 15px; border: 1px solid rgba(255,255,255,0.1); padding: 20px;">
+            <h2 style="margin-top: 0; text-align: center;">Manage Logins (SuperAdmin)</h2>
+            <p style="color: var(--muted); font-size: 0.9rem; text-align: center;">Create the username/password logins your team will use. Each login stores its own data.</p>
+            <div class="home-row" style="display: flex; gap: 10px; flex-wrap: wrap; justify-content: center; margin: 15px 0;">
+                <input id="new-login-username" class="pill-input" type="text" placeholder="New username" style="flex: 1; min-width: 160px;">
+                <input id="new-login-password" class="pill-input" type="text" placeholder="Password / access code" style="flex: 1; min-width: 160px;">
+                <button id="add-login-btn" class="clear-btn" type="button">Add Login</button>
+            </div>
+            <div id="login-mgmt-status" style="text-align: center; font-size: 0.85rem; min-height: 18px; margin-bottom: 10px;"></div>
+            <div id="login-list"></div>
+        </div>
+    `;
+
+    const statusEl = document.getElementById('login-mgmt-status');
+    const listEl = document.getElementById('login-list');
+
+    const loadUsers = async () => {
+        listEl.innerHTML = '<div style="text-align:center; color: var(--muted);">Loading...</div>';
+        try {
+            const serverUrl = getSyncServerUrl().replace(/\/$/, '');
+            const resp = await fetch(`${serverUrl}/api/auth/users?_=${Date.now()}`, { headers: getSyncAuthHeaders() });
+            if (!resp.ok) {
+                listEl.innerHTML = `<div style="text-align:center; color:#fa5252;">Could not load logins (status ${resp.status}).</div>`;
+                return;
+            }
+            const users = await resp.json();
+            listEl.innerHTML = '';
+            (users || []).forEach(u => {
+                const row = document.createElement('div');
+                row.style.display = 'flex';
+                row.style.justifyContent = 'space-between';
+                row.style.alignItems = 'center';
+                row.style.padding = '10px 12px';
+                row.style.borderBottom = '1px solid rgba(255,255,255,0.08)';
+                const label = document.createElement('span');
+                label.textContent = u.username + (u.is_super_admin ? ' (SuperAdmin)' : '');
+                row.appendChild(label);
+                if (!u.is_super_admin) {
+                    const del = document.createElement('button');
+                    del.className = 'mini-pill';
+                    del.style.background = 'rgba(235, 87, 87, 0.15)';
+                    del.style.borderColor = 'rgba(235, 87, 87, 0.4)';
+                    del.textContent = 'Delete';
+                    del.onclick = async () => {
+                        if (!confirm(`Delete login "${u.username}" and all of its data? This cannot be undone.`)) return;
+                        const serverUrl2 = getSyncServerUrl().replace(/\/$/, '');
+                        const r = await fetch(`${serverUrl2}/api/auth/users/${encodeURIComponent(u.username)}`, { method: 'DELETE', headers: getSyncAuthHeaders() });
+                        if (r.ok) { loadUsers(); } else { statusEl.style.color = '#fa5252'; statusEl.textContent = 'Delete failed.'; }
+                    };
+                    row.appendChild(del);
+                }
+                listEl.appendChild(row);
+            });
+            if (!(users || []).length) listEl.innerHTML = '<div style="text-align:center; color: var(--muted);">No accounts yet.</div>';
+        } catch (err) {
+            listEl.innerHTML = '<div style="text-align:center; color:#fa5252;">Could not reach the sync server.</div>';
+        }
+    };
+
+    const addBtn = document.getElementById('add-login-btn');
+    if (addBtn) addBtn.onclick = async () => {
+        const username = document.getElementById('new-login-username').value.trim();
+        const password = document.getElementById('new-login-password').value;
+        if (!username || !password) { statusEl.style.color = '#fa5252'; statusEl.textContent = 'Enter a username and password.'; return; }
+        statusEl.style.color = 'var(--accent)';
+        statusEl.textContent = 'Saving...';
+        try {
+            const serverUrl = getSyncServerUrl().replace(/\/$/, '');
+            const resp = await fetch(`${serverUrl}/api/auth/users`, {
+                method: 'POST',
+                headers: getSyncAuthHeaders({ 'Content-Type': 'application/json' }),
+                body: JSON.stringify({ username, password })
+            });
+            const data = await resp.json().catch(() => ({}));
+            if (resp.ok && data.success) {
+                statusEl.style.color = '#4caf50';
+                statusEl.textContent = `Login "${username}" saved.`;
+                document.getElementById('new-login-username').value = '';
+                document.getElementById('new-login-password').value = '';
+                loadUsers();
+            } else {
+                statusEl.style.color = '#fa5252';
+                statusEl.textContent = data.error || `Could not save (status ${resp.status}).`;
+            }
+        } catch (err) {
+            statusEl.style.color = '#fa5252';
+            statusEl.textContent = 'Could not reach the sync server.';
+        }
+    };
+
+    loadUsers();
+}
+
+function __legacyBuildUserAccountPage_unused() {
     const container = document.getElementById('user-account-container');
     const tabContainer = document.getElementById('user-tabs');
     if (!container) return;
@@ -12343,7 +12537,7 @@ function renderUserManagement(container, bundle) {
 }
 
 function buildUserManagementPage() {
-    navigateToPage('page8.html?tab=manage');
+    navigateToPage('page8.html');
 }
 function buildMapsPage() {
   const container = document.querySelector('main');
@@ -12725,7 +12919,7 @@ async function syncWithServer() {
         // (Restriction removed)
         
         // 1. Sync entire file list
-        const listResp = await fetch(`${apiBase}/all-files?_=${Date.now()}`);
+        const listResp = await fetch(`${apiBase}/all-files?_=${Date.now()}`, { headers: getSyncAuthHeaders() });
         if (listResp.ok) {
             const serverFiles = await listResp.json();
             const localFiles = getSavedFiles();
@@ -12764,7 +12958,7 @@ async function syncWithServer() {
 
         // 2. Sync active bundle
         const endpoint = isNewDevice ? 'latest' : 'bundle';
-        const resp = await fetch(`${apiBase}/${endpoint}?_=${Date.now()}`);
+        const resp = await fetch(`${apiBase}/${endpoint}?_=${Date.now()}`, { headers: getSyncAuthHeaders() });
         if (resp.ok) {
             const serverBundle = await resp.json();
             if (serverBundle) {
@@ -12812,12 +13006,7 @@ async function pushBundleToServer(bundle) {
     const serverUrl = getSyncServerUrl();
     if (!serverUrl) return;
     
-    const user = getCurrentUser();
-    const headers = { 
-        'Content-Type': 'application/json',
-        'X-User-Name': getAccountName(user),
-        'X-User-Pin': user ? user.pin : ''
-    };
+    const headers = getSyncAuthHeaders({ 'Content-Type': 'application/json' });
     
     try {
         const baseUrl = serverUrl.replace(/\/$/, '');
@@ -12855,13 +13044,7 @@ async function pushFileListToServer(files) {
     const serverUrl = getSyncServerUrl();
     if (!serverUrl) return;
     
-    const user = getCurrentUser();
-    const headers = { 
-        'Content-Type': 'application/json',
-        'X-User-Name': getAccountName(user),
-        'X-User-Pin': user ? user.pin : '',
-        'X-Last-Modified': new Date().toISOString()
-    };
+    const headers = getSyncAuthHeaders({ 'Content-Type': 'application/json', 'X-Last-Modified': new Date().toISOString() });
     
     try {
         const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/all-files`, {
@@ -12888,7 +13071,7 @@ async function notifyActiveUser(user) {
 
     const headers = {
         'Content-Type': 'application/json',
-        'X-User-Name': getAccountName(user),
+        'X-User-Name': getSyncBucket() || getAccountName(user),
         'X-User-Pin': user ? user.pin : ''
     };
     

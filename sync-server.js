@@ -217,9 +217,438 @@ if (!fs.existsSync(DATA_DIR)) {
 app.use(cors({
     origin: '*',
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-    allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Name', 'X-User-Pin']
+    allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Name', 'X-User-Pin', 'X-Last-Modified']
 }));
 app.use(express.json({limit: '50mb'}));
+
+// ===========================================================================
+// MySQL persistence layer (username/password accounts + fully-normalized
+// per-user data storage). The bucket in the sync API === the account username,
+// and the X-User-Pin header === that account's access code (password).
+// ===========================================================================
+const mysql = require('mysql2/promise');
+
+const SUPER_ADMIN_USERNAME = 'SuperAdmin';
+const SUPER_ADMIN_ACCESS_CODE = '1976';
+
+let dbPool = null;
+
+const buildMysqlPoolOptions = () => {
+    const baseOptions = {
+        waitForConnections: true,
+        connectionLimit: 10,
+        charset: 'utf8mb4'
+    };
+
+    const connectionString = getTrimmedString(
+        process.env.MYSQL_URL || process.env.DATABASE_URL || process.env.MYSQL_PUBLIC_URL || ''
+    );
+    if (connectionString) {
+        return {uri: connectionString, ...baseOptions};
+    }
+
+    const host = getTrimmedString(process.env.MYSQLHOST || process.env.MYSQL_HOST || '');
+    const user = getTrimmedString(process.env.MYSQLUSER || process.env.MYSQL_USER || '');
+    const database = getTrimmedString(process.env.MYSQLDATABASE || process.env.MYSQL_DATABASE || '');
+    if (host && user && database) {
+        return {
+            host,
+            user,
+            database,
+            password: process.env.MYSQLPASSWORD || process.env.MYSQL_PASSWORD || '',
+            port: Number(process.env.MYSQLPORT || process.env.MYSQL_PORT || 3306),
+            ...baseOptions
+        };
+    }
+
+    return null;
+};
+
+const createSchema = async () => {
+    const statements = [
+        `CREATE TABLE IF NOT EXISTS users (
+            username VARCHAR(190) NOT NULL PRIMARY KEY,
+            access_code VARCHAR(190) NOT NULL,
+            is_super_admin TINYINT(1) NOT NULL DEFAULT 0,
+            created_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS user_files (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(190) NOT NULL,
+            file_key VARCHAR(190) NOT NULL,
+            file_name VARCHAR(255) NULL,
+            data_json LONGTEXT NOT NULL,
+            updated_by VARCHAR(190) NULL,
+            is_super_admin TINYINT(1) NOT NULL DEFAULT 0,
+            last_modified DATETIME NULL,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
+            UNIQUE KEY uniq_user_file (username, file_key),
+            KEY idx_user (username)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS column_headers (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(190) NOT NULL,
+            file_name VARCHAR(255) NOT NULL,
+            page_key VARCHAR(64) NOT NULL,
+            col_index INT NOT NULL,
+            label TEXT NULL,
+            UNIQUE KEY uniq_header (username, file_name, page_key, col_index)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS data_cells (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(190) NOT NULL,
+            file_name VARCHAR(255) NOT NULL,
+            page_key VARCHAR(64) NOT NULL,
+            row_index INT NOT NULL,
+            col_index INT NOT NULL,
+            col_key VARCHAR(190) NULL,
+            value LONGTEXT NULL,
+            updated_by VARCHAR(190) NULL,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            KEY idx_cells_file (username, file_name, page_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS settings (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(190) NOT NULL,
+            file_name VARCHAR(255) NOT NULL,
+            setting_key VARCHAR(190) NOT NULL,
+            value LONGTEXT NULL,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uniq_setting (username, file_name, setting_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS profile_fields (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(190) NOT NULL,
+            file_name VARCHAR(255) NOT NULL,
+            field_key VARCHAR(190) NOT NULL,
+            value LONGTEXT NULL,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uniq_profile (username, file_name, field_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`,
+        `CREATE TABLE IF NOT EXISTS form_fields (
+            id BIGINT NOT NULL AUTO_INCREMENT PRIMARY KEY,
+            username VARCHAR(190) NOT NULL,
+            file_name VARCHAR(255) NOT NULL,
+            task_num VARCHAR(190) NOT NULL,
+            field_key VARCHAR(190) NOT NULL,
+            value LONGTEXT NULL,
+            updated_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            UNIQUE KEY uniq_form (username, file_name, task_num, field_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`
+    ];
+
+    for (const statement of statements) {
+        await dbPool.query(statement);
+    }
+};
+
+const seedSuperAdmin = async () => {
+    await dbPool.query(
+        'INSERT INTO users (username, access_code, is_super_admin) VALUES (?, ?, 1) ON DUPLICATE KEY UPDATE access_code = VALUES(access_code), is_super_admin = 1',
+        [SUPER_ADMIN_USERNAME, SUPER_ADMIN_ACCESS_CODE]
+    );
+};
+
+const initDatabase = async () => {
+    const options = buildMysqlPoolOptions();
+    if (!options) {
+        console.warn('[DB] No MySQL configuration found. Set MYSQL_URL (or MYSQLHOST/MYSQLUSER/MYSQLPASSWORD/MYSQLDATABASE). Login and data storage will be unavailable until configured.');
+        return;
+    }
+
+    dbPool = mysql.createPool(options);
+
+    const connection = await dbPool.getConnection();
+    try {
+        await connection.query('SELECT 1');
+    } finally {
+        connection.release();
+    }
+
+    await createSchema();
+    await seedSuperAdmin();
+    console.log(`[DB] MySQL connected. Schema ready and "${SUPER_ADMIN_USERNAME}" account ensured.`);
+};
+
+// --- Persistence helpers ---------------------------------------------------
+const dbUnavailable = (res) => {
+    res.status(503).json({
+        error: 'Database not configured',
+        message: 'The sync server is not connected to MySQL. Set MYSQL_URL and restart the server.'
+    });
+};
+
+const getUserRow = async (username) => {
+    const [rows] = await dbPool.query(
+        'SELECT username, access_code, is_super_admin FROM users WHERE username = ? LIMIT 1',
+        [username]
+    );
+    return rows && rows.length ? rows[0] : null;
+};
+
+// Verify the request may access a bucket. The bucket === the account username;
+// the requester must present that account's access code via X-User-Pin.
+const authenticateBucket = async (req, res) => {
+    const bucket = req.params.bucket;
+    const providedCode = req.headers['x-user-pin'] != null ? String(req.headers['x-user-pin']) : '';
+    const user = await getUserRow(bucket);
+    if (!user) {
+        res.status(404).json({error: 'Unknown account', message: `No account named "${bucket}".`});
+        return null;
+    }
+    if (String(user.access_code) !== providedCode) {
+        res.status(403).json({error: 'Forbidden', message: 'Invalid access code for this account.'});
+        return null;
+    }
+    return {bucket, isSuperAdmin: !!user.is_super_admin};
+};
+
+const requireSuperAdmin = async (req, res) => {
+    const username = getTrimmedString(req.headers['x-user-name']);
+    const code = req.headers['x-user-pin'] != null ? String(req.headers['x-user-pin']) : '';
+    const user = await getUserRow(username);
+    if (!user || !user.is_super_admin || String(user.access_code) !== code) {
+        res.status(403).json({error: 'Forbidden', message: 'Super-Admin credentials are required for this action.'});
+        return false;
+    }
+    return true;
+};
+
+const deriveFileName = (key, body) => {
+    if (body && typeof body === 'object' && !Array.isArray(body) && body.fileName) {
+        return String(body.fileName);
+    }
+    return String(key);
+};
+
+const computeIncomingLastModified = (req) => {
+    if (req.headers['x-last-modified']) {
+        const headerTime = new Date(req.headers['x-last-modified']).getTime();
+        if (!Number.isNaN(headerTime)) return headerTime;
+    }
+    const body = req.body;
+    if (body && typeof body === 'object') {
+        if (body.lastModified) {
+            const bodyTime = new Date(body.lastModified).getTime();
+            if (!Number.isNaN(bodyTime)) return bodyTime;
+        }
+        let maxTime = 0;
+        let found = false;
+        for (const key of Object.keys(body)) {
+            const entry = body[key];
+            if (entry && entry.lastModified) {
+                const entryTime = new Date(entry.lastModified).getTime();
+                if (!Number.isNaN(entryTime) && entryTime > maxTime) {
+                    maxTime = entryTime;
+                    found = true;
+                }
+            }
+        }
+        if (found) return maxTime;
+    }
+    return Date.now();
+};
+
+const toCellString = (value) => {
+    if (value === null || value === undefined) return '';
+    if (typeof value === 'object') return JSON.stringify(value);
+    return String(value);
+};
+
+// Flatten a form object into [path, value] pairs, e.g. teamMembers[0].name.
+const flattenFormValue = (prefix, value, out) => {
+    if (value === null || value === undefined) {
+        if (prefix) out.push([prefix, '']);
+    } else if (Array.isArray(value)) {
+        if (value.length === 0) {
+            if (prefix) out.push([prefix, '[]']);
+        } else {
+            value.forEach((item, index) => flattenFormValue(`${prefix}[${index}]`, item, out));
+        }
+    } else if (typeof value === 'object') {
+        const keys = Object.keys(value);
+        if (keys.length === 0) {
+            if (prefix) out.push([prefix, '{}']);
+        } else {
+            keys.forEach((key) => flattenFormValue(prefix ? `${prefix}.${key}` : key, value[key], out));
+        }
+    } else {
+        out.push([prefix || 'value', String(value)]);
+    }
+};
+
+// Project a single file's bundle into the normalized tables. This is a
+// derived view for organized querying; the authoritative copy lives in
+// user_files.data_json, so a projection error never loses data.
+const decomposeBundle = async (username, fileName, bundle, updatedBy) => {
+    if (!bundle || typeof bundle !== 'object') return;
+    const fname = String(fileName || 'bundle').slice(0, 255);
+
+    const cellRows = [];
+    const headerRows = [];
+    const settingRows = [];
+    const profileRows = [];
+    const formRows = [];
+
+    const pages = bundle.pages && typeof bundle.pages === 'object' ? bundle.pages : {};
+    for (const [pageKey, pageData] of Object.entries(pages)) {
+        const pk = String(pageKey).slice(0, 64);
+        if (pageData && !Array.isArray(pageData) && Array.isArray(pageData.rows)) {
+            // Regions-style page: { headers, rows, voterVisibility }
+            const headers = Array.isArray(pageData.headers) ? pageData.headers : [];
+            headers.forEach((header, colIndex) => {
+                headerRows.push([username, fname, pk, colIndex, toCellString(header)]);
+            });
+            pageData.rows.forEach((row, rowIndex) => {
+                const cols = Array.isArray(row) ? row : [row];
+                cols.forEach((cellValue, colIndex) => {
+                    const colKey = (headers[colIndex] != null ? toCellString(headers[colIndex]) : `col_${colIndex}`).slice(0, 190);
+                    cellRows.push([username, fname, pk, rowIndex, colIndex, colKey, toCellString(cellValue), updatedBy]);
+                });
+            });
+            if (Array.isArray(pageData.voterVisibility)) {
+                settingRows.push([username, fname, `${pk}.voterVisibility`.slice(0, 190), JSON.stringify(pageData.voterVisibility)]);
+            }
+        } else if (Array.isArray(pageData)) {
+            // Standard page: array of row-arrays
+            pageData.forEach((row, rowIndex) => {
+                const cols = Array.isArray(row) ? row : [row];
+                cols.forEach((cellValue, colIndex) => {
+                    cellRows.push([username, fname, pk, rowIndex, colIndex, `col_${colIndex}`, toCellString(cellValue), updatedBy]);
+                });
+            });
+        }
+    }
+
+    const scalarSettingKeys = [
+        'fileName', 'lastModified', 'deleteMode', 'theme', 'showTips', 'background',
+        'parCheckFrequency', 'segmentColorScaleUsePsriMax', 'segmentColorScaleLowColor',
+        'segmentColorScaleMidColor', 'segmentColorScaleHighColor', 'segmentActiveSearchOpacityPercent'
+    ];
+    scalarSettingKeys.forEach((settingKey) => {
+        if (bundle[settingKey] !== undefined) {
+            settingRows.push([username, fname, settingKey, toCellString(bundle[settingKey])]);
+        }
+    });
+
+    if (bundle.profile && typeof bundle.profile === 'object') {
+        Object.entries(bundle.profile).forEach(([fieldKey, value]) => {
+            profileRows.push([username, fname, String(fieldKey).slice(0, 190), toCellString(value)]);
+        });
+    }
+
+    if (bundle.forms && typeof bundle.forms === 'object') {
+        Object.entries(bundle.forms).forEach(([taskNum, form]) => {
+            const pairs = [];
+            flattenFormValue('', form, pairs);
+            pairs.forEach(([fieldKey, value]) => {
+                formRows.push([username, fname, String(taskNum).slice(0, 190), String(fieldKey || 'value').slice(0, 190), value]);
+            });
+        });
+    }
+
+    const connection = await dbPool.getConnection();
+    try {
+        await connection.beginTransaction();
+        await connection.query('DELETE FROM data_cells WHERE username = ? AND file_name = ?', [username, fname]);
+        await connection.query('DELETE FROM column_headers WHERE username = ? AND file_name = ?', [username, fname]);
+        await connection.query('DELETE FROM settings WHERE username = ? AND file_name = ?', [username, fname]);
+        await connection.query('DELETE FROM profile_fields WHERE username = ? AND file_name = ?', [username, fname]);
+        await connection.query('DELETE FROM form_fields WHERE username = ? AND file_name = ?', [username, fname]);
+
+        if (headerRows.length) await connection.query('INSERT INTO column_headers (username, file_name, page_key, col_index, label) VALUES ?', [headerRows]);
+        if (cellRows.length) await connection.query('INSERT INTO data_cells (username, file_name, page_key, row_index, col_index, col_key, value, updated_by) VALUES ?', [cellRows]);
+        if (settingRows.length) await connection.query('INSERT INTO settings (username, file_name, setting_key, value) VALUES ?', [settingRows]);
+        if (profileRows.length) await connection.query('INSERT INTO profile_fields (username, file_name, field_key, value) VALUES ?', [profileRows]);
+        if (formRows.length) await connection.query('INSERT INTO form_fields (username, file_name, task_num, field_key, value) VALUES ?', [formRows]);
+
+        await connection.commit();
+    } catch (err) {
+        try { await connection.rollback(); } catch (rollbackErr) { /* ignore */ }
+        throw err;
+    } finally {
+        connection.release();
+    }
+};
+
+// --- Authentication routes -------------------------------------------------
+// Login only validates against the users table; there is no registration.
+app.post('/api/auth/login', async (req, res) => {
+    if (!dbPool) return dbUnavailable(res);
+    const username = getTrimmedString(req.body && req.body.username);
+    const password = req.body && req.body.password != null ? String(req.body.password) : '';
+
+    if (!username || !password) {
+        return res.status(400).json({success: false, error: 'Username and password are required.'});
+    }
+
+    try {
+        const user = await getUserRow(username);
+        if (!user || String(user.access_code) !== password) {
+            return res.status(401).json({success: false, error: 'Invalid username or password.'});
+        }
+        res.json({success: true, username: user.username, isSuperAdmin: !!user.is_super_admin});
+    } catch (err) {
+        console.error('[AUTH] Login failed:', err.message);
+        res.status(500).json({success: false, error: 'Login failed due to a server error.'});
+    }
+});
+
+// Super-Admin only: list / create / delete accounts.
+app.get('/api/auth/users', async (req, res) => {
+    if (!dbPool) return dbUnavailable(res);
+    try {
+        if (!(await requireSuperAdmin(req, res))) return;
+        const [rows] = await dbPool.query('SELECT username, is_super_admin, created_at FROM users ORDER BY is_super_admin DESC, username ASC');
+        res.json(rows);
+    } catch (err) {
+        console.error('[AUTH] List users failed:', err.message);
+        res.status(500).json({error: 'Failed to list users.'});
+    }
+});
+
+app.post('/api/auth/users', async (req, res) => {
+    if (!dbPool) return dbUnavailable(res);
+    try {
+        if (!(await requireSuperAdmin(req, res))) return;
+        const username = getTrimmedString(req.body && req.body.username);
+        const password = req.body && req.body.password != null ? String(req.body.password) : '';
+        if (!username || !password) {
+            return res.status(400).json({error: 'Username and password are required.'});
+        }
+        if (username.length > 190) {
+            return res.status(400).json({error: 'Username is too long.'});
+        }
+        await dbPool.query(
+            'INSERT INTO users (username, access_code, is_super_admin) VALUES (?, ?, 0) ON DUPLICATE KEY UPDATE access_code = VALUES(access_code)',
+            [username, password]
+        );
+        res.json({success: true, username});
+    } catch (err) {
+        console.error('[AUTH] Create user failed:', err.message);
+        res.status(500).json({error: 'Failed to save user.'});
+    }
+});
+
+app.delete('/api/auth/users/:username', async (req, res) => {
+    if (!dbPool) return dbUnavailable(res);
+    try {
+        if (!(await requireSuperAdmin(req, res))) return;
+        const target = req.params.username;
+        if (target === SUPER_ADMIN_USERNAME) {
+            return res.status(400).json({error: 'The SuperAdmin account cannot be deleted.'});
+        }
+        for (const table of ['user_files', 'data_cells', 'column_headers', 'settings', 'profile_fields', 'form_fields']) {
+            await dbPool.query(`DELETE FROM ${table} WHERE username = ?`, [target]);
+        }
+        await dbPool.query('DELETE FROM users WHERE username = ?', [target]);
+        res.json({success: true});
+    } catch (err) {
+        console.error('[AUTH] Delete user failed:', err.message);
+        res.status(500).json({error: 'Failed to delete user.'});
+    }
+});
 
 const ensureHttpsDomain = (domain) => {
     const normalized = (domain || CALTOPO_DEFAULT_DOMAIN).trim().toLowerCase();
@@ -363,231 +792,128 @@ const fetchPublicCalTopoState = async (targetUrl) => {
     return normalizeCalTopoState(response.data);
 };
 
-// Helper to get file path
-const getFilePath = (bucket, key) => {
-    const bucketDir = path.join(DATA_DIR, bucket);
-    if (!fs.existsSync(bucketDir)) {
-        fs.mkdirSync(bucketDir);
-    }
-    // Sanitize key to prevent directory traversal
-    const safeKey = key.replace(/[^a-z0-9_-]/gi, '_');
-    return path.join(bucketDir, `${safeKey}.json`);
+// Keys that hold a full data bundle (eligible for normalized decomposition).
+const isBundlePayload = (key, body) => {
+    if (key === 'all-files') return false;
+    if (/^user-/.test(key)) return false;
+    return !!(body && typeof body === 'object' && !Array.isArray(body) && (body.pages || body.profile || body.fileName));
 };
 
-// List all keys in a bucket
-app.get('/api/v1/:bucket', (req, res) => {
-    const {bucket} = req.params;
-    const bucketDir = path.join(DATA_DIR, bucket);
-
-    if (!fs.existsSync(bucketDir)) {
-        return res.json([]);
-    }
-
+// List all stored keys for a user (bucket === account username)
+app.get('/api/v1/:bucket', async (req, res) => {
+    if (!dbPool) return dbUnavailable(res);
     try {
-        const files = fs.readdirSync(bucketDir);
-        const keys = files
-            .filter(f => f.endsWith('.json') && !f.endsWith('.meta'))
-            .map(f => f.replace('.json', ''));
-        res.json(keys);
+        const auth = await authenticateBucket(req, res);
+        if (!auth) return;
+        const [rows] = await dbPool.query('SELECT file_key FROM user_files WHERE username = ?', [auth.bucket]);
+        res.json(rows.map(row => row.file_key));
     } catch (err) {
+        console.error('[DATA] List failed:', err.message);
         res.status(500).json({error: 'Failed to list keys'});
     }
 });
 
-// Get the most recently updated file in a bucket
-app.get('/api/v1/:bucket/latest', (req, res) => {
-    const {bucket} = req.params;
-    const bucketDir = path.join(DATA_DIR, bucket);
-
-    if (!fs.existsSync(bucketDir)) {
-        return res.status(404).json({error: 'Bucket not found'});
-    }
-
+// Get the most recently updated data bundle for a user
+app.get('/api/v1/:bucket/latest', async (req, res) => {
+    if (!dbPool) return dbUnavailable(res);
     try {
-        const files = fs.readdirSync(bucketDir)
-            .filter(f => f.endsWith('.json') && f !== 'all-files.json' && f !== 'bundle.json');
-        
-        if (files.length === 0) {
-            // Fallback to bundle.json if it exists
-            const bundlePath = path.join(bucketDir, 'bundle.json');
-            if (fs.existsSync(bundlePath)) {
-                return res.json(JSON.parse(fs.readFileSync(bundlePath, 'utf8')));
-            }
-            return res.status(404).json({error: 'No data files found'});
-        }
-
-        let latestFile = null;
-        let latestTime = 0;
-
-        files.forEach(f => {
-            const filePath = path.join(bucketDir, f);
-            const metaPath = filePath + '.meta';
-            let updatedAt;
-
-            if (fs.existsSync(metaPath)) {
-                try {
-                    const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-                    updatedAt = new Date(meta.updatedAt).getTime();
-                } catch (e) {
-                    updatedAt = fs.statSync(filePath).mtimeMs;
-                }
-            } else {
-                updatedAt = fs.statSync(filePath).mtimeMs;
-            }
-
-            if (updatedAt >= latestTime) {
-                latestTime = updatedAt;
-                latestFile = f;
-            }
-        });
-
-        // Also check bundle.json for its time
-        const bundlePath = path.join(bucketDir, 'bundle.json');
-        if (fs.existsSync(bundlePath)) {
-            const bundleMetaPath = bundlePath + '.meta';
-            let bundleTime;
-            if (fs.existsSync(bundleMetaPath)) {
-                try {
-                    bundleTime = new Date(JSON.parse(fs.readFileSync(bundleMetaPath, 'utf8')).updatedAt).getTime();
-                } catch (e) {
-                    bundleTime = fs.statSync(bundlePath).mtimeMs;
-                }
-            } else {
-                bundleTime = fs.statSync(bundlePath).mtimeMs;
-            }
-
-            if (bundleTime >= latestTime) {
-                latestTime = bundleTime;
-                latestFile = 'bundle.json';
-            }
-        }
-
-        if (latestFile) {
-            const data = fs.readFileSync(path.join(bucketDir, latestFile), 'utf8');
-            res.json(JSON.parse(data));
-        } else {
-            res.status(404).json({error: 'No files found'});
-        }
+        const auth = await authenticateBucket(req, res);
+        if (!auth) return;
+        const [rows] = await dbPool.query(
+            "SELECT data_json FROM user_files WHERE username = ? AND file_key <> 'all-files' AND file_key NOT LIKE 'user-%' ORDER BY last_modified DESC, updated_at DESC LIMIT 1",
+            [auth.bucket]
+        );
+        if (!rows.length) return res.status(404).json({error: 'No data files found'});
+        res.json(JSON.parse(rows[0].data_json));
     } catch (err) {
-        console.error('Error finding latest file:', err);
+        console.error('[DATA] Latest failed:', err.message);
         res.status(500).json({error: 'Internal server error'});
     }
 });
 
-// Get a value
-app.get('/api/v1/:bucket/:key', (req, res) => {
-    const {bucket, key} = req.params;
-    const filePath = getFilePath(bucket, key);
-
-    if (!fs.existsSync(filePath)) {
-        return res.status(404).json({error: 'Not found'});
-    }
-
+// Get a stored value by key
+app.get('/api/v1/:bucket/:key', async (req, res) => {
+    if (!dbPool) return dbUnavailable(res);
     try {
-        const data = fs.readFileSync(filePath, 'utf8');
-        res.json(JSON.parse(data));
+        const auth = await authenticateBucket(req, res);
+        if (!auth) return;
+        const [rows] = await dbPool.query(
+            'SELECT data_json FROM user_files WHERE username = ? AND file_key = ? LIMIT 1',
+            [auth.bucket, req.params.key]
+        );
+        if (!rows.length) return res.status(404).json({error: 'Not found'});
+        res.json(JSON.parse(rows[0].data_json));
     } catch (err) {
+        console.error('[DATA] Read failed:', err.message);
         res.status(500).json({error: 'Failed to read data'});
     }
 });
 
-// Set a value
-// Delete a value
-app.delete('/api/v1/:bucket/:key', (req, res) => {
-    const {bucket, key} = req.params;
-    const userPin = req.headers['x-user-pin'] || '';
-    const isSuperAdmin = userPin === '1976';
-
-    db.get("SELECT userPin FROM store WHERE bucket = ? AND key = ?", [bucket, key], (err, row) => {
-        if (err) return res.status(500).json({error: 'Failed to query db'});
-        if (!row) return res.json({success: true}); // already gone
-        
-        if (row.userPin === '1976' && !isSuperAdmin) {
-            return res.status(403).json({
-                error: 'Conflict',
-                message: 'Cannot delete Super-Admin created files.'
-            });
-        }
-        
-        db.run("DELETE FROM store WHERE bucket = ? AND key = ?", [bucket, key], (err) => {
-            if (err) return res.status(500).json({error: 'Failed to delete data'});
-            res.json({success: true});
-        });
-    });
-});
-
-app.put('/api/v1/:bucket/:key', (req, res) => {
-    const {bucket, key} = req.params;
-    const filePath = getFilePath(bucket, key);
-    const metaPath = filePath + '.meta';
-
-    const userName = req.headers['x-user-name'] || 'Unknown';
-    const userPin = req.headers['x-user-pin'] || '';
-    const isSuperAdmin = userPin === '1976';
-
-    let incomingLastModified = Date.now();
-    if (req.headers['x-last-modified']) {
-        incomingLastModified = new Date(req.headers['x-last-modified']).getTime();
-    } else if (req.body) {
-        if (req.body.lastModified) {
-            incomingLastModified = new Date(req.body.lastModified).getTime();
-        } else if (typeof req.body === 'object' && req.body !== null) {
-            // Try to find latest modified time in a collection of files
-            let found = false;
-            let maxM = 0;
-            for (const key in req.body) {
-                if (req.body[key] && req.body[key].lastModified) {
-                    const m = new Date(req.body[key].lastModified).getTime();
-                    if (m > maxM) maxM = m;
-                    found = true;
-                }
-            }
-            if (found) incomingLastModified = maxM;
-        }
-    }
-
-    if (fs.existsSync(metaPath)) {
-        try {
-            const meta = JSON.parse(fs.readFileSync(metaPath, 'utf8'));
-            const currentIsSuperAdmin = meta.userPin === '1976';
-            const existingLastModified = new Date(meta.updatedAt).getTime();
-
-            // Super-Admin priority
-            if (currentIsSuperAdmin && !isSuperAdmin) {
-                return res.status(403).json({
-                    error: 'Conflict',
-                    message: 'Changes by Super-Admin cannot be overwritten by a regular user.'
-                });
-            }
-
-            // Conflict resolution (same level or Super-Admin overwriting anyone)
-            if (isSuperAdmin === currentIsSuperAdmin) {
-                if (incomingLastModified < existingLastModified) {
-                    return res.status(403).json({
-                        error: 'Conflict',
-                        message: 'Incoming data is older than server data.'
-                    });
-                }
-            }
-        } catch (err) {
-            console.error('Failed to read meta file:', err);
-        }
-    }
-
-    const saveTime = (incomingLastModified && incomingLastModified > 0) 
-        ? new Date(incomingLastModified).toISOString() 
-        : new Date().toISOString();
-
+// Store a value by key, then project bundles into the normalized tables
+app.put('/api/v1/:bucket/:key', async (req, res) => {
+    if (!dbPool) return dbUnavailable(res);
     try {
-        fs.writeFileSync(filePath, JSON.stringify(req.body, null, 2));
-        fs.writeFileSync(metaPath, JSON.stringify({
-            userName,
-            userPin,
-            updatedAt: saveTime
-        }, null, 2));
+        const auth = await authenticateBucket(req, res);
+        if (!auth) return;
+        const bucket = auth.bucket;
+        const key = req.params.key;
+        const userName = getTrimmedString(req.headers['x-user-name']) || bucket;
+        const incoming = computeIncomingLastModified(req);
+
+        const [existing] = await dbPool.query(
+            'SELECT last_modified FROM user_files WHERE username = ? AND file_key = ? LIMIT 1',
+            [bucket, key]
+        );
+        if (existing.length && existing[0].last_modified) {
+            const existingMs = new Date(existing[0].last_modified).getTime();
+            if (incoming && !Number.isNaN(existingMs) && incoming < existingMs) {
+                return res.status(403).json({error: 'Conflict', message: 'Incoming data is older than server data.'});
+            }
+        }
+
+        const saveDate = new Date(incoming && incoming > 0 ? incoming : Date.now());
+        const fileName = deriveFileName(key, req.body);
+
+        await dbPool.query(
+            `INSERT INTO user_files (username, file_key, file_name, data_json, updated_by, is_super_admin, last_modified)
+             VALUES (?, ?, ?, ?, ?, ?, ?)
+             ON DUPLICATE KEY UPDATE data_json = VALUES(data_json), file_name = VALUES(file_name), updated_by = VALUES(updated_by), is_super_admin = VALUES(is_super_admin), last_modified = VALUES(last_modified)`,
+            [bucket, key, fileName, JSON.stringify(req.body), userName, auth.isSuperAdmin ? 1 : 0, saveDate]
+        );
+
+        // Project into normalized tables (best-effort; never blocks the authoritative save).
+        try {
+            if (key === 'all-files' && req.body && typeof req.body === 'object') {
+                for (const [fname, info] of Object.entries(req.body)) {
+                    if (info && info.bundle) {
+                        await decomposeBundle(bucket, fname, info.bundle, userName);
+                    }
+                }
+            } else if (isBundlePayload(key, req.body)) {
+                await decomposeBundle(bucket, fileName, req.body, userName);
+            }
+        } catch (decompErr) {
+            console.warn('[DATA] Normalized projection skipped:', decompErr.message);
+        }
+
         res.json({success: true});
     } catch (err) {
+        console.error('[DATA] Save failed:', err.message);
         res.status(500).json({error: 'Failed to save data'});
+    }
+});
+
+// Delete a stored value
+app.delete('/api/v1/:bucket/:key', async (req, res) => {
+    if (!dbPool) return dbUnavailable(res);
+    try {
+        const auth = await authenticateBucket(req, res);
+        if (!auth) return;
+        await dbPool.query('DELETE FROM user_files WHERE username = ? AND file_key = ?', [auth.bucket, req.params.key]);
+        res.json({success: true});
+    } catch (err) {
+        console.error('[DATA] Delete failed:', err.message);
+        res.status(500).json({error: 'Failed to delete data'});
     }
 });
 
@@ -602,8 +928,9 @@ app.get('/api/health', (req, res) => {
     const envInfo = getServerEnvironmentInfo();
     res.json({
         status: 'ok',
-        version: '1.3.0',
+        version: '1.4.0',
         service: 'SAR Proxy + Sync',
+        databaseConfigured: !!dbPool,
         message: creds.configured
             ? 'Unified server is live and ready to sign CalTopo Team API requests using backend credentials.'
             : getCredentialConfigurationHelp(),
@@ -893,6 +1220,15 @@ app.post('/fetch-map', fetchMapHandler); // Alias for compatibility
 
 logCredentialConfigurationStatus();
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Sync server v1.3.0 listening on port ${PORT}`);
-});
+// Connect to MySQL, ensure the schema + SuperAdmin exist, then start serving.
+// The server still boots (health + proxy) even if the database is unavailable;
+// data + auth endpoints will return 503 until MYSQL_URL is configured.
+initDatabase()
+    .catch((err) => {
+        console.error('[DB] Initialization failed. Login and data storage will be unavailable until MySQL is reachable:', err.message);
+    })
+    .finally(() => {
+        app.listen(PORT, '0.0.0.0', () => {
+            console.log(`Sync server v1.4.0 listening on port ${PORT}`);
+        });
+    });
