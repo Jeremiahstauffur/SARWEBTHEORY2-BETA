@@ -456,10 +456,28 @@ function getSyncBucket() {
 }
 
 function setSyncBucket(bucket) {
-    if (_serverSettings) {
-        _serverSettings[SYNC_BUCKET_STORAGE_KEY] = bucket;
-        saveServerSettings(_serverSettings);
+    // Persist the chosen CASE # server-side. Return the save promise so callers
+    // that reload the page (e.g. the case-number popup) can await it first;
+    // otherwise the reload aborts the in-flight PUT and the case number is lost.
+    if (!_serverSettings) { _serverSettings = {}; }
+    _serverSettings[SYNC_BUCKET_STORAGE_KEY] = bucket;
+    return saveServerSettings(_serverSettings);
+}
+
+// Convert an internal sync-bucket id back to the clean CASE # to show the user.
+// getSyncBucket() appends "_<pin>" so each team's data is namespaced in the
+// shared store; that suffix is an internal detail and must never be displayed
+// or fed back into setSyncBucket() (doing so would double the suffix). The list
+// returned by /api/auth/history stores those suffixed ids, so anything shown to
+// the user or used for duplicate detection must pass through here first.
+function bucketToCaseNumber(bucket) {
+    if (!bucket) return '';
+    const creds = getUserCredentials();
+    const suffix = creds && creds.password ? `_${creds.password}` : '';
+    if (suffix && bucket.endsWith(suffix)) {
+        return bucket.slice(0, -suffix.length);
     }
+    return bucket;
 }
 
 function setCookie(name, value, days = 365) {
@@ -1762,14 +1780,19 @@ function saveBundle(bundle, skipSync = false) {
   const sanitized = sanitizeBundle(bundle);
 
   _memoryStorage[BUNDLE_STORAGE_KEY] = JSON.stringify(sanitized);
-  
+
+  let pushPromise;
   if (!skipSync) {
-      pushBundleToServer(sanitized);
+      // Return this promise so callers that reload immediately after saving
+      // (e.g. creating a new CASE #) can await the write; otherwise the reload
+      // aborts the in-flight PUT and the just-entered data never reaches the DB.
+      pushPromise = pushBundleToServer(sanitized);
       // Ensure the current file is always in the saved files list
       saveFileToList(sanitized.fileName, sanitized);
   }
   
   updateFileNameDisplay();
+  return pushPromise;
 }
 
 function getSavedFiles() {
@@ -7151,9 +7174,11 @@ async function populateSearchHistory() {
             btn.style.flexDirection = 'column';
             btn.style.gap = '4px';
 
+            const caseNumber = bucketToCaseNumber(item.bucket);
+
             const nameSpan = document.createElement('span');
             nameSpan.style.fontWeight = 'bold';
-            nameSpan.textContent = item.bucket;
+            nameSpan.textContent = caseNumber;
             btn.appendChild(nameSpan);
 
             const dateSpan = document.createElement('span');
@@ -7162,9 +7187,10 @@ async function populateSearchHistory() {
             dateSpan.textContent = new Date(item.lastAccessed).toLocaleString();
             btn.appendChild(dateSpan);
 
-            btn.onclick = () => {
-                setSyncBucket(item.bucket);
-                alert(`Switched to search: ${item.bucket}`);
+            btn.onclick = async () => {
+                // Switch using the clean CASE # (not the suffixed internal bucket)
+                // and await the write so the reload doesn't abort it.
+                await setSyncBucket(caseNumber);
                 window.location.reload();
             };
             historyList.appendChild(btn);
@@ -7228,28 +7254,34 @@ function showCaseNumberPopup(originElement = null) {
     const normalizeBucket = (name) =>
         name.replace(/\.json$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_');
 
+    // The unique, clean CASE #s for this account (buckets carry an internal
+    // per-user suffix that must not be shown or reused directly).
+    const getCaseNumbers = () =>
+        [...new Set(existingCases.map(item => bucketToCaseNumber(item.bucket)).filter(Boolean))];
+
     const updateList = () => {
         listContainer.innerHTML = '';
         const query = caseInput.value.trim().toLowerCase();
-        const filtered = existingCases.filter(item =>
-            (item.bucket || '').toLowerCase().includes(query)
-        );
+        const caseNumbers = getCaseNumbers();
+        const filtered = caseNumbers.filter(name => name.toLowerCase().includes(query));
         if (filtered.length === 0) {
             const empty = document.createElement('div');
             empty.style.fontSize = '0.85em';
             empty.style.opacity = '0.6';
-            empty.textContent = existingCases.length === 0
+            empty.textContent = caseNumbers.length === 0
                 ? 'No existing case numbers.'
                 : 'No matches.';
             listContainer.appendChild(empty);
             return;
         }
-        filtered.forEach(item => {
+        filtered.forEach(name => {
             const pill = document.createElement('button');
             pill.className = 'mini-pill';
-            pill.textContent = item.bucket;
-            pill.onclick = () => {
-                setSyncBucket(item.bucket);
+            pill.textContent = name;
+            pill.onclick = async () => {
+                // Switch using the clean CASE # and await the write before
+                // reloading so the reload doesn't abort the PUT.
+                await setSyncBucket(name);
                 window.location.reload();
             };
             listContainer.appendChild(pill);
@@ -7271,19 +7303,20 @@ function showCaseNumberPopup(originElement = null) {
     const saveBtn = document.createElement('button');
     saveBtn.className = 'popup-btn primary';
     saveBtn.textContent = 'Save';
-    saveBtn.onclick = () => {
+    saveBtn.onclick = async () => {
         const typed = caseInput.value.trim();
         if (!typed) return alert('Please enter a case number.');
 
         const newBucket = normalizeBucket(typed);
         if (!newBucket) return alert('Please enter a valid case number.');
 
-        // Reject exact duplicates (case-insensitive) against the fetched buckets.
-        const isDuplicate = existingCases.some(item =>
-            (item.bucket || '').toLowerCase() === newBucket.toLowerCase()
+        // Reject exact duplicates (case-insensitive) against the clean CASE #s
+        // already associated with this account.
+        const isDuplicate = getCaseNumbers().some(name =>
+            name.toLowerCase() === newBucket.toLowerCase()
         );
         if (isDuplicate) {
-            return alert(`A case number "${newBucket}" already exists. Pick it from the list or choose a different name.`);
+            return alert(`Case # "${newBucket}" already exists. Pick it from the list or choose a different name.`);
         }
 
         // Build the new search, preserving personnel/accounts (same as the old
@@ -7309,10 +7342,19 @@ function showCaseNumberPopup(originElement = null) {
 
         newBundle.accounts = currentBundle.accounts;
 
-        logCreation('New Search File', newBundle.fileName, newBundle);
+        logCreation('New Case #', newBundle.fileName, newBundle);
 
-        setSyncBucket(newBucket);
-        saveBundle(newBundle);
+        // Await the server writes before reloading: the reload would otherwise
+        // abort the in-flight case-number PUT and bundle push, so nothing would
+        // reach the database and the case number would be lost on refresh.
+        saveBtn.disabled = true;
+        saveBtn.textContent = 'Saving…';
+        try {
+            await setSyncBucket(newBucket);
+            await saveBundle(newBundle);
+        } catch (e) {
+            console.warn('Failed to persist new case number:', e);
+        }
         window.location.reload();
     };
     btnContainer.appendChild(saveBtn);
@@ -7358,7 +7400,7 @@ function buildHomePage() {
       const files = getSavedFiles();
       const fileNames = Object.keys(files);
       if (fileNames.length === 0) {
-        alert("No saved search files to backup.");
+        alert("No saved cases to backup.");
         return;
       }
 
@@ -7455,20 +7497,21 @@ function buildHomePage() {
       const file = e.target.files[0];
       if (!file) return;
       const reader = new FileReader();
-      reader.onload = (event) => {
+      reader.onload = async (event) => {
         try {
           const importedBundle = JSON.parse(event.target.result);
           if (!importedBundle.pages || !importedBundle.fileName) {
-              alert('Invalid search file format. Missing pages or fileName.');
+              alert('Invalid case file format. Missing pages or case number.');
               return;
           }
-          logCreation('Imported Search File', importedBundle.fileName, importedBundle);
+          logCreation('Imported Case #', importedBundle.fileName, importedBundle);
           
-          // Set bucket ID for the imported search
+          // Set the internal bucket for the imported CASE #.
           const newBucket = importedBundle.fileName.replace('.json', '').replace(/[^a-zA-Z0-9_-]/g, '_');
-          setSyncBucket(newBucket);
-
-          saveBundle(importedBundle);
+          // Await the server writes before reloading; otherwise the reload aborts
+          // the in-flight case-number PUT and bundle push and the import is lost.
+          await setSyncBucket(newBucket);
+          await saveBundle(importedBundle);
           window.location.reload();
         } catch (err) {
           alert('Error importing file: ' + err.message);
@@ -10775,10 +10818,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
     }
 
-    // Load server settings in the background. Awaiting a fetch with no timeout here
-    // means an unreachable/slow sync server would stall the rest of init — including
-    // wiring up the home-page Save/New/Import buttons and other page handlers.
-    loadServerSettings();
+    // Working data lives only in memory (_memoryStorage) and is wiped on every
+    // reload, so the database is the single source of truth. Await the server
+    // settings first so getSyncBucket() knows the current CASE # on a fresh load;
+    // otherwise the case number and every saved row disappear on refresh (and a
+    // later auto-save can even overwrite the server with an empty default bundle).
+    // The wait is bounded by a timeout so an unreachable server can't hang the page.
+    await withTimeout(loadServerSettings(), 8000);
 
     if (!getSyncBucket() && !isHomePage()) {
         // No case number is set yet. Instead of silently bouncing the user back
@@ -10789,12 +10835,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
     }
     
-    // Kick off the initial sync WITHOUT blocking page setup. Awaiting it would hang
-    // the whole page (leaving buttons/handlers unwired) whenever the server is slow
-    // or down. syncWithServer() calls refreshSyncUI() itself once fresh data lands,
-    // so the UI still updates when the sync completes.
+    // Pull the latest bundle and file list from the database BEFORE rendering so a
+    // reload restores everything (CASE # + all rows) from the server instead of
+    // showing an empty default — and so no empty bundle is pushed before the real
+    // data has been read back. Bounded by a timeout so a slow/down server still
+    // lets the page finish loading (it re-syncs on the next save/visibility change).
     if (getSyncBucket()) {
-        syncWithServer();
+        await withTimeout(syncWithServer(), 10000);
     }
     
     const bundle = loadBundle();
@@ -13250,6 +13297,17 @@ function getAuthHeaders(extra = {}) {
     return { ...headers, ...extra };
 }
 
+// Await a promise but give up after `ms` milliseconds so a slow or unreachable
+// server can never hang page initialization. Resolves with undefined on timeout
+// (and swallows rejections) because callers only need a best-effort attempt and
+// then must continue rendering the page regardless.
+function withTimeout(promise, ms) {
+    return Promise.race([
+        Promise.resolve(promise).catch(() => undefined),
+        new Promise((resolve) => setTimeout(resolve, ms))
+    ]);
+}
+
 async function syncWithServer() {
     if (isSyncing) return;
     const bucket = getSyncBucket();
@@ -13346,7 +13404,13 @@ async function syncWithServer() {
                     pushBundleToServer(localBundle);
                 }
             }
-        } else if (resp.status === 404 && !isNewDevice) {
+        } else if (resp.status === 404) {
+            // The server has no bundle for this CASE # yet. Seed it with the
+            // current bundle (a freshly-opened case starts from defaultBundle(),
+            // which already contains the blank placeholder rows every page needs)
+            // so the database is populated and pages have data to render instead
+            // of crashing on an empty case. This runs even on a fresh device/reload
+            // so opening a brand-new case immediately writes its rows to the DB.
             pushBundleToServer(loadBundle());
         }
 

@@ -14,7 +14,7 @@
       <div class="nav-wrap">
         <div>
           <div class="brand">Search & Rescue Theory Software</div>
-          <div class="file-badge">Current file: <span data-file-name>us-pill-data.json</span></div>
+          <div class="file-badge">Case #: <span data-file-name>us-pill-data.json</span></div>
         </div>
                                                 <nav>
           <a href="home.html" id="nav-home" class="active" title="Home"><svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 9l9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z"></path><polyline points="9 22 9 12 15 12 15 22"></polyline></svg></a>
@@ -44,7 +44,7 @@
               <p>All table data across the site is stored together as one exportable file. Export it anytime, rename it, import it back later, or reset to a blank file.</p>
             </div>
             <div class="hero-col-right" style="display: flex; justify-content: flex-end; align-items: center;">
-              <button id="print-search-file-btn" class="clear-btn" style="white-space: nowrap;">Search File Printout</button>
+              <button id="print-search-file-btn" class="clear-btn" style="white-space: nowrap;">Case # Printout</button>
             </div>
           </div>
         </section>
@@ -60,7 +60,7 @@
           </div>
 
           <div id="search-history-panel" class="home-panel full-width" style="display: none;">
-            <h2>Search History</h2>
+            <h2>Case # History</h2>
             <div id="search-history-list" style="display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; margin-top: 10px;">
               <!-- History items will be injected here -->
             </div>
@@ -164,7 +164,7 @@
 
           <div class="home-panel full-width">
             <div style="display: flex; justify-content: space-between; align-items: center;">
-              <h2>Saved Search Files</h2>
+              <h2>Saved Cases</h2>
               <button id="backup-all-zip-btn" class="clear-btn" type="button" style="font-size: 0.8rem; padding: 5px 10px;">Backup All (ZIP)</button>
             </div>
             <div style="overflow-x: auto; margin-top: 15px;">
@@ -178,7 +178,7 @@
                   </tr>
                 </thead>
                 <tbody id="saved-files-body">
-                  <tr><td colspan="4" style="text-align: center; color: var(--muted); padding: 20px;">No saved search files yet.</td></tr>
+                  <tr><td colspan="4" style="text-align: center; color: var(--muted); padding: 20px;">No saved cases yet.</td></tr>
                 </tbody>
               </table>
             </div>
