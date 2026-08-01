@@ -5,6 +5,7 @@ const BUNDLE_STORAGE_KEY = 'pill-table-bundle-v1';
 const FILE_LIST_STORAGE_KEY = 'sar-saved-files-v1';
 const DEFAULT_FILE_NAME = 'us-pill-data.json';
 const SYNC_URL_STORAGE_KEY = 'sar-sync-url-v1';
+const SYNC_URL_LOCAL_STORAGE_KEY = 'sar-sync-url-local-v1';
 const SYNC_BUCKET_STORAGE_KEY = 'sar-sync-bucket-v1';
 const USER_NAME_STORAGE_KEY = 'sar-user-name-v1';
 const USER_PASSWORD_STORAGE_KEY = 'sar-user-password-v1';
@@ -404,7 +405,31 @@ async function withSaveButtonFeedback(button, saveAction, options = {}) {
 // so all API requests must be sent to this absolute URL instead of a relative path.
 const DEFAULT_SYNC_SERVER_URL = 'https://sarwebtheory2-production.up.railway.app';
 
+// A locally-stored (cookie) sync server URL, set from the login popup BEFORE
+// authentication. This is the source against which all data flows in and out.
+// It must be readable before login, so it lives in a cookie rather than the
+// server-side settings (which are only loaded after a successful login).
+function getLocalSyncServerUrl() {
+    const url = getCookie(SYNC_URL_LOCAL_STORAGE_KEY);
+    return (url && /^https?:\/\//i.test(url)) ? url : '';
+}
+
+function setLocalSyncServerUrl(url) {
+    const trimmed = typeof url === 'string' ? url.trim() : '';
+    if (trimmed) {
+        setCookie(SYNC_URL_LOCAL_STORAGE_KEY, trimmed);
+    } else {
+        eraseCookie(SYNC_URL_LOCAL_STORAGE_KEY);
+    }
+}
+
 function getSyncServerUrl() {
+    // A URL explicitly set from the login popup wins over everything else so the
+    // user can point the app at their own server before (and after) logging in.
+    const localUrl = getLocalSyncServerUrl();
+    if (localUrl) {
+        return localUrl;
+    }
     const configuredUrl = _serverSettings && _serverSettings[SYNC_URL_STORAGE_KEY];
     // Only honor an explicitly configured absolute URL. A stale relative value
     // like "data.php" would resolve against the static host and fail with a 405.
@@ -588,7 +613,7 @@ function showLoginPopup() {
             }, 300);
         }
     };
-    const popup = createPopup('Login / Register', null, onCancel);
+    const popup = createPopup('Login', null, onCancel);
     popup.classList.add('login-popup');
     const content = popup.querySelector('.popup-content');
     const btnContainer = popup.querySelector('.popup-buttons');
@@ -651,33 +676,17 @@ function showLoginPopup() {
     };
     btnContainer.appendChild(loginBtn);
 
-    const registerBtn = document.createElement('button');
-    registerBtn.className = 'popup-btn';
-    registerBtn.textContent = 'Register';
-    registerBtn.onclick = async () => {
-        const username = usernameInput.value.trim();
-        const pin = pinInput.value.trim();
-        if (!username || !pin) return alert('Username and PIN required');
-
-        const serverUrl = getSyncServerUrl();
-        try {
-            const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/auth/register`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username, pin })
-            });
-            const data = await readJsonResponse(resp);
-            if (resp.ok && data.success) {
-                alert('Registration successful! Please login.');
-            } else {
-                alert(data.error || 'Registration failed');
-            }
-        } catch (e) {
-            console.error("Registration connection error:", e);
-            alert(`Registration failed: ${e.message || 'Unable to reach the sync server.'}`);
-        }
+    // Opens a second popup where the user can type/paste the address of the
+    // server against which all data flows in and out. This is the only server
+    // configuration exposed on the login screen (registration is intentionally
+    // not available here).
+    const setServerBtn = document.createElement('button');
+    setServerBtn.className = 'popup-btn';
+    setServerBtn.textContent = 'Set Server';
+    setServerBtn.onclick = () => {
+        showSetServerPopup();
     };
-    btnContainer.appendChild(registerBtn);
+    btnContainer.appendChild(setServerBtn);
 
     const cancelBtn = document.createElement('button');
     cancelBtn.className = 'popup-btn';
@@ -689,6 +698,84 @@ function showLoginPopup() {
     btnContainer.appendChild(cancelBtn);
 
     setTimeout(() => usernameInput.focus(), 100);
+}
+
+// Second popup (opened from the login popup's "Set Server" button) that lets the
+// user type or paste the address of the server against which all data flows in
+// and out. On "Set" the URL is validated and persisted locally so it takes
+// effect immediately for every request, including the login that follows.
+function showSetServerPopup() {
+    if (document.querySelector('.popup-overlay.set-server-popup')) return;
+    const popup = createPopup('Set Server', null, null);
+    popup.classList.add('set-server-popup');
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+
+    const inputs = document.createElement('div');
+    inputs.className = 'popup-input-container';
+    inputs.style.display = 'flex';
+    inputs.style.flexDirection = 'column';
+    inputs.style.gap = '10px';
+
+    const label = document.createElement('div');
+    label.textContent = 'Server address (e.g. https://your-server.example.com)';
+    label.style.textAlign = 'center';
+    label.style.fontSize = '0.9em';
+    label.style.opacity = '0.85';
+    inputs.appendChild(label);
+
+    const serverInput = document.createElement('input');
+    serverInput.type = 'text';
+    serverInput.placeholder = 'https://your-server.example.com';
+    serverInput.className = 'pill-input';
+    serverInput.style.textAlign = 'center';
+    serverInput.style.width = '100%';
+    serverInput.style.padding = '12px';
+    serverInput.value = getLocalSyncServerUrl() || getSyncServerUrl() || '';
+    inputs.appendChild(serverInput);
+
+    content.insertBefore(inputs, btnContainer);
+
+    const setBtn = document.createElement('button');
+    setBtn.className = 'popup-btn primary';
+    setBtn.textContent = 'Set';
+    setBtn.onclick = () => {
+        let url = serverInput.value.trim();
+        if (!url) return alert('Please enter a server address.');
+        // Be forgiving about a missing scheme so pasting a bare host still works.
+        if (!/^https?:\/\//i.test(url)) {
+            url = 'https://' + url;
+        }
+        try {
+            // Validate the address before persisting it.
+            // eslint-disable-next-line no-new
+            new URL(url);
+        } catch (e) {
+            return alert('That does not look like a valid server address.');
+        }
+        // Strip a trailing slash for a consistent base URL.
+        url = url.replace(/\/$/, '');
+        setLocalSyncServerUrl(url);
+        // Keep any loaded server-side settings in sync so it also persists for
+        // the logged-in session, not just this device's cookie.
+        if (_serverSettings) {
+            _serverSettings[SYNC_URL_STORAGE_KEY] = url;
+            saveServerSettings(_serverSettings);
+        }
+        alert(`Server set to:\n${url}`);
+        closePopup(popup);
+    };
+    btnContainer.appendChild(setBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => {
+        closePopup(popup);
+    };
+    btnContainer.appendChild(cancelBtn);
+
+    setTimeout(() => serverInput.focus(), 100);
 }
 
 function showBucketPromptPopup() {
@@ -7640,6 +7727,10 @@ function buildSettingsPage() {
             const serverUrl = syncUrlInput.value.trim();
 
             if (serverUrl) {
+                // Persist locally too so it takes effect immediately and is not
+                // masked by a stale login-popup cookie (getSyncServerUrl prefers
+                // the local value).
+                setLocalSyncServerUrl(serverUrl);
                 if (_serverSettings) {
                     _serverSettings[SYNC_URL_STORAGE_KEY] = serverUrl;
                     saveServerSettings(_serverSettings);
