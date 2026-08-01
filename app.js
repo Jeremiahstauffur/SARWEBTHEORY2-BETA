@@ -553,6 +553,29 @@ async function fetchUserHistory() {
     return [];
 }
 
+// Read a fetch Response as JSON without crashing when the server answers with
+// something that is not JSON. An outdated or misconfigured sync server returns
+// an HTML page (for example "<!DOCTYPE html> ... Cannot POST /api/auth/login"),
+// which otherwise makes resp.json() throw the cryptic
+// "Unexpected token '<', "<!DOCTYPE "... is not valid JSON".
+async function readJsonResponse(resp) {
+    const raw = await resp.text();
+    const contentType = (resp.headers.get('content-type') || '').toLowerCase();
+    if (contentType.includes('application/json') || /^\s*[[{]/.test(raw)) {
+        try {
+            return JSON.parse(raw);
+        } catch (e) {
+            // Content was not valid JSON; fall through to the descriptive error.
+        }
+    }
+    const looksLikeHtml = /^\s*</.test(raw);
+    const snippet = raw.trim().replace(/\s+/g, ' ').slice(0, 120);
+    const detail = looksLikeHtml
+        ? 'the server returned an HTML page instead of JSON'
+        : (snippet ? `the server returned: "${snippet}"` : 'the server returned an empty response');
+    throw new Error(`Unexpected server response (HTTP ${resp.status}): ${detail}. Make sure the Sync Server URL points to the SAR sync server that provides /api/auth/login.`);
+}
+
 function showLoginPopup() {
     if (document.querySelector('.popup-overlay.login-popup')) return;
     const onCancel = () => {
@@ -611,7 +634,7 @@ function showLoginPopup() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, pin })
             });
-            const data = await resp.json();
+            const data = await readJsonResponse(resp);
             if (resp.ok && data.success) {
                 setCookie(USER_NAME_STORAGE_KEY, data.user.username);
                 setCookie(USER_PASSWORD_STORAGE_KEY, data.user.pin);
@@ -623,7 +646,7 @@ function showLoginPopup() {
             }
         } catch (e) {
             console.error("Login connection error:", e);
-            alert(`Failed to connect to server: ${e.message || 'Unknown error'}`);
+            alert(`Login failed: ${e.message || 'Unable to reach the sync server.'}`);
         }
     };
     btnContainer.appendChild(loginBtn);
@@ -643,7 +666,7 @@ function showLoginPopup() {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({ username, pin })
             });
-            const data = await resp.json();
+            const data = await readJsonResponse(resp);
             if (resp.ok && data.success) {
                 alert('Registration successful! Please login.');
             } else {
@@ -651,7 +674,7 @@ function showLoginPopup() {
             }
         } catch (e) {
             console.error("Registration connection error:", e);
-            alert(`Failed to connect to server: ${e.message || 'Unknown error'}`);
+            alert(`Registration failed: ${e.message || 'Unable to reach the sync server.'}`);
         }
     };
     btnContainer.appendChild(registerBtn);

@@ -1258,6 +1258,29 @@ app.post('/api/call', genericCallHandler);
 app.get('/fetch-map', fetchMapHandler); // Alias for compatibility
 app.post('/fetch-map', fetchMapHandler); // Alias for compatibility
 
+// Fallback handlers so the API always answers with JSON. Without these,
+// Express' defaults return an HTML page ("<!DOCTYPE html> ... Cannot POST
+// /api/auth/login" for an unknown route, or "Bad Request" for a body-parser
+// failure). A browser that then calls resp.json() throws the cryptic
+// "Unexpected token '<', "<!DOCTYPE "... is not valid JSON".
+app.use((req, res) => {
+    res.status(404).json({
+        error: 'Not found',
+        method: req.method,
+        path: req.originalUrl
+    });
+});
+
+// eslint-disable-next-line no-unused-vars
+app.use((err, req, res, next) => {
+    const status = (err && (err.status || err.statusCode)) || 500;
+    console.error('[SERVER] Unhandled error:', err && err.message ? err.message : err);
+    if (res.headersSent) {
+        return next(err);
+    }
+    res.status(status).json({error: (err && err.message) ? err.message : 'Internal Server Error'});
+});
+
 // Only initialize the schema, log credential status, and start listening when
 // this file is run directly. When it is required (e.g. from a test), these
 // side effects are skipped so no port is opened and no DB connection is made.
