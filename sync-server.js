@@ -333,10 +333,184 @@ const initDatabaseSchema = () => {
             settings LONGTEXT,
             PRIMARY KEY (username)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+        // ------------------------------------------------------------------
+        // Structured, easily-managed tables. Every save from the website is
+        // decomposed into these tables so the Railway database holds one row
+        // per item (region, segment, person, ...) instead of a single JSON
+        // blob. Each table carries the team `username` and the `search_case`
+        // (the CASE # chosen on the home page) so data can be filtered to a
+        // single team + case.
+        // ------------------------------------------------------------------
+
+        // Login info (team usernames + passwords).
+        db.run(`CREATE TABLE IF NOT EXISTS login_info (
+            username VARCHAR(191) NOT NULL,
+            password VARCHAR(255),
+            search_case VARCHAR(191) DEFAULT NULL,
+            updatedAt VARCHAR(64),
+            PRIMARY KEY (username)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+        // Row-collection tables: many rows per (username, search_case).
+        COLLECTION_TABLES.forEach((table) => {
+            db.run(`CREATE TABLE IF NOT EXISTS \`${table}\` (
+                id BIGINT NOT NULL AUTO_INCREMENT,
+                username VARCHAR(191) NOT NULL,
+                search_case VARCHAR(191) NOT NULL,
+                row_index INT DEFAULT 0,
+                label VARCHAR(255),
+                data LONGTEXT,
+                updatedAt VARCHAR(64),
+                PRIMARY KEY (id),
+                KEY idx_${table}_user_case (username, search_case)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+        });
+
+        // Single-record tables: one row per (username, search_case).
+        SINGLE_TABLES.forEach((table) => {
+            db.run(`CREATE TABLE IF NOT EXISTS \`${table}\` (
+                username VARCHAR(191) NOT NULL,
+                search_case VARCHAR(191) NOT NULL,
+                data LONGTEXT,
+                updatedAt VARCHAR(64),
+                PRIMARY KEY (username, search_case)
+            ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+        });
     });
 };
 
-initDatabaseSchema();
+// Tables that hold one row per item in a page/list.
+const COLLECTION_TABLES = [
+    'regions',        // Regions page rows
+    'segments',       // Segments page rows
+    'personnel',      // Personnel page rows
+    'search_log',     // Search Log page rows
+    'uploaded_files', // Uploads page items
+    'maps_settings',  // Maps page settings/entries
+    'forms',          // Forms page entries
+    'activity_log'    // Activity log entries
+];
+
+// Tables that hold a single record per (username, search_case).
+const SINGLE_TABLES = [
+    'profile',        // Incident / profile page
+    'settings_page'   // Settings page values
+];
+
+// Every structured table that can be read back by the website.
+const STRUCTURED_TABLES = [...COLLECTION_TABLES, ...SINGLE_TABLES];
+
+// Promise wrapper around the sqlite-compatible db.run helper.
+const runAsync = (sql, params = []) => new Promise((resolve, reject) => {
+    db.run(sql, params, function (err) {
+        if (err) { reject(err); } else { resolve(this); }
+    });
+});
+
+const safeJsonParse = (value) => {
+    if (value == null) { return null; }
+    try { return JSON.parse(value); } catch (e) { return value; }
+};
+
+const toLabel = (value) => value == null ? null : String(value).slice(0, 255);
+
+// Pure transform: turn a saved bundle into the structured rows that belong in
+// each table. Returns null for payloads that are not real save bundles (file
+// lists, presence pings, ...). Kept side-effect free so it can be unit tested
+// without a database connection.
+const buildStructuredPlan = (bundle, fallbackCase) => {
+    if (!bundle || typeof bundle !== 'object') { return null; }
+    if (!bundle.pages || typeof bundle.pages !== 'object') { return null; }
+
+    // The CASE # is the bundle's own file/case name. Some pushes use a fixed
+    // store key ("bundle"), so prefer the name inside the payload and only fall
+    // back to the store key when the bundle does not carry one.
+    const searchCase = (typeof bundle.fileName === 'string' && bundle.fileName.trim())
+        ? bundle.fileName.trim()
+        : (fallbackCase || '');
+    if (!searchCase) { return null; }
+
+    const collection = (items, mapFn) => {
+        const list = Array.isArray(items) ? items : [];
+        return list.map((item, i) => {
+            const mapped = mapFn(item, i) || {};
+            const data = mapped.data === undefined ? item : mapped.data;
+            return { row_index: i, label: toLabel(mapped.label), data: data ?? null };
+        });
+    };
+
+    const pages = bundle.pages;
+    const regionRows = pages.index && Array.isArray(pages.index.rows) ? pages.index.rows : [];
+    const formsObj = bundle.forms && typeof bundle.forms === 'object' ? bundle.forms : {};
+    const formsArr = Object.keys(formsObj).map((key) => ({ key, value: formsObj[key] }));
+
+    return {
+        searchCase,
+        collections: {
+            regions: collection(regionRows, (row) => ({ label: Array.isArray(row) ? row[0] : '', data: row })),
+            segments: collection(pages.page2, (row) => ({ label: Array.isArray(row) ? row[0] : '', data: row })),
+            personnel: collection(pages.page3, (row) => ({ label: Array.isArray(row) ? row[0] : '', data: row })),
+            search_log: collection(pages.page4, (row) => ({ label: Array.isArray(row) ? row[0] : '', data: row })),
+            forms: collection(formsArr, (item) => ({ label: item.key, data: item.value })),
+            uploaded_files: collection(bundle.uploads, (u) => ({ label: u && (u.name || u.fileName || u.title) || '', data: u })),
+            maps_settings: collection(bundle.maps, (m) => ({ label: m && (m.name || m.id || m.title) || '', data: m })),
+            activity_log: collection(bundle.activityLog, (e) => ({ label: e && (e.type || e.action || e.event || e.message) || '', data: e }))
+        },
+        singles: {
+            profile: bundle.profile || {},
+            settings_page: {
+                theme: bundle.theme,
+                showTips: bundle.showTips,
+                background: bundle.background,
+                deleteMode: bundle.deleteMode,
+                segmentColorScaleUsePsriMax: bundle.segmentColorScaleUsePsriMax,
+                segmentColorScaleLowColor: bundle.segmentColorScaleLowColor,
+                segmentColorScaleMidColor: bundle.segmentColorScaleMidColor,
+                segmentColorScaleHighColor: bundle.segmentColorScaleHighColor,
+                segmentActiveSearchOpacityPercent: bundle.segmentActiveSearchOpacityPercent,
+                parCheckFrequency: bundle.parCheckFrequency
+            }
+        }
+    };
+};
+
+// Break a saved bundle into the structured tables above, tagged with the
+// team username and the CASE #. The current rows for (username, search_case)
+// are replaced so each table always mirrors the latest save.
+const decomposeBundleToTables = async (username, fallbackCase, bundle) => {
+    if (!username) { return; }
+    const plan = buildStructuredPlan(bundle, fallbackCase);
+    if (!plan) { return; }
+
+    const {searchCase, collections, singles} = plan;
+    const nowIso = new Date().toISOString();
+
+    for (const table of Object.keys(collections)) {
+        await runAsync(`DELETE FROM \`${table}\` WHERE username = ? AND search_case = ?`, [username, searchCase]);
+        for (const row of collections[table]) {
+            await runAsync(
+                `INSERT INTO \`${table}\` (username, search_case, row_index, label, data, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+                [username, searchCase, row.row_index, row.label, JSON.stringify(row.data ?? null), nowIso]
+            );
+        }
+    }
+
+    for (const table of Object.keys(singles)) {
+        await runAsync(
+            `REPLACE INTO \`${table}\` (username, search_case, data, updatedAt) VALUES (?, ?, ?, ?)`,
+            [username, searchCase, JSON.stringify(singles[table] ?? {}), nowIso]
+        );
+    }
+};
+
+// Expose the pure transform for unit testing without starting the server.
+if (typeof module !== 'undefined' && module.exports) {
+    module.exports.buildStructuredPlan = buildStructuredPlan;
+    module.exports.COLLECTION_TABLES = COLLECTION_TABLES;
+    module.exports.SINGLE_TABLES = SINGLE_TABLES;
+    module.exports.STRUCTURED_TABLES = STRUCTURED_TABLES;
+}
 
 app.use(cors({
     origin: '*',
@@ -362,6 +536,9 @@ app.post('/api/auth/register', (req, res) => {
             }
             return res.status(500).json({error: err.message});
         }
+        // Mirror the credentials into the structured login_info table.
+        db.run("INSERT OR REPLACE INTO login_info (username, password, updatedAt) VALUES (?, ?, ?)",
+            [username, hashedPassword, new Date().toISOString()]);
         res.json({success: true, user: {username, pin}});
     });
 });
@@ -719,8 +896,65 @@ app.put('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
                 [bucket, key, JSON.stringify(req.body), userName, userPin, saveTime],
                 (err) => {
                     if (err) return res.status(500).json({error: 'Failed to save data'});
+                    // Also split the saved bundle into the structured tables,
+                    // tagged with the team username and CASE # (the store key).
+                    decomposeBundleToTables(userName, key, req.body)
+                        .catch((decomposeErr) => console.error('[DB] decompose error:', decomposeErr.message));
                     res.json({success: true});
                 });
+    });
+});
+
+// Structured table read endpoints.
+//
+// These return rows from the normalized tables filtered to the authenticated
+// team username, and (when provided) to a single CASE # via ?case=...  so a
+// team only ever sees its own data for the chosen case.
+const mapStructuredRow = (row) => ({
+    ...row,
+    data: safeJsonParse(row.data)
+});
+
+// Read every structured table at once for a given CASE #.
+app.get('/api/v1/tables', authMiddleware, async (req, res) => {
+    const username = req.user.username;
+    const searchCase = req.query.case || req.query.searchCase || '';
+    try {
+        const result = {};
+        for (const table of STRUCTURED_TABLES) {
+            const params = [username];
+            let sql = `SELECT * FROM \`${table}\` WHERE username = ?`;
+            if (searchCase) { sql += ' AND search_case = ?'; params.push(searchCase); }
+            const rows = await new Promise((resolve, reject) => {
+                db.all(sql, params, (err, r) => err ? reject(err) : resolve(r || []));
+            });
+            result[table] = rows.map(mapStructuredRow);
+        }
+        res.json(result);
+    } catch (err) {
+        res.status(500).json({error: err.message});
+    }
+});
+
+// Read a single structured table for a given CASE #.
+app.get('/api/v1/tables/:table', authMiddleware, (req, res) => {
+    const {table} = req.params;
+    if (!STRUCTURED_TABLES.includes(table)) {
+        return res.status(404).json({error: 'Unknown table'});
+    }
+    const username = req.user.username;
+    const searchCase = req.query.case || req.query.searchCase || '';
+    const params = [username];
+    let sql = `SELECT * FROM \`${table}\` WHERE username = ?`;
+    if (searchCase) { sql += ' AND search_case = ?'; params.push(searchCase); }
+    if (SINGLE_TABLES.includes(table)) {
+        // ordering not meaningful for single-record tables
+    } else {
+        sql += ' ORDER BY row_index ASC';
+    }
+    db.all(sql, params, (err, rows) => {
+        if (err) return res.status(500).json({error: err.message});
+        res.json((rows || []).map(mapStructuredRow));
     });
 });
 
@@ -1024,8 +1258,14 @@ app.post('/api/call', genericCallHandler);
 app.get('/fetch-map', fetchMapHandler); // Alias for compatibility
 app.post('/fetch-map', fetchMapHandler); // Alias for compatibility
 
-logCredentialConfigurationStatus();
+// Only initialize the schema, log credential status, and start listening when
+// this file is run directly. When it is required (e.g. from a test), these
+// side effects are skipped so no port is opened and no DB connection is made.
+if (require.main === module) {
+    initDatabaseSchema();
+    logCredentialConfigurationStatus();
 
-app.listen(PORT, '0.0.0.0', () => {
-    console.log(`Sync server v1.3.0 listening on port ${PORT}`);
-});
+    app.listen(PORT, '0.0.0.0', () => {
+        console.log(`Sync server v1.3.0 listening on port ${PORT}`);
+    });
+}

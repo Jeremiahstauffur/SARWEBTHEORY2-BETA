@@ -7281,8 +7281,9 @@ function buildHomePage() {
 
   saveNameBtn.onclick = () => {
     const currentBundle = loadBundle();
+    // CASE #: store exactly what the user typed (letters, numbers and symbols
+    // are all allowed). No ".json" suffix is forced onto the value anymore.
     let nextName = fileNameInput.value.trim() || DEFAULT_FILE_NAME;
-    if (!nextName.toLowerCase().endsWith('.json')) nextName += '.json';
     
     // Check if we are renaming an existing file list entry
     const files = getSavedFiles();
@@ -7302,7 +7303,7 @@ function buildHomePage() {
     saveBundle(currentBundle);
 
     fileNameInput.value = nextName;
-    homeStatus.textContent = `File identifier updated to ${nextName} and saved to list.`;
+    homeStatus.textContent = `CASE # updated to ${nextName} and saved to list.`;
     updateFileNameDisplay();
     buildSavedFilesTable();
   };
