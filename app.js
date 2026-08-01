@@ -7174,6 +7174,158 @@ async function populateSearchHistory() {
     }
 }
 
+// Website-themed popup (replacing the raw browser prompt) for creating a new
+// case number or switching to one already associated with the account. Reuses
+// the same createPopup/pill-input/mini-pill patterns as showUserSelectionPopup()
+// so it matches the site theme.
+function showCaseNumberPopup(originElement = null) {
+    if (document.querySelector('.popup-overlay.case-number-popup')) return;
+    const popup = createPopup('Case Number', originElement);
+    popup.classList.add('case-number-popup');
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+
+    const inputs = document.createElement('div');
+    inputs.className = 'popup-input-container';
+    inputs.style.display = 'flex';
+    inputs.style.flexDirection = 'column';
+    inputs.style.gap = '12px';
+
+    const label = document.createElement('div');
+    label.textContent = 'Type a case number, or pick an existing one below.';
+    label.style.textAlign = 'center';
+    label.style.fontSize = '0.9em';
+    label.style.opacity = '0.85';
+    inputs.appendChild(label);
+
+    const caseInput = document.createElement('input');
+    caseInput.type = 'text';
+    caseInput.placeholder = 'New case number';
+    caseInput.className = 'pill-input';
+    caseInput.style.textAlign = 'center';
+    caseInput.style.width = '100%';
+    caseInput.style.padding = '12px';
+    inputs.appendChild(caseInput);
+
+    const listContainer = document.createElement('div');
+    listContainer.style.display = 'flex';
+    listContainer.style.flexWrap = 'wrap';
+    listContainer.style.justifyContent = 'center';
+    listContainer.style.gap = '5px';
+    listContainer.style.marginTop = '5px';
+    listContainer.style.maxHeight = '220px';
+    listContainer.style.overflowY = 'auto';
+    inputs.appendChild(listContainer);
+
+    content.insertBefore(inputs, btnContainer);
+
+    // Cache of existing case numbers (sync buckets) for this account. Populated
+    // asynchronously so the popup renders immediately even if the server is slow.
+    let existingCases = [];
+
+    // Same normalization the New-search creation uses, so "exact duplicate" is
+    // judged on the actual stored bucket id.
+    const normalizeBucket = (name) =>
+        name.replace(/\.json$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_');
+
+    const updateList = () => {
+        listContainer.innerHTML = '';
+        const query = caseInput.value.trim().toLowerCase();
+        const filtered = existingCases.filter(item =>
+            (item.bucket || '').toLowerCase().includes(query)
+        );
+        if (filtered.length === 0) {
+            const empty = document.createElement('div');
+            empty.style.fontSize = '0.85em';
+            empty.style.opacity = '0.6';
+            empty.textContent = existingCases.length === 0
+                ? 'No existing case numbers.'
+                : 'No matches.';
+            listContainer.appendChild(empty);
+            return;
+        }
+        filtered.forEach(item => {
+            const pill = document.createElement('button');
+            pill.className = 'mini-pill';
+            pill.textContent = item.bucket;
+            pill.onclick = () => {
+                setSyncBucket(item.bucket);
+                window.location.reload();
+            };
+            listContainer.appendChild(pill);
+        });
+    };
+
+    caseInput.oninput = updateList;
+    updateList();
+
+    // Fetch existing case numbers without blocking popup rendering.
+    fetchUserHistory().then(history => {
+        existingCases = Array.isArray(history) ? history : [];
+        updateList();
+    }).catch(() => {
+        existingCases = [];
+        updateList();
+    });
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'popup-btn primary';
+    saveBtn.textContent = 'Save';
+    saveBtn.onclick = () => {
+        const typed = caseInput.value.trim();
+        if (!typed) return alert('Please enter a case number.');
+
+        const newBucket = normalizeBucket(typed);
+        if (!newBucket) return alert('Please enter a valid case number.');
+
+        // Reject exact duplicates (case-insensitive) against the fetched buckets.
+        const isDuplicate = existingCases.some(item =>
+            (item.bucket || '').toLowerCase() === newBucket.toLowerCase()
+        );
+        if (isDuplicate) {
+            return alert(`A case number "${newBucket}" already exists. Pick it from the list or choose a different name.`);
+        }
+
+        // Build the new search, preserving personnel/accounts (same as the old
+        // New-search flow).
+        let nextName = typed;
+        if (!nextName.toLowerCase().endsWith('.json')) nextName += '.json';
+
+        const currentBundle = loadBundle();
+        const newBundle = defaultBundle();
+        newBundle.fileName = nextName;
+
+        const oldPersonnel = currentBundle.pages.page3 || [];
+        const preservedPersonnel = oldPersonnel.filter(r => r[0] && r[0].trim() !== '').map(r => {
+            const newRow = [...r];
+            newRow[1] = ''; // Clear team
+            newRow[2] = ''; // Clear lead
+            newRow[6] = 'false'; // Off-scene
+            return newRow;
+        });
+        if (preservedPersonnel.length > 0) {
+            newBundle.pages.page3 = preservedPersonnel;
+        }
+
+        newBundle.accounts = currentBundle.accounts;
+
+        logCreation('New Search File', newBundle.fileName, newBundle);
+
+        setSyncBucket(newBucket);
+        saveBundle(newBundle);
+        window.location.reload();
+    };
+    btnContainer.appendChild(saveBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => closePopup(popup);
+    btnContainer.appendChild(cancelBtn);
+
+    setTimeout(() => caseInput.focus(), 100);
+}
+
 function buildHomePage() {
   updateFileNameDisplay();
   populateSearchHistory();
@@ -7188,70 +7340,7 @@ function buildHomePage() {
 
   const createNewBtn = document.getElementById('create-new-search-btn');
   if (createNewBtn) {
-    createNewBtn.onclick = () => {
-        const popup = createPopup('Create New Search?', createNewBtn);
-        const content = popup.querySelector('.popup-content');
-        const btnContainer = popup.querySelector('.popup-buttons');
-        
-        const desc = document.createElement('p');
-        desc.style.color = 'var(--muted)';
-        desc.style.fontSize = '0.9rem';
-        desc.style.margin = '10px 0 20px 0';
-        desc.textContent = 'Create a new search file? Registered personnel will be preserved but set to off-scene.';
-        content.insertBefore(desc, btnContainer);
-        
-        const confirmBtn = document.createElement('button');
-        confirmBtn.className = 'popup-btn primary';
-        confirmBtn.textContent = 'Confirm';
-        confirmBtn.onclick = () => {
-            let nextName = prompt('Enter a name for the new search:', 'new-search.json');
-            if (nextName === null) {
-                closePopup(popup);
-                return;
-            }
-            nextName = nextName.trim();
-            if (!nextName) nextName = 'new-search.json';
-            if (!nextName.toLowerCase().endsWith('.json')) nextName += '.json';
-
-            const currentBundle = loadBundle();
-            const newBundle = defaultBundle();
-            newBundle.fileName = nextName;
-            
-            // Preserve personnel but set to off-scene
-            const oldPersonnel = currentBundle.pages.page3 || [];
-            const preservedPersonnel = oldPersonnel.filter(r => r[0] && r[0].trim() !== '').map(r => {
-                const newRow = [...r];
-                newRow[1] = ''; // Clear team
-                newRow[2] = ''; // Clear lead
-                newRow[6] = 'false'; // Off-scene
-                return newRow;
-            });
-            
-            if (preservedPersonnel.length > 0) {
-                newBundle.pages.page3 = preservedPersonnel;
-            }
-            
-            // Preserve accounts
-            newBundle.accounts = currentBundle.accounts;
-
-            logCreation('New Search File', newBundle.fileName, newBundle);
-            
-            // Set bucket ID for the new search
-            const newBucket = nextName.replace('.json', '').replace(/[^a-zA-Z0-9_-]/g, '_');
-            setSyncBucket(newBucket);
-
-            saveBundle(newBundle);
-            window.location.reload();
-        };
-        
-        const cancelBtn = document.createElement('button');
-        cancelBtn.className = 'popup-btn';
-        cancelBtn.textContent = 'Cancel';
-        cancelBtn.onclick = () => closePopup(popup);
-        
-        btnContainer.appendChild(confirmBtn);
-        btnContainer.appendChild(cancelBtn);
-    };
+    createNewBtn.onclick = () => showCaseNumberPopup(createNewBtn);
   }
 
   const printBtn = document.getElementById('print-search-file-btn');
@@ -10692,6 +10781,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     loadServerSettings();
 
     if (!getSyncBucket() && !isHomePage()) {
+        // No case number is set yet. Instead of silently bouncing the user back
+        // to home, send them home and flag that the case-number popup should open
+        // so they can create/select one (confirmed behavior: prompt to pick).
+        try { sessionStorage.setItem('sar-open-case-popup', '1'); } catch (e) { /* ignore */ }
         window.location.href = 'home.html';
         return;
     }
@@ -10778,6 +10871,15 @@ document.addEventListener('DOMContentLoaded', async () => {
 
   if (isHomePage()) {
     buildHomePage();
+    // If the user was redirected here because no case number was set (or there is
+    // still none), open the themed case-number popup so they can pick/create one
+    // instead of being silently stranded on home.
+    let shouldPromptCase = false;
+    try { shouldPromptCase = sessionStorage.getItem('sar-open-case-popup') === '1'; } catch (e) { /* ignore */ }
+    if (shouldPromptCase) {
+        try { sessionStorage.removeItem('sar-open-case-popup'); } catch (e) { /* ignore */ }
+        showCaseNumberPopup();
+    }
     return;
   }
 
