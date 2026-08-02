@@ -334,6 +334,17 @@ const initDatabaseSchema = () => {
             PRIMARY KEY (username)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
+        // Super-Admin credentials that gate account registration. This table is
+        // populated manually by the operator (no UI manages it): insert one row
+        // per admin code you want to accept. Registration is allowed only when
+        // the password typed in the Super-Admin popup matches admin_password of
+        // ANY row here. admin_name is informational bookkeeping only.
+        db.run(`CREATE TABLE IF NOT EXISTS admin_credentials (
+            admin_name VARCHAR(191) NOT NULL,
+            admin_password VARCHAR(255),
+            PRIMARY KEY (admin_name)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
         // ------------------------------------------------------------------
         // Structured, easily-managed tables. Every save from the website is
         // decomposed into these tables so the Railway database holds one row
@@ -521,25 +532,44 @@ app.use(express.json({limit: '50mb'}));
 
 // Auth Endpoints
 app.post('/api/auth/register', (req, res) => {
-    const {username, pin} = req.body;
+    const {username, pin, adminPassword} = req.body;
     if (!username || !pin) {
         return res.status(400).json({error: 'Username and PIN are required'});
     }
 
-    const hashedPassword = crypto.createHash('sha256').update(pin).digest('hex');
+    // Registration is gated behind a Super-Admin password. The gate lives here,
+    // server-side, so it cannot be bypassed by editing the client. Reject the
+    // request when no admin password was supplied.
+    if (!adminPassword) {
+        return res.status(403).json({error: 'Super-Admin password is required.'});
+    }
 
-    db.run("INSERT INTO users (username, password, pin) VALUES (?, ?, ?)", 
-        [username, hashedPassword, pin], (err) => {
-        if (err) {
-            if (err.message.includes('UNIQUE constraint failed')) {
-                return res.status(400).json({error: 'User already exists'});
-            }
-            return res.status(500).json({error: err.message});
+    // The admin password must match admin_password of ANY row in
+    // admin_credentials (compared as plaintext, per the operator's request).
+    // An empty table therefore blocks all registration by design.
+    db.get("SELECT admin_name FROM admin_credentials WHERE admin_password = ?", [adminPassword], (adminErr, adminRow) => {
+        if (adminErr) {
+            return res.status(500).json({error: adminErr.message});
         }
-        // Mirror the credentials into the structured login_info table.
-        db.run("INSERT OR REPLACE INTO login_info (username, password, updatedAt) VALUES (?, ?, ?)",
-            [username, hashedPassword, new Date().toISOString()]);
-        res.json({success: true, user: {username, pin}});
+        if (!adminRow) {
+            return res.status(403).json({error: 'Invalid Super-Admin password.'});
+        }
+
+        const hashedPassword = crypto.createHash('sha256').update(pin).digest('hex');
+
+        db.run("INSERT INTO users (username, password, pin) VALUES (?, ?, ?)",
+            [username, hashedPassword, pin], (err) => {
+            if (err) {
+                if (err.message.includes('UNIQUE constraint failed')) {
+                    return res.status(400).json({error: 'User already exists'});
+                }
+                return res.status(500).json({error: err.message});
+            }
+            // Mirror the credentials into the structured login_info table.
+            db.run("INSERT OR REPLACE INTO login_info (username, password, updatedAt) VALUES (?, ?, ?)",
+                [username, hashedPassword, new Date().toISOString()]);
+            res.json({success: true, user: {username, pin}});
+        });
     });
 });
 
@@ -570,7 +600,13 @@ const authMiddleware = (req, res, next) => {
     }
 
     const hashedPassword = crypto.createHash('sha256').update(password).digest('hex');
-    db.get("SELECT * FROM users WHERE username = ? AND password = ?", [username, hashedPassword], (err, row) => {
+    // Accept EITHER the hashed password (accounts created through the app store
+    // password = sha256(pin)) OR the plaintext pin (accounts inserted directly
+    // into the DB by an operator with only username + pin). /api/auth/login only
+    // checks the plaintext pin, so without this an admin-inserted account could
+    // log in but every authenticated read/write would return 401 and silently
+    // fail to persist (the reported "Case # never saves / DB stays empty" bug).
+    db.get("SELECT * FROM users WHERE username = ? AND (password = ? OR pin = ?)", [username, hashedPassword, password], (err, row) => {
         if (err) return res.status(500).json({error: err.message});
         if (!row) return res.status(401).json({error: 'Invalid credentials'});
         req.user = row;

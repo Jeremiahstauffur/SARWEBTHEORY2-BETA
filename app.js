@@ -694,10 +694,22 @@ function showLoginPopup() {
     };
     btnContainer.appendChild(loginBtn);
 
+    // Registration is gated behind a Super-Admin password. This button turns the
+    // username/PIN already typed above into a new account, but only after the
+    // themed Super-Admin popup verifies the admin password server-side.
+    const registerBtn = document.createElement('button');
+    registerBtn.className = 'popup-btn';
+    registerBtn.textContent = 'Register';
+    registerBtn.onclick = () => {
+        const username = usernameInput.value.trim();
+        const pin = pinInput.value.trim();
+        if (!username || !pin) return alert('Enter a username and PIN to register.');
+        showAdminVerifyPopup(username, pin, popup);
+    };
+    btnContainer.appendChild(registerBtn);
+
     // Opens a second popup where the user can type/paste the address of the
-    // server against which all data flows in and out. This is the only server
-    // configuration exposed on the login screen (registration is intentionally
-    // not available here).
+    // server against which all data flows in and out.
     const setServerBtn = document.createElement('button');
     setServerBtn.className = 'popup-btn';
     setServerBtn.textContent = 'Set Server';
@@ -716,6 +728,94 @@ function showLoginPopup() {
     btnContainer.appendChild(cancelBtn);
 
     setTimeout(() => usernameInput.focus(), 100);
+}
+
+// Themed Super-Admin verification popup (opened from the login popup's
+// "Register" button). It collects ONLY the Super-Admin password and sends it,
+// together with the username/PIN typed on the login popup, to the gated
+// /api/auth/register endpoint. On success the new account is created and the
+// user is logged in immediately (the same path as a normal login). The gate
+// itself lives on the server, so this popup cannot bypass it.
+function showAdminVerifyPopup(username, pin, loginPopup) {
+    if (document.querySelector('.popup-overlay.admin-verify-popup')) return;
+    const popup = createPopup('Super-Admin Verification', null, null);
+    popup.classList.add('admin-verify-popup');
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+
+    const inputs = document.createElement('div');
+    inputs.className = 'popup-input-container';
+    inputs.style.display = 'flex';
+    inputs.style.flexDirection = 'column';
+    inputs.style.gap = '10px';
+
+    const label = document.createElement('div');
+    label.textContent = `Enter the Super-Admin password to create the account "${username}".`;
+    label.style.textAlign = 'center';
+    label.style.fontSize = '0.9em';
+    label.style.opacity = '0.85';
+    inputs.appendChild(label);
+
+    const adminInput = document.createElement('input');
+    adminInput.type = 'password';
+    adminInput.placeholder = 'Super-Admin password';
+    adminInput.className = 'pill-input';
+    adminInput.style.textAlign = 'center';
+    adminInput.style.width = '100%';
+    adminInput.style.padding = '12px';
+    inputs.appendChild(adminInput);
+
+    content.insertBefore(inputs, btnContainer);
+
+    const registerBtn = document.createElement('button');
+    registerBtn.className = 'popup-btn primary';
+    registerBtn.textContent = 'Register';
+    registerBtn.onclick = async () => {
+        const adminPassword = adminInput.value.trim();
+        if (!adminPassword) return alert('Enter the Super-Admin password.');
+
+        const serverUrl = getSyncServerUrl();
+        registerBtn.disabled = true;
+        registerBtn.textContent = 'Registering\u2026';
+        try {
+            const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/auth/register`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ username, pin, adminPassword })
+            });
+            const data = await readJsonResponse(resp);
+            if (resp.ok && data.success) {
+                // Auto-login the new account: identical to the login-success path.
+                setCookie(USER_NAME_STORAGE_KEY, data.user.username);
+                setCookie(USER_PASSWORD_STORAGE_KEY, data.user.pin);
+                setCurrentUser(data.user);
+                closePopup(popup);
+                if (loginPopup) closePopup(loginPopup);
+                window.location.reload();
+            } else {
+                alert(data.error || 'Registration failed');
+                registerBtn.disabled = false;
+                registerBtn.textContent = 'Register';
+            }
+        } catch (e) {
+            // Never log the admin password itself; only the error is reported.
+            console.error("Registration connection error:", e);
+            alert(`Registration failed: ${e.message || 'Unable to reach the sync server.'}`);
+            registerBtn.disabled = false;
+            registerBtn.textContent = 'Register';
+        }
+    };
+    btnContainer.appendChild(registerBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => {
+        closePopup(popup);
+    };
+    btnContainer.appendChild(cancelBtn);
+
+    setTimeout(() => adminInput.focus(), 100);
 }
 
 // Second popup (opened from the login popup's "Set Server" button) that lets the

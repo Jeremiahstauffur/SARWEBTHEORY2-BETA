@@ -5,144 +5,158 @@ sessionId: session-260801-155638-1c77
 # Requirements
 
 ### Overview & Goals
-After logging in, users are unable to navigate to any page other than the home page — they are instantly bounced back. This happens because the app requires a *case number* (internally a "sync bucket") to be set before any non-home page can be used, and there is currently no good way to create or pick one. The goals are:
+The login popup currently lets a user only log in — a previous change deliberately removed registration from the UI. The user now wants a **Register** button back, but locked behind a **Super-Admin** gate so only someone who knows the Super-Admin password can create new accounts. When **Register** is clicked, the app must ask for the Super-Admin password in a website-themed popup; that password is checked against a new, manually-populated database table before the username/PIN typed into the login fields are saved as a new account.
 
-1. Stop the silent redirect loop and instead guide the user to choose/create a case number.
-2. Replace the crude browser `prompt()` used by the **New** button with a proper, website-themed popup for managing case numbers.
+Goals:
+1. Add a **Register** button to the login popup that saves the username/PIN from the login fields as a new account.
+2. Gate registration behind a Super-Admin password collected via a website-themed popup (never a browser `prompt`).
+3. Verify that Super-Admin password server-side against a new two-column table (`admin_name`, `admin_password`) that the operator populates by hand.
+4. On success, auto-log-in the newly created account.
 
 ### Scope
 **In Scope**
-- A themed popup (opened by the **New** button next to the CASE # box) that lets the user:
-  - Type a new case number.
-  - See a live list of case numbers already associated with their account.
-  - Filter that list in real time as they type.
-  - Save a new case number, with exact-duplicate prevention.
-  - Select an existing case number from the list to switch to it.
-- Change the post-login navigation guard so that, when no case number is set, the app opens this popup instead of silently redirecting to home.
+- A **Register** button in `showLoginPopup()` (`app.js`) alongside Login / Set Server / Cancel.
+- A new themed popup (`showAdminVerifyPopup()`) that asks only for the Super-Admin password.
+- A gated `POST /api/auth/register` in `sync-server.js` that requires and verifies the Super-Admin password before creating the account.
+- A new `admin_credentials` table (exactly two columns: `admin_name`, `admin_password`) created by `initDatabaseSchema()` and populated manually by the operator.
+- Auto-login of the new account on successful registration.
 
 **Out of Scope**
-- Any server-side (`sync-server.js`) changes — the existing `/api/auth/history` endpoint already returns per-account case numbers.
-- Renaming or deleting existing case numbers.
-- Registration or authentication changes.
+- Any UI to create/manage admin rows (the operator inserts the row directly in the DB).
+- Changing the login flow, the Set-Server flow, or the Case #/sync-bucket logic.
+- Hashing the Super-Admin password (it is stored and compared as plaintext, per request) or broader password hardening.
+- Editing or deleting existing user accounts.
 
 ### User Stories
-- As a logged-in user, I want to click **New** by the CASE # box and get a website-themed popup (not a raw browser prompt) to type my case number.
-- As a user, I want to see the case numbers already associated with my account so I can reuse one instead of retyping it.
-- As a user, I want the list to filter down as I type so I can quickly find a matching case number.
-- As a user, I want to be blocked from creating an exact duplicate of a case number that already exists when I hit **Save**.
-- As a user, I want navigating between pages to work once I've chosen a case number, instead of being bounced back to home.
+- As an operator, I want a Super-Admin password gate on registration so only I (or people I trust) can create new team accounts.
+- As a user who knows the Super-Admin password, I want a **Register** button on the login popup that turns the username/PIN I typed into a new account.
+- As a user, I want the Super-Admin prompt to be a website-themed popup consistent with the rest of the app, not a raw browser dialog.
+- As a newly-registered user, I want to be logged in immediately after registering so I don't have to retype my credentials.
 
 ### Functional Requirements
-1. Clicking **New** (`#create-new-search-btn`) opens a themed popup built with the existing `createPopup()` helper.
-2. The popup contains a text input for the new case number and a scrollable, filterable list of existing case numbers fetched via `fetchUserHistory()`.
-3. Typing in the input filters the existing-case-number list case-insensitively (substring match), matching the existing `updatePills()` pattern.
-4. Clicking an existing case number in the list switches to it (`setSyncBucket(...)`) and reloads, preserving today's "switch search" behavior.
-5. **Save** validates the typed name; if a case number with the same (normalized) name already exists, it is rejected with a clear message and nothing is created.
-6. On a valid, non-duplicate name, **Save** creates the new search (preserving personnel/accounts, as the current New flow does), sets the sync bucket, and reloads.
-7. When no case number is set after login, the navigation guard opens the case-number popup instead of redirecting to `home.html`.
+1. `showLoginPopup()` shows a **Register** button in addition to Login, Set Server, and Cancel.
+2. Clicking **Register** first validates that a username and PIN are typed in the login fields; if either is empty it alerts and does not open the admin popup.
+3. Clicking **Register** (with fields filled) opens a themed `createPopup()`-based popup (e.g. titled "Super-Admin Verification") with a single password input and **Register** / **Cancel** buttons.
+4. Submitting the admin popup sends `{ username, pin, adminPassword }` to `POST /api/auth/register` on the currently-configured sync server.
+5. The server allows registration only if `adminPassword` matches the `admin_password` of ANY row in `admin_credentials`; otherwise it returns an error (HTTP 403) and creates no account.
+6. If the admin password is valid but the username already exists, the server returns the existing "User already exists" error (HTTP 400) and creates nothing.
+7. On success the client stores the credentials (username + PIN cookies), sets the current user, closes both popups, and reloads — logging the new account in automatically.
+8. On any failure the popup shows a clear message from the server's JSON `error` field (e.g. "Invalid Super-Admin password.") and stays open so the user can retry.
 
 ### Non-Functional Requirements
-- Reuse existing popup, input, and pill styling (`createPopup`, `pill-input`, `mini-pill`) so the popup matches the site theme.
-- The history fetch must not block popup rendering; the list populates asynchronously and degrades gracefully if the server is unreachable (empty list).
+- Reuse the existing themed popup + `pill-input` styling so the admin popup matches the site.
+- The Super-Admin password is sent over the same channel as login (POST JSON) and is never logged by the client.
+- Registration must remain impossible from the UI without a valid Super-Admin password — the gate lives server-side so it cannot be bypassed by editing the client.
+- No regression to existing login, Set-Server, or authenticated data flows.
 
 # Technical Design
 
 ### Current Implementation
-- **CASE # UI** lives in `home.html`: an input `#bundle-file-name`, a `#save-file-name` button, and a `#create-new-search-btn` (**New**) button.
-- **New button handler** is wired in `buildHomePage()` in `app.js` (around lines 7189–7255). It opens a confirm popup, then calls the native `prompt('Enter a name for the new search:', ...)`, sanitizes the name, builds a new bundle via `defaultBundle()`, preserves personnel/accounts, calls `setSyncBucket(newBucket)` and `saveBundle(...)`, then reloads.
-- **Case numbers = sync buckets.** `getSyncBucket()`/`setSyncBucket()` (lines 449–463) read/write `SYNC_BUCKET_STORAGE_KEY` in `_serverSettings`.
-- **Existing case numbers per account** come from `fetchUserHistory()` (lines 560–579), which calls `GET /api/auth/history` and returns `[{ bucket, lastAccessed }]` from the server's `user_buckets` table (`sync-server.js` line 581). This is already used by `populateSearchHistory()` (line 7136) to render a switchable list on the home page.
-- **Navigation guard** in the `DOMContentLoaded` handler (`app.js` line 10694): `if (!getSyncBucket() && !isHomePage()) { window.location.href = 'home.html'; return; }` — this is the source of the "bounced back to home" behavior.
-- **Reusable filter pattern:** `showUserSelectionPopup()` (lines 5019–5094) demonstrates a search input (`pill-input`) driving an `updatePills()` function that re-renders `mini-pill` buttons filtered by a lowercased substring query.
+- **Login popup (`app.js`, `showLoginPopup()` lines 622–719):** builds a `createPopup('Login', ...)` overlay with `usernameInput` + `pinInput` (`pill-input`), a **Login** button that POSTs to `/api/auth/login` and parses via `readJsonResponse()`, plus **Set Server** and **Cancel** buttons. A prior change removed the Register button (the comment at lines 697–700 states registration is intentionally absent here).
+- **Themed popups:** `createPopup(title, originElement, onClose)` (lines 4938–4977) returns an overlay containing `.popup-content` and `.popup-buttons`; `closePopup(overlay)` (lines 4930–4936) fades it out. `showSetServerPopup()` (lines 725–797) is the existing example of a second popup opened from the login popup.
+- **JSON parsing:** `readJsonResponse(resp)` (lines 604–620) returns parsed JSON for any JSON body regardless of status, and throws a descriptive error only for non-JSON/HTML responses — so a `403 { error }` body is returned and the caller checks `resp.ok && data.success`.
+- **Credential storage:** on login success the client sets the `USER_NAME_STORAGE_KEY` and `USER_PASSWORD_STORAGE_KEY` cookies (the latter to the PIN), calls `setCurrentUser(data.user)`, then reloads (lines 681–686).
+- **Server register (`sync-server.js`, `POST /api/auth/register` lines 523–544):** takes `{ username, pin }`, computes `sha256(pin)`, inserts into `users(username, password, pin)` and mirrors into `login_info`. It is currently **ungated** — anyone who can reach the endpoint can create an account.
+- **Schema (`sync-server.js`, `initDatabaseSchema()` lines 305–381):** creates `store`, `users`, `user_buckets`, `user_settings`, `login_info`, and the structured tables via `CREATE TABLE IF NOT EXISTS`.
+- **JSON fallbacks (`sync-server.js` lines 1266–1282):** a 404 handler and error middleware guarantee every API response — including register errors — is JSON, so the client's `readJsonResponse()` can surface them.
 
 ### Key Decisions
-- **Redirect behavior — Prompt to pick case # (confirmed with user):** keep the requirement that a case number be set before using non-home pages, but replace the silent `window.location.href = 'home.html'` bounce with opening the new case-number popup so the user can create/select one in place.
-- **Reuse existing patterns:** build the popup with `createPopup()` and reuse the `pill-input` + `mini-pill` + live-filter approach from `showUserSelectionPopup()` for consistency and minimal new code.
-- **Duplicate detection uses the same normalization as bucket creation:** compare the typed name after the same sanitization the New flow already applies (`replace('.json','').replace(/[^a-zA-Z0-9_-]/g, '_')`) against the buckets returned by `fetchUserHistory()`, case-insensitively, so "exact duplicate" is judged on the actual stored bucket id.
-- **No server changes:** the `/api/auth/history` endpoint already provides everything needed.
+- **Gate registration server-side, inside `POST /api/auth/register` (chosen):** the endpoint requires `adminPassword` and verifies it against `admin_credentials` before inserting the user, in a single request. Rationale: the check cannot be bypassed by editing the client, and it keeps the flow to one round-trip.
+- **Password-only match against any admin row (confirmed with user):** registration is allowed when the entered password equals the `admin_password` of any row; `admin_name` is informational bookkeeping only, so the popup asks for just the password.
+- **Plaintext admin password, compared directly (confirmed with user):** the operator types their admin code into the `admin_password` column as-is and the server compares it directly (`SELECT ... WHERE admin_password = ?`). Rationale: matches the user's mental model of "manually enter my admin code."
+- **Auto-login on success (confirmed with user):** reuse the exact login-success path (set cookies, `setCurrentUser`, reload) so the new account is signed in immediately.
+- **New two-column table, populated manually:** `admin_credentials(admin_name, admin_password)` is created by `initDatabaseSchema()` (idempotent `CREATE TABLE IF NOT EXISTS`) but seeded by the operator directly in the DB — there is no UI to manage it.
 
 ### Proposed Changes
-1. **New function `showCaseNumberPopup()` in `app.js`:**
-   - Build via `createPopup('New Case Number', ...)`, add a class (e.g. `case-number-popup`) and guard against double-open.
-   - Add a `pill-input` text field for the new case number and a scrollable list container for existing case numbers.
-   - On open, call `fetchUserHistory()` and cache the results; render an `updateList()` function (mirroring `updatePills()`) that filters cached case numbers by the lowercased input value and renders each as a clickable `mini-pill`/row.
-   - Clicking an existing entry: `setSyncBucket(entry.bucket)` then `window.location.reload()` (same as `populateSearchHistory()`).
-   - **Save** button: trim input; reject empty; compute the normalized bucket id; if it matches any existing bucket (case-insensitive) show an alert and abort; otherwise run the existing New-search creation logic (preserve personnel/accounts, `defaultBundle()`, `logCreation`, `setSyncBucket`, `saveBundle`, reload).
-   - A **Cancel** button that closes the popup.
-2. **Rewire the New button** in `buildHomePage()` to call `showCaseNumberPopup()` instead of the current confirm+`prompt()` block, removing the native `prompt()` usage.
-3. **Update the navigation guard** (line 10694): when `!getSyncBucket() && !isHomePage()`, redirect to `home.html` and then open `showCaseNumberPopup()` (or, if already home, just open the popup) so the user is prompted to pick a case number instead of being silently bounced.
+1. **`sync-server.js` — new table.** In `initDatabaseSchema()`, add:
+   ```sql
+   CREATE TABLE IF NOT EXISTS admin_credentials (
+       admin_name VARCHAR(191) NOT NULL,
+       admin_password VARCHAR(255),
+       PRIMARY KEY (admin_name)
+   ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4
+   ```
+2. **`sync-server.js` — gate `POST /api/auth/register`.** Read `{ username, pin, adminPassword }`. If `username`/`pin` is missing → 400 (unchanged). If `adminPassword` is missing → 403 "Super-Admin password is required." Then `db.get("SELECT admin_name FROM admin_credentials WHERE admin_password = ?", [adminPassword], ...)`; if no row matches → 403 "Invalid Super-Admin password." and create nothing; if a row matches → run the existing insert into `users` + `login_info` and return `{ success: true, user: { username, pin } }`.
+3. **`app.js` — Register button.** In `showLoginPopup()`, add a `popup-btn` **Register** button (placed after Login). Its handler reads `usernameInput`/`pinInput`; if either is empty it alerts (e.g. "Enter a username and PIN to register."); otherwise it calls `showAdminVerifyPopup(username, pin, popup)`.
+4. **`app.js` — new `showAdminVerifyPopup(username, pin, loginPopup)`.** Guard against double-open with a dedicated class; build with `createPopup('Super-Admin Verification', ...)`; add a short instruction label and a password `pill-input`; add a **Register** primary button and a **Cancel** button. The Register handler POSTs `{ username, pin, adminPassword }` to `${getSyncServerUrl()}/api/auth/register`, parses with `readJsonResponse()`, and on `resp.ok && data.success` performs the auto-login (set `USER_NAME_STORAGE_KEY`/`USER_PASSWORD_STORAGE_KEY` cookies, `setCurrentUser`, close the admin popup and the login popup, reload). On failure it `alert`s `data.error` and leaves the popup open. Cancel just closes the admin popup, returning to the login popup.
 
 ### Data Models / Contracts
-- `fetchUserHistory(): Promise<Array<{ bucket: string, lastAccessed: string }>>` — existing, unchanged.
-- New: `showCaseNumberPopup(): void` — renders the themed popup; no return value.
-- Bucket id normalization (existing, reused): `name.replace(/\.json$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_')`.
+- **New table** `admin_credentials(admin_name VARCHAR(191) PRIMARY KEY, admin_password VARCHAR(255))` — exactly two columns, seeded manually.
+- **`POST /api/auth/register`** request body changes from `{ username, pin }` to `{ username, pin, adminPassword }`:
+  - `403 { error: 'Super-Admin password is required.' }` when `adminPassword` is missing.
+  - `403 { error: 'Invalid Super-Admin password.' }` when no `admin_credentials` row matches.
+  - `400 { error: 'User already exists' }` unchanged.
+  - `200 { success: true, user: { username, pin } }` on success.
+- **New client function** `showAdminVerifyPopup(username, pin, loginPopup): void`.
+
+### Components
+- **`showLoginPopup()` (modified):** gains a **Register** button; the existing Login / Set Server / Cancel buttons are unchanged.
+- **`showAdminVerifyPopup()` (new):** the themed Super-Admin password popup that performs the gated registration and auto-login.
+- **`POST /api/auth/register` (modified):** now admin-gated.
+- **`initDatabaseSchema()` (modified):** creates the `admin_credentials` table.
 
 ### File Structure
-- `app.js` — **modified**: add `showCaseNumberPopup()`, rewire `#create-new-search-btn` handler in `buildHomePage()`, adjust the navigation guard in the `DOMContentLoaded` handler.
-- `home.html` — no change (existing `#create-new-search-btn` reused).
-- `sync-server.js` — no change.
+- `app.js` — **modified**: add the **Register** button in `showLoginPopup()`; add `showAdminVerifyPopup()`.
+- `sync-server.js` — **modified**: add the `admin_credentials` table in `initDatabaseSchema()`; gate `POST /api/auth/register`.
+- No HTML changes (the login popup is built entirely in `app.js`).
 
 ### Architecture Diagram
 ```mermaid
 graph TD
-    A[New button #create-new-search-btn] --> B[showCaseNumberPopup]
-    G[Nav guard: no bucket + not home] --> B
-    B --> C[fetchUserHistory GET /api/auth/history]
-    B --> D[Type + live filter]
-    D --> E[Save: dedupe + create bundle + setSyncBucket]
-    C --> F[Existing case #s list]
-    F --> H[Click: setSyncBucket + reload]
-    E --> H
+    A[Login popup: Register button] --> B[showAdminVerifyPopup]
+    B -->|POST /api/auth/register username, pin, adminPassword| C[sync-server register]
+    C -->|SELECT WHERE admin_password matches| D[(admin_credentials)]
+    D -->|match| E[INSERT users + login_info]
+    D -->|no match| F[403 Invalid Super-Admin password]
+    E -->|success| G[Auto-login: set cookies + reload]
+    F --> B
 ```
 
 ### Risks
-- **Server unreachable:** `fetchUserHistory()` returns `[]` on error, so duplicate detection can only check what it can fetch; Save should still proceed for new names. Mitigation: treat an empty/failed fetch as "no known duplicates" and rely on the server's `user_buckets` PRIMARY KEY to avoid true collisions.
-- **Guard + popup timing:** opening the popup right after a redirect must happen after `DOMContentLoaded`/credentials are available; ensure the popup is invoked in the same init flow where `getSyncBucket()` is checked.
+- **Deployment:** the server-side gate and the new table only take effect if the current `sync-server.js` is deployed to Railway. On an outdated backend, `/api/auth/register` behaves differently (or the table is missing); the operator must redeploy and insert an `admin_credentials` row before registration works.
+- **Empty admin table = no registration possible:** if no row exists, every attempt returns "Invalid Super-Admin password." This is by design; the operator must seed at least one row.
+- **`readJsonResponse()` wording** references `/api/auth/login`; it is still accurate enough for register errors, though its guidance text mentions login specifically. Optional: generalize the wording (low priority, not required).
+- **Plaintext storage** means anyone with DB read access can see the admin code; acceptable per the explicit request, but worth noting.
 
 # Testing
 
 ### Validation Approach
-Because this is browser UI logic in `app.js`, validate with a static syntax check plus targeted manual/DOM reasoning against the acceptance criteria. Run `node --check app.js` to confirm no syntax errors after edits (the same check used previously in this project).
+- Run `node --check app.js` and `node --check sync-server.js` after edits (syntax).
+- Run `node test_structured_tables.js` and `node test_sync_bucket_decoupling.js` to confirm no regressions in the server decompose logic and Case #/bucket coupling.
+- Optionally start the server locally and exercise `POST /api/auth/register` with `curl` (valid / invalid / missing admin password) to confirm the JSON responses and status codes, since the admin gate is pure server logic.
 
 ### Key Scenarios
-1. **New button opens themed popup:** clicking **New** shows the `createPopup`-based popup (not a browser `prompt`).
-2. **Existing list loads:** the popup lists case numbers returned by `fetchUserHistory()`.
-3. **Live filtering:** typing filters the list case-insensitively to matching case numbers.
-4. **Duplicate prevention:** typing a name whose normalized bucket matches an existing one and clicking **Save** shows a rejection message and creates nothing.
-5. **Create new:** typing a unique name and clicking **Save** creates the search, sets the bucket, and reloads.
-6. **Select existing:** clicking an existing entry switches to it and reloads.
-7. **Navigation prompt:** logging in with no case number and attempting to leave home opens the case-number popup instead of a silent bounce.
+1. **Register button appears:** the login popup shows Login, Register, Set Server, and Cancel.
+2. **Missing fields:** clicking Register with an empty username or PIN alerts and does not open the admin popup.
+3. **Themed admin popup:** clicking Register (fields filled) opens the `createPopup`-based Super-Admin password popup (not a browser prompt).
+4. **Valid admin password:** with a matching `admin_credentials` row, submitting creates the account and auto-logs-in (cookies set, page reloads).
+5. **Invalid admin password:** a non-matching password returns 403 and the popup shows "Invalid Super-Admin password." with nothing created.
+6. **Duplicate user:** a valid admin password with an existing username returns 400 "User already exists" and creates nothing.
 
 ### Edge Cases
-- Empty input on **Save** is rejected.
-- Names differing only by case or by non-alphanumeric characters that normalize to the same bucket id are treated as duplicates.
-- `fetchUserHistory()` failing returns an empty list; the popup still renders and Save still works for new names.
+- Missing `adminPassword` in the request → 403 "Super-Admin password is required."
+- Empty `admin_credentials` table → every registration is rejected as an invalid admin password.
+- Non-JSON / unreachable server → the client's `readJsonResponse()` surfaces a clear connection error and the popup stays open.
 
 ### Test Changes
-- No automated UI test framework exists for these popups; add no new test files. Rely on `node --check app.js` and manual verification of the scenarios above.
+- No UI test harness exists for these popups; add no new test files. Optionally add a small assertion that `sync-server.js` references `admin_credentials` in both the schema and the register handler; otherwise rely on `node --check` + the existing suites + manual/`curl` verification.
 
 # Delivery Steps
 
-### ✓ Step 1: Add themed case-number popup with live filtering and duplicate prevention
-A new `showCaseNumberPopup()` in `app.js` renders a website-themed popup for creating and picking case numbers.
+### ✓ Step 1: Add the admin_credentials table and gate the register endpoint (sync-server.js)
+Registration is allowed only when a Super-Admin password matching a manually-inserted row is supplied.
 
-- Add `showCaseNumberPopup()` built with the existing `createPopup()` helper, guarding against double-open with a dedicated overlay class.
-- Add a `pill-input` text field for the new case number and a scrollable list container for existing case numbers.
-- Call `fetchUserHistory()` on open, cache the results, and render an `updateList()` function that filters cached case numbers case-insensitively as the user types (mirroring the `updatePills()` pattern in `showUserSelectionPopup()`).
-- Render each existing case number as a clickable `mini-pill`/row that calls `setSyncBucket(entry.bucket)` and reloads.
-- Implement the **Save** button: trim input, reject empty, compute the normalized bucket id, reject exact duplicates (case-insensitive match against fetched buckets) with a clear alert, and otherwise run the existing New-search creation logic (preserve personnel/accounts via `defaultBundle()`, `logCreation`, `setSyncBucket`, `saveBundle`, reload).
-- Add a **Cancel** button that closes the popup.
+- In `initDatabaseSchema()` (lines 305–381), add `CREATE TABLE IF NOT EXISTS admin_credentials (admin_name VARCHAR(191) NOT NULL, admin_password VARCHAR(255), PRIMARY KEY (admin_name)) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4` alongside the other tables.
+- In `POST /api/auth/register` (lines 523–544), read `adminPassword` from the body and return 403 "Super-Admin password is required." when it is missing.
+- Before inserting the user, run `SELECT admin_name FROM admin_credentials WHERE admin_password = ?`; if no row matches, return 403 "Invalid Super-Admin password." and create nothing.
+- On a match, keep the existing insert into `users` + `login_info` and the `{ success: true, user: { username, pin } }` response; keep the "User already exists" (400) path intact.
+- Verify with `node --check sync-server.js`, `node test_structured_tables.js`, and `node test_sync_bucket_decoupling.js`.
 
-### ✓ Step 2: Rewire the New button to use the new popup
-The **New** button next to the CASE # box opens the themed popup instead of a native browser prompt.
+### ✓ Step 2: Add the Register button and themed Super-Admin popup with auto-login (app.js)
+The login popup can register the typed credentials after a themed Super-Admin password check, then logs the new account in.
 
-- In `buildHomePage()` in `app.js`, replace the current `#create-new-search-btn` handler (the confirm popup + `prompt()` block, ~lines 7189–7255) with a call to `showCaseNumberPopup()`.
-- Remove the now-unused native `prompt()`-based creation code.
-- Verify with `node --check app.js`.
-
-### ✓ Step 3: Fix the post-login navigation guard to prompt for a case number
-Navigating away from home with no case number set opens the case-number popup instead of silently bouncing to home.
-
-- Update the navigation guard in the `DOMContentLoaded` handler in `app.js` (line ~10694): when `!getSyncBucket() && !isHomePage()`, redirect to `home.html` and then open `showCaseNumberPopup()`; if already on home, just open the popup.
-- Ensure the popup is invoked after credentials/settings are available in the init flow so `fetchUserHistory()` works.
+- In `showLoginPopup()` (lines 622–719), add a **Register** `popup-btn` (after the Login button) whose handler validates that username + PIN are filled (else alert) and calls `showAdminVerifyPopup(username, pin, popup)`.
+- Add `showAdminVerifyPopup(username, pin, loginPopup)`: a `createPopup('Super-Admin Verification', ...)` popup (guarded against double-open) with an instruction label, a password `pill-input`, and **Register** / **Cancel** buttons.
+- The Register handler POSTs `{ username, pin, adminPassword }` to `${getSyncServerUrl()}/api/auth/register`, parses via `readJsonResponse()`, and on `resp.ok && data.success` performs the login-success path (set `USER_NAME_STORAGE_KEY`/`USER_PASSWORD_STORAGE_KEY` cookies, `setCurrentUser(data.user)`, close both popups, `window.location.reload()`).
+- On failure, `alert(data.error || 'Registration failed')` and keep the popup open; Cancel closes only the admin popup.
 - Verify with `node --check app.js`.
