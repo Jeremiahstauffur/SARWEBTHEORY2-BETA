@@ -699,11 +699,16 @@ function showLoginPopup() {
     // themed Super-Admin popup verifies the admin password server-side.
     const registerBtn = document.createElement('button');
     registerBtn.className = 'popup-btn';
+    registerBtn.id = 'login-register-btn';
     registerBtn.textContent = 'Register';
     registerBtn.onclick = () => {
         const username = usernameInput.value.trim();
         const pin = pinInput.value.trim();
         if (!username || !pin) return alert('Enter a username and PIN to register.');
+        if (typeof showAdminVerifyPopup !== 'function') {
+            alert('Registration is temporarily unavailable.');
+            return;
+        }
         showAdminVerifyPopup(username, pin, popup);
     };
     btnContainer.appendChild(registerBtn);
@@ -7150,104 +7155,267 @@ function drawBarChart(containerId, data, color) {
 }
 
 
-function buildSavedFilesTable() {
+// Count the populated Regions / Segments / Personnel / Tasks rows inside a case
+// bundle. Used by the Saved Cases table to show per-case metrics. Kept tolerant
+// of partially-formed bundles so it never throws while rendering the table.
+function computeBundleStats(bundle) {
+    const empty = { regions: 0, segments: 0, personnel: 0, tasks: 0 };
+    if (!bundle || !bundle.pages) return empty;
+    const pages = bundle.pages;
+    const indexRows = (pages.index && pages.index.rows) || [];
+    const page2 = pages.page2 || [];
+    const page3 = pages.page3 || [];
+    const page4 = pages.page4 || [];
+    return {
+        regions: indexRows.filter(r => r && r[0] && String(r[0]).trim() !== '').length,
+        segments: page2.filter(r => r && r[1] && String(r[1]).trim() !== '').length,
+        personnel: page3.filter(r => r && r[0] && String(r[0]).trim() !== '').length,
+        tasks: page4.filter(r => r && r[0] && String(r[0]).trim() !== '').length
+    };
+}
+
+// Themed popup used by the Saved Cases "Edit" action to rename a case number.
+// Mirrors the createPopup/pill-input pattern used elsewhere (e.g.
+// showCaseNumberPopup) instead of a raw browser prompt.
+function showRenameCasePopup(currentName, originElement, onConfirm) {
+    if (document.querySelector('.popup-overlay.rename-case-popup')) return;
+    const popup = createPopup('Rename Case #', originElement);
+    popup.classList.add('rename-case-popup');
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+
+    const inputs = document.createElement('div');
+    inputs.className = 'popup-input-container';
+    inputs.style.display = 'flex';
+    inputs.style.flexDirection = 'column';
+    inputs.style.gap = '12px';
+
+    const label = document.createElement('div');
+    label.textContent = 'Enter a new case number.';
+    label.style.textAlign = 'center';
+    label.style.fontSize = '0.9em';
+    label.style.opacity = '0.85';
+    inputs.appendChild(label);
+
+    const input = document.createElement('input');
+    input.type = 'text';
+    input.className = 'pill-input';
+    input.value = currentName;
+    input.style.textAlign = 'center';
+    input.style.width = '100%';
+    input.style.padding = '12px';
+    inputs.appendChild(input);
+
+    content.insertBefore(inputs, btnContainer);
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'popup-btn primary';
+    saveBtn.textContent = 'Rename';
+    saveBtn.onclick = () => {
+        const newName = input.value.trim();
+        if (!newName) { alert('Enter a case number.'); return; }
+        closePopup(popup);
+        onConfirm(newName);
+    };
+    btnContainer.appendChild(saveBtn);
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => closePopup(popup);
+    btnContainer.appendChild(cancelBtn);
+
+    setTimeout(() => { input.focus(); input.select(); }, 100);
+}
+
+// Saved Cases table. Rows come from the current user's server-side case history
+// (/api/auth/history via fetchUserHistory) merged with any locally-cached
+// bundles (getSavedFiles), keyed by the clean CASE #. Per-case metric columns
+// are computed only when the bundle is cached locally; otherwise a "—"
+// placeholder is shown until the case is opened.
+async function buildSavedFilesTable() {
     const tbody = document.getElementById('saved-files-body');
     if (!tbody) return;
 
     const files = getSavedFiles();
-    const fileNames = Object.keys(files).sort();
-    
-    if (fileNames.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="4" style="text-align: center; color: var(--muted); padding: 20px;">No saved search files yet.</td></tr>';
-        return;
-    }
-
-    tbody.innerHTML = '';
     const currentUser = getCurrentUser();
     const isAdmin = isUserAdmin(currentUser);
     const isFileManager = currentUser && (currentUser.isFileManager === true || currentUser.isFileManager === 'true');
 
-    fileNames.forEach(name => {
-        const fileInfo = files[name];
+    // Normalize a case-number/file-name for merge/dedup (drop any .json suffix).
+    const normalizeCase = (name) => String(name || '').replace(/\.json$/i, '');
+
+    // Ordered, de-duplicated list of case numbers plus per-case metadata.
+    const order = [];
+    const seen = new Set();
+    const meta = {};
+    const addCase = (caseNumber) => {
+        if (!caseNumber) return;
+        if (!seen.has(caseNumber)) { seen.add(caseNumber); order.push(caseNumber); meta[caseNumber] = {}; }
+    };
+
+    // 1) Server case history first (preserves lastAccessed ordering).
+    let history = [];
+    try {
+        history = await fetchUserHistory();
+    } catch (e) {
+        history = [];
+    }
+    (history || []).forEach(item => {
+        const caseNumber = normalizeCase(bucketToCaseNumber(item.bucket));
+        if (!caseNumber) return;
+        addCase(caseNumber);
+        meta[caseNumber].lastAccessed = item.lastAccessed;
+    });
+
+    // 2) Merge in any locally-cached cases (provide the bundle for metrics).
+    Object.keys(files).forEach(name => {
+        const caseNumber = normalizeCase(name);
+        addCase(caseNumber);
+        meta[caseNumber].localKey = name;
+        meta[caseNumber].localInfo = files[name];
+    });
+
+    if (order.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--muted); padding: 20px;">No saved cases yet.</td></tr>';
+        return;
+    }
+
+    tbody.innerHTML = '';
+
+    order.forEach(caseNumber => {
+        const info = meta[caseNumber] || {};
+        const localInfo = info.localInfo;
+        const hasLocal = !!(localInfo && localInfo.bundle);
+        const stats = hasLocal ? computeBundleStats(localInfo.bundle) : null;
+
         const tr = document.createElement('tr');
         tr.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
 
-        // Name (Open button-like pill)
-        const tdName = document.createElement('td');
-        tdName.setAttribute('data-label', 'File Name');
-        tdName.style.padding = '12px 15px';
-        const nameBtn = document.createElement('button');
-        nameBtn.className = 'mini-pill';
-        nameBtn.style.fontWeight = 'bold';
-        nameBtn.textContent = name;
-        nameBtn.onclick = () => {
-            saveBundle(fileInfo.bundle);
-            window.location.reload();
-        };
-        tdName.appendChild(nameBtn);
-        tr.appendChild(tdName);
+        // Case #
+        const tdCase = document.createElement('td');
+        tdCase.setAttribute('data-label', 'Case #');
+        tdCase.style.padding = '12px 15px';
+        tdCase.style.fontWeight = 'bold';
+        tdCase.textContent = caseNumber;
+        tr.appendChild(tdCase);
 
-        // Date
-        const tdDate = document.createElement('td');
-        tdDate.setAttribute('data-label', 'Last Modified');
-        tdDate.style.padding = '12px 15px';
-        tdDate.style.color = 'var(--muted)';
-        try {
-            tdDate.textContent = new Date(fileInfo.lastModified).toLocaleString();
-        } catch(e) {
-            tdDate.textContent = fileInfo.lastModified;
-        }
-        tr.appendChild(tdDate);
+        // Metric columns (Regions / Segments / Personnel / Tasks Logged)
+        const metricKeys = ['regions', 'segments', 'personnel', 'tasks'];
+        metricKeys.forEach(key => {
+            const td = document.createElement('td');
+            td.style.padding = '12px 15px';
+            td.style.textAlign = 'center';
+            td.style.color = 'var(--muted)';
+            td.textContent = stats ? String(stats[key]) : '\u2014';
+            tr.appendChild(td);
+        });
 
-        // Size
-        const tdSize = document.createElement('td');
-        tdSize.setAttribute('data-label', 'File Size');
-        tdSize.style.padding = '12px 15px';
-        tdSize.style.color = 'var(--muted)';
-        const sizeInBytes = JSON.stringify(fileInfo.bundle).length;
-        const sizeInKB = (sizeInBytes / 1024).toFixed(1);
-        tdSize.textContent = `${sizeInKB} KB`;
-        tr.appendChild(tdSize);
-
-        // Actions
+        // Actions: Edit (rename) / Load / Delete / Export
         const tdActions = document.createElement('td');
         tdActions.setAttribute('data-label', 'Actions');
         tdActions.style.padding = '12px 15px';
         tdActions.style.textAlign = 'center';
-        
+
         const btnCont = document.createElement('div');
         btnCont.className = 'tool-actions';
         btnCont.style.justifyContent = 'center';
         btnCont.style.gap = '10px';
 
-        const downBtn = document.createElement('button');
-        downBtn.className = 'mini-pill';
-        downBtn.textContent = 'Download';
-        downBtn.onclick = () => {
-            downloadTextFile(name, JSON.stringify(fileInfo.bundle, null, 2));
-        };
-        btnCont.appendChild(downBtn);
+        // Edit (rename the case number). Works on locally-cached cases; a
+        // non-cached case must be opened first so its data can be re-keyed.
+        const editBtn = document.createElement('button');
+        editBtn.className = 'mini-pill';
+        editBtn.textContent = 'Edit';
+        editBtn.onclick = () => {
+            if (!hasLocal) {
+                alert('Open this case (Load) before renaming it.');
+                return;
+            }
+            showRenameCasePopup(caseNumber, editBtn, (newName) => {
+                const cleanNew = normalizeCase(newName);
+                if (!cleanNew || cleanNew === caseNumber) return;
+                const files2 = getSavedFiles();
+                const collisionKey = Object.keys(files2).find(k => normalizeCase(k) === cleanNew);
+                if (collisionKey) {
+                    if (!confirm(`A case named "${cleanNew}" already exists. Overwrite it?`)) return;
+                }
+                const localKey = info.localKey;
+                const targetBundle = (files2[localKey] && files2[localKey].bundle) || localInfo.bundle;
+                targetBundle.fileName = cleanNew;
 
+                const active = loadBundle();
+                const wasActive = active && normalizeCase(active.fileName) === caseNumber;
+
+                saveFileToList(cleanNew, targetBundle);
+                if (localKey && normalizeCase(localKey) !== cleanNew) {
+                    deleteFileFromList(localKey);
+                }
+                if (wasActive) {
+                    active.fileName = cleanNew;
+                    saveBundle(active);
+                    setSyncBucket(cleanNew);
+                    updateFileNameDisplay();
+                }
+                buildSavedFilesTable();
+            });
+        };
+        btnCont.appendChild(editBtn);
+
+        // Load (open the case).
+        const loadBtn = document.createElement('button');
+        loadBtn.className = 'mini-pill';
+        loadBtn.style.fontWeight = 'bold';
+        loadBtn.textContent = 'Load';
+        loadBtn.onclick = async () => {
+            if (hasLocal) {
+                saveBundle(localInfo.bundle);
+            } else {
+                await setSyncBucket(caseNumber);
+            }
+            window.location.reload();
+        };
+        btnCont.appendChild(loadBtn);
+
+        // Delete (existing admin / file-manager permission rules).
         const delBtn = document.createElement('button');
         delBtn.className = 'row-delete-btn';
         delBtn.textContent = 'Delete';
         delBtn.onclick = () => {
-            if (isAdmin || isFileManager) {
-                const b = loadBundle();
-                const doDelete = () => {
-                    deleteFileFromList(name);
-                    buildSavedFilesTable();
-                };
-                if (b.deleteMode) {
-                    doDelete();
-                } else if (confirm(`Are you sure you want to delete "${name}"?`)) {
-                    doDelete();
-                }
-            } else {
+            if (!(isAdmin || isFileManager)) {
                 alert('You do not have permission to delete files. Contact Super Admin or a File Manager.');
+                return;
+            }
+            if (!hasLocal) {
+                alert('This case is not stored locally; open it (Load) before deleting.');
+                return;
+            }
+            const localKey = info.localKey;
+            const b = loadBundle();
+            const doDelete = () => {
+                deleteFileFromList(localKey);
+                buildSavedFilesTable();
+            };
+            if (b.deleteMode) {
+                doDelete();
+            } else if (confirm(`Are you sure you want to delete "${caseNumber}"?`)) {
+                doDelete();
             }
         };
         btnCont.appendChild(delBtn);
+
+        // Export (download the case JSON).
+        const exportBtn = document.createElement('button');
+        exportBtn.className = 'mini-pill';
+        exportBtn.textContent = 'Export';
+        exportBtn.onclick = () => {
+            if (!hasLocal) {
+                alert('Open this case (Load) before exporting it.');
+                return;
+            }
+            downloadTextFile(caseNumber + '.json', JSON.stringify(localInfo.bundle, null, 2));
+        };
+        btnCont.appendChild(exportBtn);
 
         tdActions.appendChild(btnCont);
         tr.appendChild(tdActions);
@@ -7470,7 +7638,8 @@ function showCaseNumberPopup(originElement = null) {
 
 function buildHomePage() {
   updateFileNameDisplay();
-  populateSearchHistory();
+  // The former "Case # History" panel is retired; the user's case numbers now
+  // live in the Saved Cases table (see buildSavedFilesTable).
   const fileNameInput = document.getElementById('bundle-file-name');
   const saveNameBtn = document.getElementById('save-file-name');
   const homeStatus = document.getElementById('home-status');
@@ -7528,28 +7697,8 @@ function buildHomePage() {
     };
   }
 
-  // Populate stats
-  const statRegions = document.getElementById('stat-regions');
-  const statSegments = document.getElementById('stat-segments');
-  const statPersonnel = document.getElementById('stat-personnel');
-  const statTasks = document.getElementById('stat-tasks');
-
-  if (statRegions) {
-    const rows = bundle.pages.index.rows || [];
-    statRegions.textContent = rows.filter(r => r[0] && r[0].trim() !== '').length;
-  }
-  if (statSegments) {
-    const rows = bundle.pages.page2 || [];
-    statSegments.textContent = rows.filter(r => r[1] && r[1].trim() !== '').length;
-  }
-  if (statPersonnel) {
-    const rows = bundle.pages.page3 || [];
-    statPersonnel.textContent = rows.filter(r => r[0] && r[0].trim() !== '').length;
-  }
-  if (statTasks) {
-    const rows = bundle.pages.page4 || [];
-    statTasks.textContent = rows.filter(r => r[0] && r[0].trim() !== '').length;
-  }
+  // Per-case stats now live in the Saved Cases table (see buildSavedFilesTable);
+  // the standalone dashboard-stats panel was removed from home.html.
 
   const recentLogsContainer = document.getElementById('recent-logs');
   const updateRecentLogs = () => {
@@ -13644,7 +13793,21 @@ async function notifyActiveUser(user) {
     }
 }
 
-function refreshSyncUI() {
+// True while the user is actively editing a field (an input/textarea/select or a
+// contenteditable cell). Rebuilding a table replaces the focused element and moves
+// the caret out of the cell, so pulls must never refresh the UI while this is true.
+function isEditingActive() {
+    const el = document.activeElement;
+    if (!el) return false;
+    const tag = (el.tagName || '').toLowerCase();
+    return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable === true;
+}
+
+// Set when a UI refresh was skipped because the user was editing; flushed once
+// editing stops so pulled server changes still render without disturbing typing.
+let _pendingUIRefresh = false;
+
+function performSyncUIRefresh() {
     if (isHomePage()) buildHomePage();
     else if (isRegionsPage()) buildRegionsTable();
     else if (isSegmentsPage()) buildSegmentsTable();
@@ -13657,6 +13820,27 @@ function refreshSyncUI() {
     else if (isMapsPage()) buildMapsPage();
     else if (isUploadsPage()) buildUploadsPage();
     else buildStandardTable();
+}
+
+function refreshSyncUI() {
+    // Never rebuild the current page's table while the user is editing a cell or
+    // field: a full rebuild replaces the focused element and yanks the caret out.
+    // Defer the refresh and flush it once editing stops (see flushPendingSyncUI).
+    if (isEditingActive()) {
+        _pendingUIRefresh = true;
+        return;
+    }
+    _pendingUIRefresh = false;
+    performSyncUIRefresh();
+}
+
+// Apply a refresh that was deferred while the user was editing, once they leave
+// the field. No-op if nothing is pending or the user is still editing.
+function flushPendingSyncUI() {
+    if (_pendingUIRefresh && !isEditingActive()) {
+        _pendingUIRefresh = false;
+        performSyncUIRefresh();
+    }
 }
 
 // Sync on demand instead of continuously polling in the background. Changes are
@@ -13673,7 +13857,14 @@ function scheduleSyncOnLeave() {
     if (_syncOnLeaveTimer) clearTimeout(_syncOnLeaveTimer);
     _syncOnLeaveTimer = setTimeout(() => {
         _syncOnLeaveTimer = null;
-        syncWithServer();
+        // Focus may have simply moved to another editable cell (e.g. the user
+        // tabbed from one field to the next). Pulling/rebuilding now would move
+        // the caret out of the cell they just entered, so defer until they truly
+        // leave the fields — the next focusout reschedules this check.
+        if (isEditingActive()) return;
+        // Not editing anymore: pull, then apply any refresh that was deferred
+        // while the user was typing.
+        Promise.resolve(syncWithServer()).then(flushPendingSyncUI);
     }, 200);
 }
 
