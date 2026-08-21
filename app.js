@@ -7034,6 +7034,7 @@ function buildMetricsTable() {
     });
 }
 
+let chartsResizeAttached = false;
 function initCharts() {
     const startInput = document.getElementById('chart-start-datetime');
     const endInput = document.getElementById('chart-end-datetime');
@@ -7052,6 +7053,12 @@ function initCharts() {
         };
     }
     renderCharts();
+    if (!chartsResizeAttached) {
+        window.addEventListener('resize', () => {
+            renderCharts();
+        });
+        chartsResizeAttached = true;
+    }
 }
 
 function renderCharts() {
@@ -7141,14 +7148,17 @@ function drawLineChart(containerId, data, color, startTimeTs, endTimeTs) {
         tick.setAttribute("stroke", "rgba(255,255,255,0.4)");
         svg.appendChild(tick);
 
-        const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-        text.setAttribute("x", x);
-        text.setAttribute("y", height - padding.bottom + 20);
-        text.setAttribute("fill", "var(--muted)");
-        text.setAttribute("font-size", "7.5"); // Smaller to fit date/time
-        text.setAttribute("text-anchor", "middle");
-        text.textContent = formatHourOffset(tickTs);
-        svg.appendChild(text);
+        // Only show timeline increment labels for every other increment
+        if (i % 2 === 0) {
+            const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+            text.setAttribute("x", x);
+            text.setAttribute("y", height - padding.bottom + 20);
+            text.setAttribute("fill", "var(--muted)");
+            text.setAttribute("font-size", "7.5"); // Smaller to fit date/time
+            text.setAttribute("text-anchor", "middle");
+            text.textContent = formatHourOffset(tickTs);
+            svg.appendChild(text);
+        }
     }
 
     const points = data.map((val, i) => {
@@ -10364,14 +10374,16 @@ function printSearchFile() {
             for (let i = 0; i <= numXTicks; i++) {
                 const tickTs = startTimeTs + (i / numXTicks) * durationMs;
                 const x = padding.left + (i / numXTicks) * chartWidth;
-                const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
-                text.setAttribute("x", x);
-                text.setAttribute("y", height - 10);
-                text.setAttribute("text-anchor", "middle");
-                text.setAttribute("font-size", "7");
-                text.setAttribute("fill", "#666");
-                text.textContent = formatHourOffset(tickTs);
-                svg.appendChild(text);
+                if (i % 2 === 0) {
+                    const text = document.createElementNS("http://www.w3.org/2000/svg", "text");
+                    text.setAttribute("x", x);
+                    text.setAttribute("y", height - 10);
+                    text.setAttribute("text-anchor", "middle");
+                    text.setAttribute("font-size", "7");
+                    text.setAttribute("fill", "#666");
+                    text.textContent = formatHourOffset(tickTs);
+                    svg.appendChild(text);
+                }
             }
 
             // Path

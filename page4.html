@@ -37,45 +37,45 @@
 
     
         <section class="hero">
-        <div class="hero-columns">
-          <div class="hero-col-left">
-            <h1>Search Log</h1>
-            <p>Log search activities including regions, segments, and search parameters. Date and Time columns format automatically as you type. Changes save automatically.</p>
-          </div>
-          <div class="hero-col-right">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
-                <h2 style="margin:0; font-size: 1.05rem;">Operational Charts</h2>
-                <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
-                    <div style="display: flex; align-items: center; gap: 4px;">
-                        <label style="font-size: 0.75rem; color: var(--muted);">Start:</label>
-                        <input type="datetime-local" id="chart-start-datetime" class="mini-pill" style="padding: 2px 8px;">
-                    </div>
-                    <div style="display: flex; align-items: center; gap: 4px;">
-                        <label style="font-size: 0.75rem; color: var(--muted);">End:</label>
-                        <input type="datetime-local" id="chart-end-datetime" class="mini-pill" style="padding: 2px 8px;">
-                    </div>
-                </div>
-            </div>
-
-              <div class="chart-stack-row">
-                <div style="flex: 1; display: flex; flex-direction: column;">
-                    <h2 style="font-size: 0.8rem; margin-bottom: 6px; color: var(--muted);">PSRc Sum Chart</h2>
-                    <div id="psrc-chart-container" style="flex: 1; background: rgba(0,0,0,0.1); border-radius: 12px; display: flex; align-items: flex-end; padding: 10px; gap: 2px; height: 100%;">
-                        <!-- SVG/Div Chart bars/lines will be injected here -->
-                    </div>
-                </div>
-                <div style="flex: 1; display: flex; flex-direction: column;">
-                    <h2 id="pos-chart-title" style="font-size: 0.8rem; margin-bottom: 6px; color: var(--muted);">POS Sum Chart</h2>
-                    <div id="activity-chart-container" style="flex: 1; background: rgba(0,0,0,0.1); border-radius: 12px; display: flex; align-items: flex-end; padding: 10px; gap: 2px; height: 100%;">
-                        <!-- SVG/Div Chart bars/lines will be injected here -->
-                    </div>
-                </div>
+          <div class="hero-columns">
+            <div class="hero-col-left">
+              <h1>Search Log</h1>
+              <p>Log search activities including regions, segments, and search parameters. Date and Time columns format automatically as you type. Changes save automatically.</p>
             </div>
           </div>
-        </div>
-      </section>
+        </section>
 
       <section class="table-card">
+        <div class="home-panel" style="margin-bottom: 24px;">
+          <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px;">
+              <h2 style="margin:0;">Operational Charts</h2>
+              <div style="display: flex; gap: 8px; align-items: center; flex-wrap: wrap;">
+                  <div style="display: flex; align-items: center; gap: 4px;">
+                      <label style="font-size: 0.75rem; color: var(--muted);">Start:</label>
+                      <input type="datetime-local" id="chart-start-datetime" class="mini-pill" style="padding: 2px 8px;">
+                  </div>
+                  <div style="display: flex; align-items: center; gap: 4px;">
+                      <label style="font-size: 0.75rem; color: var(--muted);">End:</label>
+                      <input type="datetime-local" id="chart-end-datetime" class="mini-pill" style="padding: 2px 8px;">
+                  </div>
+              </div>
+          </div>
+
+            <div class="chart-stack-row">
+              <div style="flex: 1; display: flex; flex-direction: column;">
+                  <h2 style="font-size: 0.9rem; margin-bottom: 8px; color: var(--muted);">PSRc Sum Chart</h2>
+                  <div id="psrc-chart-container" style="flex: 1; background: rgba(0,0,0,0.1); border-radius: 24px; display: flex; align-items: flex-end; padding: 10px; gap: 2px; height: 100%;">
+                      <!-- SVG/Div Chart bars/lines will be injected here -->
+                  </div>
+              </div>
+              <div style="flex: 1; display: flex; flex-direction: column;">
+                  <h2 id="pos-chart-title" style="font-size: 0.9rem; margin-bottom: 8px; color: var(--muted);">POS Sum Chart</h2>
+                  <div id="activity-chart-container" style="flex: 1; background: rgba(0,0,0,0.1); border-radius: 24px; display: flex; align-items: flex-end; padding: 10px; gap: 2px; height: 100%;">
+                      <!-- SVG/Div Chart bars/lines will be injected here -->
+                  </div>
+              </div>
+          </div>
+        </div>
         <div class="table-tools">
           <div style="display: flex; align-items: center; gap: 14px;">
             <label class="toggle-switch">
