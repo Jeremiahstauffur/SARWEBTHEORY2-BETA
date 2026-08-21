@@ -131,8 +131,23 @@
 
       // 1. Populate dropdown
       const bundle = loadBundle();
-      const personnel = bundle.pages.page3 || [];
-      const memberNames = personnel.map(row => row[0]).filter(n => n).sort();
+      const page3Rows = bundle.pages.page3 || [];
+      const page8Rows = bundle.pages.page8 || [];
+      const memberNameSet = new Set();
+
+      page3Rows.forEach(row => {
+        const name = row && row[0];
+        if (name) memberNameSet.add(name);
+      });
+
+      page8Rows.forEach(row => {
+        const first = row && row[2];
+        const last = row && row[3];
+        const fullName = `${first || ''} ${last || ''}`.trim();
+        if (fullName) memberNameSet.add(fullName);
+      });
+
+      const memberNames = Array.from(memberNameSet).sort((a, b) => a.localeCompare(b));
 
       memberNames.forEach(name => {
         const opt = document.createElement('option');
