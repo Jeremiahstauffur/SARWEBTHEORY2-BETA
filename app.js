@@ -6233,7 +6233,6 @@ function renderMemberIncidentCards(memberName, container) {
     
     const bundle = loadBundle();
     const allRows = (bundle.pages.page3 || []).filter(r => r[0] === memberName);
-    if (allRows.length === 0) return;
 
     const cardsWrapper = document.createElement('div');
     cardsWrapper.className = 'incident-times-container';
@@ -6332,7 +6331,8 @@ function renderMemberIncidentCards(memberName, container) {
         // Create a new row for the same member
         // Assuming the structure from previous knowledge: member name is index 0
         const firstRow = allRows[0];
-        const newRow = [...firstRow];
+        const newRow = firstRow ? [...firstRow] : Array(14).fill('');
+        newRow[0] = memberName;
         // Clear incident times in the new row (indexes 9-12)
         newRow[9] = '';
         newRow[10] = '';
