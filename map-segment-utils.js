@@ -70,21 +70,49 @@
         });
     }
 
+    function cloneIfValidGeoJsonGeometry(geometry) {
+        if (!geometry || typeof geometry !== 'object' || Array.isArray(geometry)) {
+            return null;
+        }
+
+        const type = typeof geometry.type === 'string' ? geometry.type.trim() : '';
+        if (!type) {
+            return null;
+        }
+
+        const hasCoordinates = Object.prototype.hasOwnProperty.call(geometry, 'coordinates');
+        const hasGeometries = type === 'GeometryCollection' && Array.isArray(geometry.geometries);
+        if (!hasCoordinates && !hasGeometries) {
+            return null;
+        }
+
+        try {
+            return JSON.parse(JSON.stringify(geometry));
+        } catch (error) {
+            return null;
+        }
+    }
+
     function buildCalTopoFeatureUpdatePayload(feature, styleOverrides = {}) {
         const attributes = {...(feature?.attributes || feature?.properties || {})};
-        const geometry = feature?.geometry ? JSON.parse(JSON.stringify(feature.geometry)) : null;
+        const geometry = cloneIfValidGeoJsonGeometry(feature?.geometry);
 
         delete attributes.ObjectID;
         delete attributes.id;
 
         applyCapturedCalTopoFeatureStyle(attributes, styleOverrides);
 
-        return {
+        const payload = {
             id: feature?.attributes?.id || feature?.id || null,
             type: 'Feature',
-            geometry,
             properties: attributes
         };
+
+        if (geometry) {
+            payload.geometry = geometry;
+        }
+
+        return payload;
     }
 
     function getFeatureTypeLabel(feature) {

@@ -274,25 +274,113 @@ function applyCapturedCalTopoFeatureStyle(attributes, style = {}) {
     });
 }
 
+function cloneIfValidGeoJsonGeometry(geometry) {
+    if (!geometry || typeof geometry !== 'object' || Array.isArray(geometry)) {
+        return null;
+    }
+
+    const type = typeof geometry.type === 'string' ? geometry.type.trim() : '';
+    if (!type) {
+        return null;
+    }
+
+    const hasCoordinates = Object.prototype.hasOwnProperty.call(geometry, 'coordinates');
+    const hasGeometries = type === 'GeometryCollection' && Array.isArray(geometry.geometries);
+    if (!hasCoordinates && !hasGeometries) {
+        return null;
+    }
+
+    try {
+        return JSON.parse(JSON.stringify(geometry));
+    } catch (error) {
+        return null;
+    }
+}
+
+function resolveCalTopoFeatureId(feature, attributes = {}, fallbackId = '') {
+    const candidates = [
+        feature?.id,
+        attributes?.id,
+        attributes?.uuid,
+        attributes?.objectId,
+        attributes?.objectID,
+        attributes?.featureId,
+        attributes?.assignmentId,
+        attributes?.sid,
+        attributes?.gid,
+        feature?.uuid,
+        feature?.objectId,
+        feature?.objectID,
+        feature?.featureId,
+        feature?.assignmentId,
+        feature?.sid,
+        feature?.gid
+    ];
+
+    for (const candidate of candidates) {
+        if (candidate === null || candidate === undefined) {
+            continue;
+        }
+        if (typeof candidate === 'number' && Number.isFinite(candidate)) {
+            return String(candidate);
+        }
+        const normalized = String(candidate).trim();
+        if (normalized && normalized !== '[object Object]') {
+            return normalized;
+        }
+    }
+
+    return typeof fallbackId === 'string' ? fallbackId : '';
+}
+
+function isSyntheticCalTopoFeatureId(featureId) {
+    const normalizedId = typeof featureId === 'string' ? featureId.trim() : String(featureId || '').trim();
+    return /^gfx-\d+$/i.test(normalizedId);
+}
+
+function getCalTopoWritableFeatureId(feature) {
+    const attrs = feature?.attributes || feature?.properties || {};
+    const resolvedId = resolveCalTopoFeatureId(feature, attrs, '');
+    if (!resolvedId || isSyntheticCalTopoFeatureId(resolvedId)) {
+        return '';
+    }
+    return resolvedId;
+}
+
+function getCalTopoOverlayOriginalStyleKey(feature) {
+    const writableId = getCalTopoWritableFeatureId(feature);
+    if (writableId) {
+        return writableId;
+    }
+    const attrs = feature?.attributes || feature?.properties || {};
+    const fallbackId = resolveCalTopoFeatureId(feature, attrs, '');
+    return fallbackId || '';
+}
+
 function buildCalTopoFeatureUpdatePayload(feature, styleOverrides = {}) {
     const utils = getMapSegmentUtils();
     if (typeof utils.buildCalTopoFeatureUpdatePayload === 'function') {
         return utils.buildCalTopoFeatureUpdatePayload(feature, styleOverrides);
     }
     const attributes = {...(feature?.attributes || feature?.properties || {})};
-    const geometry = feature?.geometry ? JSON.parse(JSON.stringify(feature.geometry)) : null;
+    const geometry = cloneIfValidGeoJsonGeometry(feature?.geometry);
 
     delete attributes.ObjectID;
     delete attributes.id;
 
     applyCapturedCalTopoFeatureStyle(attributes, styleOverrides);
 
-    return {
-        id: feature?.attributes?.id || feature?.id || null,
+    const payload = {
+        id: resolveCalTopoFeatureId(feature, feature?.attributes || feature?.properties || {}, null),
         type: 'Feature',
-        geometry,
         properties: attributes
     };
+
+    if (geometry) {
+        payload.geometry = geometry;
+    }
+
+    return payload;
 }
 
 async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
@@ -328,12 +416,12 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
     const psrcLookup = buildSegmentPsrcLookup(segmentRows, segmentDisplaySettings);
     const activeSearchNames = buildActiveSearchSegmentNameSet(bundle, segmentRows);
     const matchingAssignments = features.filter(feature => {
-        const featureId = feature?.attributes?.id;
-        if (!featureId || getCalTopoFeatureTypeKey(feature) !== 'assignment') {
+        const styleKey = getCalTopoOverlayOriginalStyleKey(feature);
+        if (!styleKey || getCalTopoFeatureTypeKey(feature) !== 'assignment') {
             return false;
         }
         if (!enabled) {
-            return !!originals[featureId];
+            return !!originals[styleKey];
         }
         return !!getFeaturePsrcAssignmentStyle(feature, psrcLookup, segmentDisplaySettings);
     });
@@ -351,19 +439,20 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
     const errors = [];
 
     for (const feature of matchingAssignments) {
-        const featureId = feature.attributes.id;
-        const featureName = feature.attributes.name || featureId;
-        const originalStyle = originals[featureId] || captureCalTopoFeatureStyle(feature.attributes);
+        const styleKey = getCalTopoOverlayOriginalStyleKey(feature);
+        const featureId = getCalTopoWritableFeatureId(feature);
+        const featureName = feature.attributes.name || styleKey || 'Unnamed Assignment';
+        const originalStyle = originals[styleKey] || captureCalTopoFeatureStyle(feature.attributes);
         const style = enabled
             ? getFeaturePsrcAssignmentStyle(feature, psrcLookup, segmentDisplaySettings)
-            : originals[featureId];
+            : originals[styleKey];
 
         if (!style) {
             continue;
         }
 
-        if (enabled && !Object.prototype.hasOwnProperty.call(originals, featureId)) {
-            originals[featureId] = originalStyle;
+        if (enabled && !Object.prototype.hasOwnProperty.call(originals, styleKey)) {
+            originals[styleKey] = originalStyle;
         }
 
         const isActiveSearch = enabled && isFeatureActivelyBeingSearched(feature, activeSearchNames);
@@ -384,6 +473,15 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
             : style;
 
         const payload = buildCalTopoFeatureUpdatePayload(feature, overlayStyle);
+        if (featureId) {
+            payload.id = featureId;
+        }
+
+        if (!featureId) {
+            errors.push(`CalTopo could not update assignment "${featureName}" because it has no valid CalTopo object ID.`);
+            continue;
+        }
+
         const typeCandidates = getCalTopoApiObjectTypeCandidates(feature);
         let result = null;
         let successfulType = null;
@@ -12755,9 +12853,10 @@ async function caltopo_request(btn = null, options = {}) {
         return hasGeom && isAllowed;
       }).map((f, idx) => {
         const props = f.properties || f;
-        const geom = f.geometry || f;
+        const geom = cloneIfValidGeoJsonGeometry(f.geometry) || cloneIfValidGeoJsonGeometry(props.geometry);
         const objectId = idx + 1;
-        
+        const resolvedFeatureId = resolveCalTopoFeatureId(f, props, '');
+
         let name = props.label || props.title || props.name || props.text;
         
         // Robust naming for Assignments or unnamed features
@@ -12778,7 +12877,7 @@ async function caltopo_request(btn = null, options = {}) {
             ...props,
             ObjectID: objectId,
             name: name,
-            id: f.id || props.id || props.uuid || `gfx-${objectId}`
+            id: resolvedFeatureId || `gfx-${objectId}`
           }
         };
 
