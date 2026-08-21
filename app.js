@@ -6330,7 +6330,9 @@ function renderMemberIncidentCards(memberName, container) {
     container.innerHTML = '';
     
     const bundle = loadBundle();
-    const allRows = (bundle.pages.page3 || []).filter(r => r[0] === memberName);
+    const memberRows = (bundle.pages.page3 || []).filter(r => r[0] === memberName);
+    const hasIncidentTime = row => [9, 10, 11, 12].some(idx => (row && row[idx] ? String(row[idx]).trim() : '') !== '');
+    const allRows = memberRows.filter(hasIncidentTime);
 
     const cardsWrapper = document.createElement('div');
     cardsWrapper.className = 'incident-times-container';
@@ -6354,7 +6356,17 @@ function renderMemberIncidentCards(memberName, container) {
             e.stopPropagation();
             if (confirm('Delete this incident row?')) {
                 const page3 = bundle.pages.page3 || [];
-                // Find the absolute index in page3
+                const memberIncidentRows = page3.filter(row => row[0] === memberName && hasIncidentTime(row));
+                if (memberIncidentRows.length <= 1) {
+                    pRow[9] = '';
+                    pRow[10] = '';
+                    pRow[11] = '';
+                    pRow[12] = '';
+                    saveBundle(bundle);
+                    renderMemberIncidentCards(memberName, container);
+                    return;
+                }
+
                 const absoluteIndex = page3.indexOf(pRow);
                 if (absoluteIndex > -1) {
                     page3.splice(absoluteIndex, 1);
@@ -6428,7 +6440,7 @@ function renderMemberIncidentCards(memberName, container) {
         const page3 = bundle.pages.page3 || [];
         // Create a new row for the same member
         // Assuming the structure from previous knowledge: member name is index 0
-        const firstRow = allRows[0];
+        const firstRow = memberRows[0];
         const newRow = firstRow ? [...firstRow] : Array(14).fill('');
         newRow[0] = memberName;
         // Clear incident times in the new row (indexes 9-12)
