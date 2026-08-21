@@ -446,8 +446,51 @@ function getSyncServerUrl() {
     return DEFAULT_SYNC_SERVER_URL;
 }
 
+const _memoryStorage = {};
+
+function getStorageItem(key) {
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage !== null) {
+      const val = localStorage.getItem(key);
+      if (val !== null && val !== undefined) return val;
+    }
+  } catch (e) {}
+  return _memoryStorage[key] || null;
+}
+
+function setStorageItem(key, value) {
+  _memoryStorage[key] = value;
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage !== null) {
+      localStorage.setItem(key, value);
+    }
+  } catch (e) {}
+}
+
+function removeStorageItem(key) {
+  delete _memoryStorage[key];
+  try {
+    if (typeof localStorage !== 'undefined' && localStorage !== null) {
+      localStorage.removeItem(key);
+    }
+  } catch (e) {}
+}
+
+const SERVER_SETTINGS_CACHE_KEY = 'sar-server-settings-cache-v1';
+
 function getSyncBucket() {
-    const bucket = _serverSettings && _serverSettings[SYNC_BUCKET_STORAGE_KEY] ? _serverSettings[SYNC_BUCKET_STORAGE_KEY] : '';
+    let bucket = _serverSettings && _serverSettings[SYNC_BUCKET_STORAGE_KEY] ? _serverSettings[SYNC_BUCKET_STORAGE_KEY] : '';
+    if (!bucket) {
+        try {
+            const cached = getStorageItem(SERVER_SETTINGS_CACHE_KEY);
+            if (cached) {
+                const parsed = JSON.parse(cached);
+                if (parsed && parsed[SYNC_BUCKET_STORAGE_KEY]) {
+                    bucket = parsed[SYNC_BUCKET_STORAGE_KEY];
+                }
+            }
+        } catch (e) {}
+    }
     const creds = getUserCredentials();
     if (bucket && creds && creds.password) {
         return `${bucket}_${creds.password}`;
@@ -512,7 +555,7 @@ function getUserCredentials() {
     return { name, password };
 }
 
-// Server-side settings cache (in-memory only, loaded from server on login)
+// Server-side settings cache (cached in localStorage + memory, loaded from server on login)
 let _serverSettings = null;
 let _serverSettingsLoading = false;
 
@@ -520,7 +563,15 @@ async function loadServerSettings() {
     const creds = getUserCredentials();
     if (!creds) return {};
     if (_serverSettings !== null) return _serverSettings;
-    if (_serverSettingsLoading) return {};
+    if (_serverSettingsLoading) return _serverSettings || {};
+
+    try {
+        const cached = getStorageItem(SERVER_SETTINGS_CACHE_KEY);
+        if (cached && _serverSettings === null) {
+            _serverSettings = JSON.parse(cached);
+        }
+    } catch (e) {}
+
     _serverSettingsLoading = true;
     try {
         const serverUrl = getSyncServerUrl();
@@ -532,12 +583,15 @@ async function loadServerSettings() {
         });
         if (resp.ok) {
             _serverSettings = await resp.json();
-        } else {
+            setStorageItem(SERVER_SETTINGS_CACHE_KEY, JSON.stringify(_serverSettings));
+        } else if (_serverSettings === null) {
             _serverSettings = {};
         }
     } catch (e) {
         console.warn('Failed to load server settings:', e);
-        _serverSettings = {};
+        if (_serverSettings === null) {
+            _serverSettings = {};
+        }
     } finally {
         _serverSettingsLoading = false;
     }
@@ -548,6 +602,9 @@ async function saveServerSettings(settings) {
     const creds = getUserCredentials();
     if (!creds) return;
     _serverSettings = settings;
+    try {
+        setStorageItem(SERVER_SETTINGS_CACHE_KEY, JSON.stringify(settings));
+    } catch (e) {}
     try {
         const serverUrl = getSyncServerUrl();
         await fetch(`${serverUrl.replace(/\/$/, '')}/api/auth/settings`, {
@@ -1868,11 +1925,9 @@ function sanitizeBundle(bundle) {
   };
 }
 
-const _memoryStorage = {};
-
 function loadBundle() {
   try {
-    const raw = _memoryStorage[BUNDLE_STORAGE_KEY];
+    const raw = getStorageItem(BUNDLE_STORAGE_KEY);
     if (!raw) return defaultBundle();
     return sanitizeBundle(JSON.parse(raw));
   } catch {
@@ -1884,7 +1939,7 @@ function saveBundle(bundle, skipSync = false) {
   bundle.lastModified = new Date().toISOString();
   const sanitized = sanitizeBundle(bundle);
 
-  _memoryStorage[BUNDLE_STORAGE_KEY] = JSON.stringify(sanitized);
+  setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
 
   let pushPromise;
   if (!skipSync) {
@@ -1901,7 +1956,7 @@ function saveBundle(bundle, skipSync = false) {
 }
 
 function getSavedFiles() {
-    const raw = _memoryStorage[FILE_LIST_STORAGE_KEY];
+    const raw = getStorageItem(FILE_LIST_STORAGE_KEY);
     if (!raw) return {};
     try {
         return JSON.parse(raw);
@@ -1919,7 +1974,7 @@ function saveFileToList(fileName, bundle) {
         bundle: sanitizeBundle(bundle),
         lastModified: new Date().toISOString()
     };
-    _memoryStorage[FILE_LIST_STORAGE_KEY] = JSON.stringify(files);
+    setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
     // No longer push to server immediately to prevent race conditions during sync.
     // Background sync loop will handle pushing merged updates.
 }
@@ -1928,7 +1983,7 @@ function deleteFileFromList(fileName) {
     const files = getSavedFiles();
     logDeletion('File', fileName);
     delete files[fileName];
-    _memoryStorage[FILE_LIST_STORAGE_KEY] = JSON.stringify(files);
+    setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
     // No longer push to server immediately to prevent race conditions during sync.
 }
 
@@ -11043,6 +11098,9 @@ const PAGE_ORDER = [
 ];
 
 function navigateToPage(targetUrl) {
+    if (document.activeElement && typeof document.activeElement.blur === 'function') {
+        document.activeElement.blur();
+    }
     window.location.href = targetUrl;
 }
 
