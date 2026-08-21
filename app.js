@@ -218,6 +218,24 @@ function getCalTopoApiObjectType(feature) {
     return typeof utils.getCalTopoApiObjectType === 'function' ? utils.getCalTopoApiObjectType(feature) : 'Assignment';
 }
 
+function getCalTopoApiObjectTypeCandidates(feature) {
+    const primaryType = getCalTopoApiObjectType(feature);
+    const candidates = [primaryType, 'Assignment', 'Shape'];
+
+    const attrs = feature?.attributes || feature?.properties || {};
+    const rawClass = attrs.class || attrs.type || feature?.geometry?.class || feature?.geometry?.type || '';
+    if (typeof rawClass === 'string' && rawClass.trim()) {
+        const normalized = rawClass.trim().toLowerCase();
+        if (normalized === 'marker') {
+            candidates.push('Marker');
+        } else if (normalized === 'folder') {
+            candidates.push('Folder');
+        }
+    }
+
+    return candidates.filter((type, index, all) => !!type && all.indexOf(type) === index);
+}
+
 function captureCalTopoFeatureStyle(attributes = {}) {
     const utils = getMapSegmentUtils();
     if (typeof utils.captureCalTopoFeatureStyle === 'function') {
@@ -366,18 +384,21 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
             : style;
 
         const payload = buildCalTopoFeatureUpdatePayload(feature, overlayStyle);
-        const primaryType = getCalTopoApiObjectType(feature);
-        const fallbackType = primaryType === 'Assignment' ? 'Shape' : 'Assignment';
+        const typeCandidates = getCalTopoApiObjectTypeCandidates(feature);
+        let result = null;
+        let successfulType = null;
 
-        let endpoint = `/api/v1/map/${encodeURIComponent(map.id)}/${encodeURIComponent(primaryType)}/${encodeURIComponent(featureId)}`;
-        let result = await caltopo_api_call('POST', endpoint, payload, map.domain || 'caltopo.com', {silent: true});
-
-        if (!result && fallbackType) {
-            const fallbackEndpoint = `/api/v1/map/${encodeURIComponent(map.id)}/${encodeURIComponent(fallbackType)}/${encodeURIComponent(featureId)}`;
-            result = await caltopo_api_call('POST', fallbackEndpoint, payload, map.domain || 'caltopo.com', {silent: true});
+        for (const objectType of typeCandidates) {
+            const endpoint = `/api/v1/map/${encodeURIComponent(map.id)}/${encodeURIComponent(objectType)}/${encodeURIComponent(featureId)}`;
+            result = await caltopo_api_call('POST', endpoint, payload, map.domain || 'caltopo.com', {silent: true});
             if (result) {
-                feature.attributes.class = fallbackType;
+                successfulType = objectType;
+                break;
             }
+        }
+
+        if (result && successfulType && feature.attributes.class !== successfulType) {
+            feature.attributes.class = successfulType;
         }
 
         if (!result) {
