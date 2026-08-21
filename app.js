@@ -1057,6 +1057,17 @@ function normalizeCalTopoProxyUrl(url) {
     return queryString ? `${resolvedBaseUrl}?${queryString}` : resolvedBaseUrl;
 }
 
+function appendUrlQueryParam(url, key, value = '1') {
+    const rawUrl = typeof url === 'string' ? url.trim() : '';
+    if (!rawUrl) {
+        return '';
+    }
+    const [baseUrl, queryString = ''] = rawUrl.split('?');
+    const encodedPart = `${encodeURIComponent(key)}=${encodeURIComponent(value)}`;
+    const nextQuery = queryString ? `${queryString}&${encodedPart}` : encodedPart;
+    return `${baseUrl}?${nextQuery}`;
+}
+
 function getCalTopoProxyHealthUrl(url) {
     const normalizedProxyUrl = normalizeCalTopoProxyUrl(url);
     if (!normalizedProxyUrl) {
@@ -1064,7 +1075,7 @@ function getCalTopoProxyHealthUrl(url) {
     }
 
     if (normalizedProxyUrl.includes('.php')) {
-        return normalizedProxyUrl.split('?')[0] + (normalizedProxyUrl.includes('?') ? '&' : '?') + 'health=1';
+        return appendUrlQueryParam(normalizedProxyUrl, 'health', '1');
     }
 
     const [baseUrl] = normalizedProxyUrl.split('?');
@@ -12481,7 +12492,7 @@ async function _execute_caltopo_api_call(method, endpoint, payload, domain) {
   // Ensure we call /api/call - normalizeCalTopoProxyUrl always ends in /api/proxy or is a .php file
   let proxyCallUrl = normalizeCalTopoProxyUrl(proxyUrl);
   if (proxyCallUrl.includes('.php')) {
-      proxyCallUrl = proxyCallUrl.split('?')[0] + (proxyCallUrl.includes('?') ? '&' : '?') + 'api_call=1';
+      proxyCallUrl = appendUrlQueryParam(proxyCallUrl, 'api_call', '1');
   } else {
       proxyCallUrl = proxyCallUrl.replace(/\/api\/proxy\/?$/i, '/api/call').replace(/\/fetch-map\/?$/i, '/api/call');
   }
