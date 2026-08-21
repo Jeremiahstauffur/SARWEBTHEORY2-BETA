@@ -2181,7 +2181,6 @@ tr.log-sweeps-due::after {
     border-spacing: 0;
   }
 
-  body[data-page="index"] .grid-table thead,
   body[data-page="home"] .grid-table thead,
   body[data-page="page2"] .grid-table thead,
   body[data-page="page3"] .grid-table thead,
@@ -2189,6 +2188,17 @@ tr.log-sweeps-due::after {
   body[data-page="page5"] .grid-table thead,
   body[data-page="page7"] .grid-table thead {
     display: none;
+  }
+
+  body[data-page="index"] .grid-table thead {
+    display: block;
+  }
+
+  body[data-page="index"] .grid-table th {
+    display: block;
+    width: auto;
+    flex: 1 1 150px;
+    padding: 0;
   }
 
   body[data-page="index"] .grid-table tr,

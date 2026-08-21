@@ -2691,24 +2691,6 @@ function buildRegionsTable() {
         }
       });
 
-      const toggleContainer = document.createElement('label');
-      toggleContainer.className = 'toggle-switch header-toggle';
-
-      const checkbox = document.createElement('input');
-      checkbox.type = 'checkbox';
-      checkbox.checked = data.voterVisibility[c - 1] ?? true;
-      checkbox.addEventListener('change', () => {
-        data.voterVisibility[c - 1] = checkbox.checked;
-        saveCurrentPageData(data);
-        buildRegionsTable();
-      });
-
-      const slider = document.createElement('span');
-      slider.className = 'slider round';
-
-      toggleContainer.appendChild(checkbox);
-      toggleContainer.appendChild(slider);
-
       const delBtn = document.createElement('button');
       delBtn.className = 'col-delete-btn';
       delBtn.innerHTML = '✕';
@@ -2725,7 +2707,6 @@ function buildRegionsTable() {
       };
 
       headerContainer.appendChild(headerPill);
-      headerContainer.appendChild(toggleContainer);
       headerContainer.appendChild(delBtn);
       th.appendChild(headerContainer);
     }
@@ -2766,7 +2747,7 @@ function buildRegionsTable() {
       const cell = document.createElement('div');
       cell.className = 'pill-cell';
       const isVoterCol = c > 0 && c < data.headers.length - 1;
-      if (isVoterCol && !data.voterVisibility[c - 1]) {
+      if (isVoterCol) {
         cell.classList.add('password-style');
       }
       cell.contentEditable = 'true';
