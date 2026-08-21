@@ -1068,6 +1068,37 @@ function appendUrlQueryParam(url, key, value = '1') {
     return `${baseUrl}?${nextQuery}`;
 }
 
+function normalizeCalTopoDomain(domain, fallback = 'caltopo.com') {
+    const fallbackDomain = (typeof fallback === 'string' && fallback.trim()) ? fallback.trim().toLowerCase() : 'caltopo.com';
+    const rawDomain = typeof domain === 'string' ? domain.trim().toLowerCase() : '';
+    if (!rawDomain) {
+        return fallbackDomain;
+    }
+
+    let candidate = rawDomain.replace(/^[a-z]+:\/\//i, '').replace(/^\/\//, '');
+    candidate = candidate.split('#')[0].split('?')[0].split('/')[0].trim();
+    if (candidate.includes('@')) {
+        candidate = candidate.split('@').pop() || '';
+    }
+    if (candidate.includes(':')) {
+        candidate = candidate.split(':')[0];
+    }
+
+    candidate = candidate.replace(/^www\./, '').replace(/^\.+|\.+$/g, '');
+    if (!candidate) {
+        return fallbackDomain;
+    }
+
+    if (candidate.includes('sartopo.com')) {
+        return 'sartopo.com';
+    }
+    if (candidate.includes('caltopo.com')) {
+        return 'caltopo.com';
+    }
+
+    return /^[a-z0-9.-]+$/.test(candidate) ? candidate : fallbackDomain;
+}
+
 function getCalTopoProxyHealthUrl(url) {
     const normalizedProxyUrl = normalizeCalTopoProxyUrl(url);
     if (!normalizedProxyUrl) {
@@ -12487,7 +12518,8 @@ async function _execute_caltopo_api_call(method, endpoint, payload, domain) {
     return null;
   }
 
-  const requestBody = { method, endpoint, payload, domain };
+  const normalizedDomain = normalizeCalTopoDomain(domain);
+  const requestBody = { method, endpoint, payload, domain: normalizedDomain };
 
   // Ensure we call /api/call - normalizeCalTopoProxyUrl always ends in /api/proxy or is a .php file
   let proxyCallUrl = normalizeCalTopoProxyUrl(proxyUrl);
@@ -12538,7 +12570,7 @@ async function _execute_caltopo_api_call(method, endpoint, payload, domain) {
       if (response.status === 404) {
         const lowerText = text.toLowerCase();
         if (lowerText.includes("lost") || text.includes("404image.png") || lowerText.includes("not found")) {
-           throw new Error(`The CalTopo endpoint '${endpoint}' was not found. This might be because the Team ID is incorrect or the domain '${domain || 'caltopo.com'}' is wrong for this account.`);
+           throw new Error(`The CalTopo endpoint '${endpoint}' was not found. This might be because the Team ID is incorrect or the domain '${normalizedDomain}' is wrong for this account.`);
         }
         throw new Error(`Endpoint not found (404) at '${proxyCallUrl}'. Your proxy server might be out of date. Please ensure you have the latest sync-server.js running.`);
       }
@@ -12571,7 +12603,7 @@ async function handleCreateMap() {
 
   const teamId = teamIdInput.value.trim();
   const title = titleInput.value.trim();
-  const domain = domainInput.value;
+  const domain = normalizeCalTopoDomain(domainInput.value);
 
   if (!teamId) {
     alert('Please enter a Team ID.');
@@ -12638,7 +12670,7 @@ async function verifyCalTopoAccount() {
   if (!teamIdInput || !domainInput || !resultSmall || !verifyBtn) return;
 
   const teamId = teamIdInput.value.trim();
-  const domain = domainInput.value;
+  const domain = normalizeCalTopoDomain(domainInput.value);
 
   if (!teamId) {
     alert('Please enter a Team ID first.');
@@ -12672,7 +12704,7 @@ async function caltopo_request(btn = null, options = {}) {
   if (!map || !map.id) return;
 
   const activeMapId = map.id;
-  const activeMapDomain = map.domain || 'caltopo.com';
+  const activeMapDomain = normalizeCalTopoDomain(map.domain);
 
   if (btn) {
     btn.disabled = true;
@@ -13550,7 +13582,7 @@ function buildMapsPage() {
   const viewMap = (id, name, domain, teamId, skipScroll = false) => {
     activeMapId = id;
     activeMapTeamId = teamId || null;
-    activeMapDomain = domain || 'caltopo.com';
+    activeMapDomain = normalizeCalTopoDomain(domain);
     currentMapTitle.textContent = name || id;
     const suffix = isFullMode ? '' : '/embed';
     mapIframe.src = `https://${activeMapDomain}/m/${id}${suffix}`;

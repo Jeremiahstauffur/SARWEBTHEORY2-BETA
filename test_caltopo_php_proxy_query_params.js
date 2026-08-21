@@ -31,6 +31,7 @@ async function main() {
     const appSource = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
     const normalizeSrc = extractFunctionSource(appSource, 'function normalizeCalTopoProxyUrl(url)');
     const appendQuerySrc = extractFunctionSource(appSource, 'function appendUrlQueryParam(url, key, value = \'1\')');
+    const normalizeDomainSrc = extractFunctionSource(appSource, 'function normalizeCalTopoDomain(domain, fallback = \'caltopo.com\')');
     const healthSrc = extractFunctionSource(appSource, 'function getCalTopoProxyHealthUrl(url)');
     const executeSrc = extractFunctionSource(appSource, 'async function _execute_caltopo_api_call(method, endpoint, payload, domain)');
 
@@ -54,7 +55,7 @@ async function main() {
     };
 
     vm.createContext(sandbox);
-    vm.runInContext(`${normalizeSrc}\n${appendQuerySrc}\n${healthSrc}\n${executeSrc}`, sandbox);
+    vm.runInContext(`${normalizeSrc}\n${appendQuerySrc}\n${normalizeDomainSrc}\n${healthSrc}\n${executeSrc}`, sandbox);
 
     const healthUrl = sandbox.getCalTopoProxyHealthUrl('https://proxy.example.com/proxy.php?token=abc123');
     assert.strictEqual(
@@ -67,7 +68,7 @@ async function main() {
         'POST',
         '/api/v1/map/M123/Shape/shape-1',
         {id: 'shape-1', type: 'Feature', properties: {name: 'Alpha'}},
-        'sartopo.com'
+        'https://sartopo.com/m/ABC123?tab=map'
     );
 
     assert.strictEqual(
@@ -82,7 +83,14 @@ async function main() {
         'Expected POST method when forwarding generic map object updates through proxy'
     );
 
-    console.log('All PHP proxy query-param preservation checks passed.');
+    const forwardedBody = JSON.parse(sandbox.capturedOptions.body);
+    assert.strictEqual(
+        forwardedBody.domain,
+        'sartopo.com',
+        'API call must normalize URL-like domain values to the expected hostname'
+    );
+
+    console.log('All PHP proxy query-param and domain normalization checks passed.');
 }
 
 main().catch((error) => {

@@ -2853,6 +2853,16 @@ tr.log-sweeps-due::after {
   }
 }
 
+@media (max-width: 860px) {
+  .bottom-nav {
+    display: flex !important;
+  }
+
+  main {
+    padding-bottom: 80px !important;
+  }
+}
+
 /* Bottom Nav Styles */
 .bottom-nav {
   display: none;
