@@ -193,28 +193,40 @@ if (isset($requestData['endpoint']) || (isset($requestData['api_call']) && $requ
         : (is_string($payload) && strlen($payload) > 0 ? $payload : '');
 
     $signatureData = signRequest($method, $endpoint, $payloadString, $creds['credentialSecret']);
-    $queryParams = [
+    $authParams = [
         'id' => $creds['credentialId'],
         'expires' => $signatureData['expires'],
         'signature' => $signatureData['signature']
     ];
 
-    $url = $targetUrl . '?' . http_build_query($queryParams);
+    $hasPayload = strlen($payloadString) > 0;
+    $isWrite = in_array($method, ['POST', 'PUT', 'PATCH'], true);
+
     $ch = curl_init();
-    curl_setopt($ch, CURLOPT_URL, $url);
     curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
     curl_setopt($ch, CURLOPT_FOLLOWLOCATION, true);
     curl_setopt($ch, CURLOPT_TIMEOUT, 15);
     curl_setopt($ch, CURLOPT_SSL_VERIFYPEER, true);
 
-    if (in_array($method, ['POST', 'PUT', 'PATCH']) && strlen($payloadString) > 0) {
+    if ($isWrite && $hasPayload) {
+        // CalTopo's Team API requires write requests to be form-encoded, with the
+        // signed JSON payload supplied in a `json` field alongside the auth params
+        // (id/expires/signature) in the request body and no query string. Sending
+        // the JSON as a raw application/json body causes "Error Saving Object".
+        $formParams = $authParams;
+        $formParams['json'] = $payloadString;
+        curl_setopt($ch, CURLOPT_URL, $targetUrl);
         curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
-        curl_setopt($ch, CURLOPT_POSTFIELDS, $payloadString);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/json']);
-    } else if ($method === 'DELETE') {
-        curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
-    } else if ($method === 'POST') {
-        curl_setopt($ch, CURLOPT_POST, true);
+        curl_setopt($ch, CURLOPT_POSTFIELDS, http_build_query($formParams));
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ['Content-Type: application/x-www-form-urlencoded']);
+    } else {
+        $url = $targetUrl . '?' . http_build_query($authParams);
+        curl_setopt($ch, CURLOPT_URL, $url);
+        if ($method === 'DELETE') {
+            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, 'DELETE');
+        } else if ($isWrite) {
+            curl_setopt($ch, CURLOPT_CUSTOMREQUEST, $method);
+        }
     }
 
     $response = curl_exec($ch);

@@ -1376,43 +1376,44 @@ const executeGenericCall = async (method, endpoint, payloadString, targetUrl, cr
     const isPostLikeWithPayload = ['POST', 'PUT', 'PATCH'].includes(upperMethod) && payloadString.length > 0;
 
     if (isPostLikeWithPayload) {
-        const axiosConfig = {
-            timeout: CALTOPO_TIMEOUT_MS,
-            params: {
-                id: creds.credentialId,
-                expires,
-                signature
-            },
-            headers: {
-                'Content-Type': 'application/json'
-            }
-        };
+        // CalTopo's Team API expects write requests to be form-encoded, with the
+        // signed JSON payload supplied in a `json` field alongside the auth params
+        // (id/expires/signature) in the request body and no query string. Sending
+        // the JSON as a raw application/json body causes "Error Saving Object".
+        const form = new URLSearchParams();
+        form.append('id', creds.credentialId);
+        form.append('expires', expires.toString());
+        form.append('signature', signature);
+        form.append('json', payloadString);
 
         try {
             return await axios({
                 method: upperMethod,
                 url: targetUrl,
-                data: payloadString,
-                ...axiosConfig
+                data: form.toString(),
+                headers: {
+                    'Content-Type': 'application/x-www-form-urlencoded'
+                },
+                timeout: CALTOPO_TIMEOUT_MS
             });
         } catch (e) {
-            // If it's a format issue (400) or auth issue (401), try the legacy form-encoded approach.
+            // Fallback: retry with the raw JSON body and query-string auth params
+            // in case a particular endpoint prefers that legacy format.
             if (e.response && [400, 401, 403].includes(e.response.status)) {
-                console.log(`[PROXY] JSON approach failed with ${e.response.status}, retrying with form-encoded...`);
-                const form = new URLSearchParams();
-                form.append('id', creds.credentialId);
-                form.append('expires', expires.toString());
-                form.append('signature', signature);
-                form.append('json', payloadString);
-
+                console.log(`[PROXY] Form-encoded approach failed with ${e.response.status}, retrying with JSON body...`);
                 return await axios({
                     method: upperMethod,
                     url: targetUrl,
-                    data: form.toString(),
-                    headers: {
-                        'Content-Type': 'application/x-www-form-urlencoded'
+                    data: payloadString,
+                    timeout: CALTOPO_TIMEOUT_MS,
+                    params: {
+                        id: creds.credentialId,
+                        expires,
+                        signature
                     },
-                    timeout: CALTOPO_TIMEOUT_MS
+                    headers: {
+                        'Content-Type': 'application/json'
+                    }
                 });
             }
             throw e;
