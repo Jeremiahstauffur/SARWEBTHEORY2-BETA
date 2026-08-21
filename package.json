@@ -4,7 +4,8 @@
   "description": "Synchronization server for SAR Search Website",
   "main": "sync-server.js",
   "scripts": {
-    "start": "node sync-server.js"
+    "start": "node sync-server.js",
+    "test": "node test_structured_tables.js && node test_sync_bucket_decoupling.js && node test_row_level_sync.js && node test_row_sync_endpoint.js"
   },
   "dependencies": {
     "axios": "^1.14.0",

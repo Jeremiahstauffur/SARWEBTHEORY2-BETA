@@ -12,6 +12,9 @@ const USER_PASSWORD_STORAGE_KEY = 'sar-user-password-v1';
 const CALTOPO_PROXY_STORAGE_KEY = 'sar-caltopo-proxy-v1';
 const CALTOPO_CREDS_STORAGE_KEY = 'sar-caltopo-creds-v1';
 const DEVICE_ID_STORAGE_KEY = 'sar-device-id-v1';
+// Snapshot of the search file as the server last confirmed it. Every save is
+// diffed against this so a device uploads only the rows it actually changed.
+const SYNC_SNAPSHOT_STORAGE_KEY = 'sar-sync-snapshot-v1';
 // const DEFAULT_BUCKET = 'MNSAR14';
 const SAVE_BUTTON_MIN_LOADING_MS = 1000;
 const SAVE_BUTTON_SUCCESS_MS = 3000;
@@ -1945,9 +1948,10 @@ function saveBundle(bundle, skipSync = false) {
 
   let pushPromise = null;
   if (!skipSync) {
-      // Return this promise so callers that reload or wait can await the write;
-      // track it in _inFlightPushPromise so background pulls never race in front.
-      pushPromise = pushBundleToServer(sanitized);
+      // Send ONLY the rows this device changed. Return this promise so callers
+      // that reload or wait can await the write; track it in
+      // _inFlightPushPromise so background pulls never race in front.
+      pushPromise = pushBundleDelta(sanitized);
       _inFlightPushPromise = pushPromise;
       pushPromise.finally(() => {
           if (_inFlightPushPromise === pushPromise) {
@@ -13993,11 +13997,16 @@ async function syncWithServer() {
 
                 if (sMod > lMod) {
                     const merged = mergeBundles(localBundle, serverBundle);
+                    // The server copy we just read is now the baseline every
+                    // later save is diffed against.
+                    writeSyncSnapshot(serverBundle);
                     if (areBundlesEqual(merged, serverBundle)) {
                         setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(serverBundle));
                     } else {
-                        // Local has some unique data, push the merged result
-                        saveBundle(merged, false);
+                        // Local holds rows the server has not seen. Store the
+                        // merge locally and send up ONLY those rows.
+                        saveBundle(merged, true);
+                        pushBundleDelta(sanitizeBundle(merged));
                     }
                     
                     const files = getSavedFiles();
@@ -14009,18 +14018,169 @@ async function syncWithServer() {
                         setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
                     }
                     refreshSyncUI();
-                } else if (lMod > sMod && !isNewDevice) {
-                    pushBundleToServer(localBundle);
                 }
+                // When the local copy looks newer nothing is pushed here: the
+                // rows a device changed were already sent as they were entered.
             }
         } else if (resp.status === 404) {
-            pushBundleToServer(loadBundle());
+            // No search file on the server yet, so seed it once.
+            const localBundle = loadBundle();
+            await pushBundleToServer(localBundle);
+            writeSyncSnapshot(localBundle);
         }
     } catch (err) {
         console.warn("Sync background check failed:", err);
     } finally {
         isSyncing = false;
     }
+}
+
+function getSyncDeltaUtils() {
+    return (typeof window !== 'undefined' && window.SARSyncDelta) ? window.SARSyncDelta : null;
+}
+
+// The snapshot is per CASE # + search file, so switching either one starts a
+// fresh comparison instead of diffing against an unrelated file.
+function syncSnapshotKeyFor(bundle) {
+    return `${getSyncBucket()}::${(bundle && bundle.fileName) || ''}`;
+}
+
+function readSyncSnapshot(bundle) {
+    try {
+        const raw = getStorageItem(SYNC_SNAPSHOT_STORAGE_KEY);
+        if (!raw) return null;
+        const parsed = JSON.parse(raw);
+        if (!parsed || parsed.key !== syncSnapshotKeyFor(bundle)) return null;
+        return parsed.bundle || null;
+    } catch (e) {
+        return null;
+    }
+}
+
+function writeSyncSnapshot(snapshotBundle, keyBundle = snapshotBundle) {
+    try {
+        setStorageItem(SYNC_SNAPSHOT_STORAGE_KEY, JSON.stringify({
+            key: syncSnapshotKeyFor(keyBundle),
+            bundle: snapshotBundle
+        }));
+    } catch (e) {}
+}
+
+// Upload ONLY what this device changed.
+//
+// Several devices share one search file, so uploading the whole file made the
+// last writer wipe out every row the others had just typed. Instead we diff the
+// saved file against the snapshot the server confirmed last time and send just
+// those rows; the server merges them into the stored file row by row. When
+// nothing changed, no request is made at all.
+async function pushBundleDelta(bundle) {
+    const bucket = getSyncBucket();
+    const serverUrl = getSyncServerUrl();
+    if (!serverUrl || !bucket || !getUserCredentials()) return;
+
+    const utils = getSyncDeltaUtils();
+    if (!utils) {
+        // The shared helper is not loaded on this page; fall back to the whole
+        // file rather than losing the edit.
+        await pushBundleToServer(bundle);
+        return;
+    }
+
+    const snapshot = readSyncSnapshot(bundle);
+    if (!snapshot) {
+        // Nothing to diff against yet (first save for this CASE # on this
+        // device). Seed the server once, then send rows only from here on.
+        await pushBundleToServer(bundle);
+        writeSyncSnapshot(bundle);
+        return;
+    }
+
+    const changes = utils.computeBundleChanges(snapshot, bundle);
+    if (!changes.length) return;
+
+    const baseUrl = serverUrl.replace(/\/$/, '');
+    try {
+        const resp = await fetch(`${baseUrl}/api/v1/${bucket}/rows`, {
+            method: 'POST',
+            headers: getAuthHeaders({'X-Last-Modified': new Date().toISOString()}),
+            body: JSON.stringify({fileName: bundle.fileName, changes}),
+            keepalive: true
+        });
+
+        if (resp.ok) {
+            writeSyncSnapshot(bundle);
+            return;
+        }
+
+        const errorData = await resp.json().catch(() => ({}));
+        // needsFullSync: the server has no copy of this CASE # yet.
+        // 400/404/405/501: an older or self-hosted backend without the row
+        // endpoint. 413: so much changed that it is no longer a row update.
+        // In every case, fall back to the whole file so the edit is never
+        // silently dropped.
+        if ((errorData && errorData.needsFullSync) || [400, 404, 405, 413, 501].indexOf(resp.status) !== -1) {
+            await pushBundleToServer(bundle);
+            writeSyncSnapshot(bundle);
+            return;
+        }
+        console.error("Push row changes failed:", resp.status, errorData.message || errorData.error || '');
+    } catch (err) {
+        console.error("Push row changes failed:", err);
+    }
+}
+
+async function fetchServerPageData(pageName) {
+    const bucket = getSyncBucket();
+    const serverUrl = getSyncServerUrl();
+    if (!serverUrl || !bucket || !getUserCredentials()) return null;
+
+    try {
+        const resp = await fetch(
+            `${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/page/${encodeURIComponent(pageName)}?_=${Date.now()}`,
+            {headers: getAuthHeaders()}
+        );
+        if (!resp.ok) return null;
+        return await resp.json();
+    } catch (err) {
+        return null;
+    }
+}
+
+// Ask the database for THIS page's data only.
+//
+// Used when arriving on a page and right after a cell edit or button press was
+// pushed, so the device immediately shows what the other devices entered without
+// ever re-uploading the page it is on (or the page it just left).
+async function pullCurrentPageData({refresh = true} = {}) {
+    if (typeof pageKey !== 'function') return false;
+    const key = pageKey();
+    const payload = await fetchServerPageData(key);
+    if (!payload || payload.found !== true || payload.data === null) return false;
+
+    const utils = getSyncDeltaUtils();
+    const local = loadBundle();
+    const currentPage = local.pages ? local.pages[key] : undefined;
+    if (utils && utils.deepEqual(currentPage, payload.data)) return false;
+
+    if (!local.pages) local.pages = {};
+    local.pages[key] = payload.data;
+    const sanitized = sanitizeBundle(local);
+    // sanitizeBundle only keeps the known table pages, so a page it does not
+    // recognise was not stored and there is nothing to show.
+    if (!sanitized.pages || sanitized.pages[key] === undefined) return false;
+    setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
+
+    // Keep the snapshot in step for this page only, so the freshly pulled rows
+    // are not mistaken for local changes and echoed straight back.
+    const snapshot = readSyncSnapshot(sanitized);
+    if (snapshot) {
+        if (!snapshot.pages) snapshot.pages = {};
+        snapshot.pages[key] = JSON.parse(JSON.stringify(sanitized.pages[key]));
+        writeSyncSnapshot(snapshot, sanitized);
+    }
+
+    if (refresh) refreshSyncUI();
+    return true;
 }
 
 async function pushBundleToServer(bundle, isReconcileRetry = false) {
@@ -14080,6 +14240,7 @@ async function reconcileAndRepushBundle(localBundle, baseUrl, bucket, headers) {
         const sanitized = sanitizeBundle(reconciled);
         setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
         await pushBundleToServer(sanitized, true);
+        writeSyncSnapshot(sanitized);
         refreshSyncUI();
     } catch (err) {
         console.warn("Bundle reconcile failed:", err);
@@ -14197,6 +14358,9 @@ function flushPendingSyncUI() {
     }
 }
 
+// Leaving a cell (or finishing a button press) has already sent just that row
+// up. All that is left to do is ask the database for this page's data so the
+// rows other devices changed appear straight away.
 let _syncOnLeaveTimer = null;
 function scheduleSyncOnLeave() {
     if (_syncOnLeaveTimer) clearTimeout(_syncOnLeaveTimer);
@@ -14208,10 +14372,10 @@ function scheduleSyncOnLeave() {
             if (_inFlightPushPromise) {
                 await _inFlightPushPromise;
             }
-            await syncWithServer();
         } finally {
             endUserAction();
         }
+        await pullCurrentPageData();
     }, 200);
 }
 
@@ -14240,6 +14404,9 @@ document.addEventListener('click', (e) => {
             } finally {
                 endUserAction();
             }
+            // The button's own change was already sent as a row update; now read
+            // this page back so it reflects what everyone else entered.
+            await pullCurrentPageData();
         }, 50);
     }
 }, true);
@@ -14254,6 +14421,8 @@ window.addEventListener('beforeunload', () => {
     }
 });
 
+// Blurring commits the cell being edited, which sends that one row. The page a
+// device is leaving is never uploaded as a whole.
 window.addEventListener('pagehide', () => {
     if (isEditingActive()) {
         const el = document.activeElement;
@@ -14261,7 +14430,6 @@ window.addEventListener('pagehide', () => {
             el.blur();
         }
     }
-    syncWithServer();
 });
 
 document.addEventListener('visibilitychange', () => {
@@ -14272,9 +14440,16 @@ document.addEventListener('visibilitychange', () => {
                 el.blur();
             }
         }
-        syncWithServer();
     }
 });
 
-// Initial sync when arriving on a page.
-setTimeout(syncWithServer, 1000);
+// Arriving on a page: ask the database for this page's data. A device that has
+// no local copy of the search file yet still needs the one-time full read to
+// learn the file list and the other pages.
+setTimeout(() => {
+    if (!getStorageItem(BUNDLE_STORAGE_KEY) || isHomePage()) {
+        syncWithServer();
+    } else {
+        pullCurrentPageData();
+    }
+}, 1000);

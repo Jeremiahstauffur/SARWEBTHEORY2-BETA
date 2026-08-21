@@ -5,6 +5,7 @@ const cors = require('cors');
 const fs = require('fs');
 const path = require('path');
 const mysql = require('mysql2');
+const syncDelta = require('./sync-delta');
 
 const createCredentialHelperFallback = () => {
     const serverEnvironmentState = {
@@ -515,12 +516,98 @@ const decomposeBundleToTables = async (username, fallbackCase, bundle) => {
     }
 };
 
+// Write ONE row of a row-collection table. The collection tables key on an
+// auto-increment id, so a targeted delete + insert is the single-row upsert.
+const upsertCollectionRow = async (username, searchCase, table, row, nowIso) => {
+    await runAsync(
+        `DELETE FROM \`${table}\` WHERE username = ? AND search_case = ? AND row_index = ?`,
+        [username, searchCase, row.row_index]
+    );
+    await runAsync(
+        `INSERT INTO \`${table}\` (username, search_case, row_index, label, data, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+        [username, searchCase, row.row_index, row.label, JSON.stringify(row.data ?? null), nowIso]
+    );
+};
+
+const replaceCollectionTable = async (username, searchCase, table, rows, nowIso) => {
+    await runAsync(`DELETE FROM \`${table}\` WHERE username = ? AND search_case = ?`, [username, searchCase]);
+    for (const row of rows) {
+        await runAsync(
+            `INSERT INTO \`${table}\` (username, search_case, row_index, label, data, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+            [username, searchCase, row.row_index, row.label, JSON.stringify(row.data ?? null), nowIso]
+        );
+    }
+};
+
+// Mirror only the rows a device actually changed into the structured tables.
+// Rebuilding a whole table (or every table) is the fallback for changes that
+// shift row indexes, such as inserting or deleting a row.
+const applyChangesToTables = async (username, fallbackCase, bundle, changes) => {
+    if (!username || !Array.isArray(changes) || !changes.length) { return; }
+    const plan = buildStructuredPlan(bundle, fallbackCase);
+    if (!plan) { return; }
+
+    const {searchCase, collections, singles} = plan;
+    const nowIso = new Date().toISOString();
+
+    const tablesToRebuild = new Set();
+    const rowsToWrite = new Map();
+    const singlesToWrite = new Set();
+    let rebuildEverything = false;
+
+    changes.forEach((change) => {
+        const target = syncDelta.describeChangeTarget(change);
+        if (!target || target.kind === 'rebuild') { rebuildEverything = true; return; }
+        if (target.kind === 'none') { return; }
+        if (target.kind === 'single') { singlesToWrite.add(target.table); return; }
+        if (target.kind === 'collectionRebuild') { tablesToRebuild.add(target.table); return; }
+        if (target.kind === 'collectionRow') {
+            if (!rowsToWrite.has(target.table)) { rowsToWrite.set(target.table, new Set()); }
+            rowsToWrite.get(target.table).add(target.rowIndex);
+        }
+    });
+
+    if (rebuildEverything) {
+        await decomposeBundleToTables(username, fallbackCase, bundle);
+        return;
+    }
+
+    for (const table of tablesToRebuild) {
+        await replaceCollectionTable(username, searchCase, table, collections[table] || [], nowIso);
+        rowsToWrite.delete(table);
+    }
+
+    for (const [table, indexes] of rowsToWrite) {
+        for (const rowIndex of indexes) {
+            const row = (collections[table] || []).find((candidate) => candidate.row_index === rowIndex);
+            if (!row) {
+                await runAsync(
+                    `DELETE FROM \`${table}\` WHERE username = ? AND search_case = ? AND row_index = ?`,
+                    [username, searchCase, rowIndex]
+                );
+                continue;
+            }
+            await upsertCollectionRow(username, searchCase, table, row, nowIso);
+        }
+    }
+
+    for (const table of singlesToWrite) {
+        await runAsync(
+            `REPLACE INTO \`${table}\` (username, search_case, data, updatedAt) VALUES (?, ?, ?, ?)`,
+            [username, searchCase, JSON.stringify(singles[table] ?? {}), nowIso]
+        );
+    }
+};
+
 // Expose the pure transform for unit testing without starting the server.
 if (typeof module !== 'undefined' && module.exports) {
     module.exports.buildStructuredPlan = buildStructuredPlan;
     module.exports.COLLECTION_TABLES = COLLECTION_TABLES;
     module.exports.SINGLE_TABLES = SINGLE_TABLES;
     module.exports.STRUCTURED_TABLES = STRUCTURED_TABLES;
+    // Exposed so an integration test can drive the endpoints over HTTP without
+    // the server having to bind a fixed port on its own.
+    module.exports.app = app;
 }
 
 app.use(cors({
@@ -802,6 +889,135 @@ const getFilePath = (bucket, key) => {
     const safeKey = key.replace(/[^a-z0-9_-]/gi, '_');
     return path.join(bucketDir, `${safeKey}.json`);
 };
+
+// ----------------------------------------------------------------------------
+// Row-level sync
+//
+// A device never uploads a whole page any more. When a cell loses focus (or a
+// button is pressed) it posts ONLY the rows it changed to /rows, and it reads
+// back a single page from /page/:page. Because the merge happens here, two
+// devices editing two different rows of the same table no longer overwrite each
+// other. These routes are declared before the generic /:bucket/:key routes so
+// they are not swallowed by them.
+// ----------------------------------------------------------------------------
+const STORE_BUNDLE_KEY = 'bundle';
+const MAX_ROW_CHANGES = 2000;
+
+const storeFileKey = (fileName) => String(fileName || '').replace(/[^a-zA-Z0-9.\-_]/g, '_');
+
+const getAsync = (sql, params = []) => new Promise((resolve, reject) => {
+    db.get(sql, params, (err, row) => err ? reject(err) : resolve(row));
+});
+
+// Serialize every write for one bucket so a read-modify-write of the stored
+// bundle can never lose a concurrent device's row.
+const bucketWriteQueues = new Map();
+
+const withBucketLock = (bucket, task) => {
+    const previous = bucketWriteQueues.get(bucket) || Promise.resolve();
+    const current = previous.then(() => task(), () => task());
+    bucketWriteQueues.set(bucket, current.then(() => {}, () => {}));
+    return current;
+};
+
+const readStoredBundle = async (bucket) => {
+    const row = await getAsync(
+        "SELECT value, userPin FROM store WHERE bucket = ? AND `key` = ?",
+        [bucket, STORE_BUNDLE_KEY]
+    );
+    if (!row) { return null; }
+    const parsed = safeJsonParse(row.value);
+    if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) { return null; }
+    return {bundle: parsed, userPin: row.userPin};
+};
+
+// Apply a device's changed rows onto the stored search file.
+app.post('/api/v1/:bucket/rows', authMiddleware, async (req, res) => {
+    const {bucket} = req.params;
+    const userName = req.user.username || 'Unknown';
+    const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
+    const isSuperAdmin = userPin === '1976';
+    const changes = req.body && Array.isArray(req.body.changes) ? req.body.changes : null;
+
+    if (!changes) {
+        return res.status(400).json({error: 'A changes array is required'});
+    }
+    if (!changes.length) {
+        return res.json({success: true, applied: 0});
+    }
+    if (changes.length > MAX_ROW_CHANGES) {
+        return res.status(413).json({error: `At most ${MAX_ROW_CHANGES} row changes may be sent at once`});
+    }
+
+    trackBucketAccess(userName, bucket);
+
+    try {
+        const result = await withBucketLock(bucket, async () => {
+            const stored = await readStoredBundle(bucket);
+            // Nothing to merge into yet: ask the device to seed the search file
+            // once with a full upload, after which it sends rows only.
+            if (!stored) {
+                return {status: 409, body: {error: 'No stored search file for this CASE #', needsFullSync: true}};
+            }
+            if (stored.userPin === '1976' && !isSuperAdmin) {
+                return {
+                    status: 403,
+                    body: {
+                        error: 'Conflict',
+                        message: 'Changes by Super-Admin cannot be overwritten by a regular user.'
+                    }
+                };
+            }
+
+            const {bundle, applied} = syncDelta.applyBundleChanges(stored.bundle, changes);
+            const nowIso = new Date().toISOString();
+            bundle.lastModified = nowIso;
+
+            const value = JSON.stringify(bundle);
+            await runAsync(
+                "INSERT OR REPLACE INTO store (bucket, `key`, value, userName, userPin, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+                [bucket, STORE_BUNDLE_KEY, value, userName, userPin, nowIso]
+            );
+
+            const fileKey = storeFileKey(bundle.fileName);
+            if (fileKey && fileKey !== STORE_BUNDLE_KEY) {
+                await runAsync(
+                    "INSERT OR REPLACE INTO store (bucket, `key`, value, userName, userPin, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+                    [bucket, fileKey, value, userName, userPin, nowIso]
+                );
+            }
+
+            await applyChangesToTables(userName, bucket, bundle, applied);
+
+            return {status: 200, body: {success: true, applied: applied.length, lastModified: nowIso}};
+        });
+
+        res.status(result.status).json(result.body);
+    } catch (err) {
+        console.error('[SYNC] row change failed:', err.message);
+        res.status(500).json({error: 'Failed to apply row changes'});
+    }
+});
+
+// Read back a single page of the stored search file.
+app.get('/api/v1/:bucket/page/:page', authMiddleware, async (req, res) => {
+    const {bucket, page} = req.params;
+    try {
+        const stored = await readStoredBundle(bucket);
+        if (!stored) {
+            return res.json({page, found: false, data: null, lastModified: null});
+        }
+        const data = syncDelta.getPageData(stored.bundle, page);
+        res.json({
+            page,
+            found: data !== undefined,
+            data: data === undefined ? null : data,
+            lastModified: stored.bundle.lastModified || null
+        });
+    } catch (err) {
+        res.status(500).json({error: 'Failed to read page data'});
+    }
+});
 
 // Get all files for a bucket
 app.get('/api/v1/:bucket/all-files', authMiddleware, (req, res) => {
