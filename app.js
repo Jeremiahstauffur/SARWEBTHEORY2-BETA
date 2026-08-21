@@ -1935,18 +1935,25 @@ function loadBundle() {
   }
 }
 
+let _inFlightPushPromise = null;
+
 function saveBundle(bundle, skipSync = false) {
   bundle.lastModified = new Date().toISOString();
   const sanitized = sanitizeBundle(bundle);
 
   setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
 
-  let pushPromise;
+  let pushPromise = null;
   if (!skipSync) {
-      // Return this promise so callers that reload immediately after saving
-      // (e.g. creating a new CASE #) can await the write; otherwise the reload
-      // aborts the in-flight PUT and the just-entered data never reaches the DB.
+      // Return this promise so callers that reload or wait can await the write;
+      // track it in _inFlightPushPromise so background pulls never race in front.
       pushPromise = pushBundleToServer(sanitized);
+      _inFlightPushPromise = pushPromise;
+      pushPromise.finally(() => {
+          if (_inFlightPushPromise === pushPromise) {
+              _inFlightPushPromise = null;
+          }
+      });
       // Ensure the current file is always in the saved files list
       saveFileToList(sanitized.fileName, sanitized);
   }
@@ -11739,35 +11746,64 @@ function showSegmentsImportPreviewPopup(segments, options = {}) {
 }
 
 function importSegmentsAction(segments) {
+    beginUserAction();
     const b = loadBundle();
     const segmentRows = ensureSegmentsPageRows(b);
+
+    // Keep all non-blank existing rows
+    const nonBlankRows = segmentRows.filter(row => Array.isArray(row) && row.some(c => c !== '' && c !== undefined && c !== null));
 
     const importedNames = [];
     segments.forEach(seg => {
         const lengthVal = parseFloat(seg.length) || 0;
         const timeVal = lengthVal / 0.5;
+        const segName = String(seg.segment || seg.name || '').trim();
+        const calTopoId = String(seg.feature?.attributes?.id || seg.caltopoId || '').trim();
+
+        // Check if segment already exists in nonBlankRows
+        const existingIdx = nonBlankRows.findIndex(r => {
+            const rCalTopoId = String(r[9] || '').trim();
+            const rSegName = String(r[1] || '').trim().toLowerCase();
+            if (calTopoId && rCalTopoId && calTopoId === rCalTopoId) return true;
+            if (segName && rSegName && segName.toLowerCase() === rSegName) return true;
+            return false;
+        });
+
         const newRow = [
-            '',
-            seg.segment,
-            seg.area ? seg.area + ' ac' : '',
-            seg.length ? seg.length + ' mi' : '',
-            (seg.sweep || 20) + ' ft',
-            timeVal > 0 ? timeVal.toFixed(2) + ' hr' : '',
-            '',
-            '',
-            '',
-            seg.feature?.attributes?.id || ''
+            seg.region || (existingIdx !== -1 ? nonBlankRows[existingIdx][0] : ''),
+            segName || (existingIdx !== -1 ? nonBlankRows[existingIdx][1] : ''),
+            seg.area ? (String(seg.area).includes('ac') ? seg.area : seg.area + ' ac') : (existingIdx !== -1 ? nonBlankRows[existingIdx][2] : ''),
+            seg.length ? (String(seg.length).includes('mi') ? seg.length : seg.length + ' mi') : (existingIdx !== -1 ? nonBlankRows[existingIdx][3] : ''),
+            (seg.sweep || (existingIdx !== -1 ? nonBlankRows[existingIdx][4] : 20)) + (typeof (seg.sweep || '') === 'string' && (seg.sweep || '').includes('ft') ? '' : ' ft'),
+            timeVal > 0 ? timeVal.toFixed(2) + ' hr' : (existingIdx !== -1 ? nonBlankRows[existingIdx][5] : ''),
+            existingIdx !== -1 ? nonBlankRows[existingIdx][6] : '',
+            existingIdx !== -1 ? nonBlankRows[existingIdx][7] : '',
+            existingIdx !== -1 ? nonBlankRows[existingIdx][8] : '',
+            calTopoId || (existingIdx !== -1 ? nonBlankRows[existingIdx][9] : '')
         ];
-        segmentRows.push(newRow);
-        newlyImportedSegments.add(`|${seg.segment}`);
-        importedNames.push(seg.segment);
+
+        if (existingIdx !== -1) {
+            nonBlankRows[existingIdx] = newRow;
+        } else {
+            nonBlankRows.push(newRow);
+        }
+
+        newlyImportedSegments.add(`${newRow[0]}|${newRow[1]}`);
+        importedNames.push(newRow[1]);
     });
+
+    const minRows = typeof ROWS !== 'undefined' ? ROWS : 50;
+    while (nonBlankRows.length < minRows) {
+        nonBlankRows.push(Array.from({ length: 10 }, () => ''));
+    }
+
+    b.pages.page2 = nonBlankRows;
 
     if (importedNames.length > 0) {
         addActivityLogEntry('System', 'Imported segments: ' + importedNames.join(', '), b);
     }
 
-    saveBundle(b);
+    const savePromise = saveBundle(b);
     recalculateEverything();
     if (isSegmentsPage()) buildSegmentsTable();
 
@@ -11775,6 +11811,10 @@ function importSegmentsAction(segments) {
         newlyImportedSegments.clear();
         if (isSegmentsPage()) buildSegmentsTable();
     }, 7000);
+
+    Promise.resolve(savePromise).finally(() => {
+        endUserAction();
+    });
 }
 
 async function showCalTopoLinkPopup(originalIdx) {
@@ -13498,31 +13538,217 @@ function buildMapsPage() {
 
 let isSyncing = false;
 
-function mergeTableRows(localRows, serverRows) {
-    if (!Array.isArray(localRows) || !Array.isArray(serverRows)) return serverRows;
-    const merged = [...serverRows];
-    const serverMap = new Map();
-    serverRows.forEach((row, index) => {
-        if (Array.isArray(row) && row[0]) serverMap.set(row[0].toString().trim(), index);
+function mergeSegmentsRows(localRows, serverRows) {
+    if (!Array.isArray(localRows)) return Array.isArray(serverRows) ? serverRows : defaultSegmentsData();
+    if (!Array.isArray(serverRows)) return localRows;
+
+    const isRowNonBlank = (row) => Array.isArray(row) && row.some(c => c !== '' && c !== undefined && c !== null);
+    const getCalTopoId = (row) => (Array.isArray(row) && row[9]) ? String(row[9]).trim() : '';
+    const getSegName = (row) => (Array.isArray(row) && row[1]) ? String(row[1]).trim().toLowerCase() : '';
+
+    const merged = [];
+    const serverIdMap = new Map();
+    const serverNameMap = new Map();
+
+    serverRows.forEach((row) => {
+        if (!isRowNonBlank(row)) return;
+        const rowCopy = [...row];
+        while (rowCopy.length < 10) rowCopy.push('');
+        const mIdx = merged.length;
+        merged.push(rowCopy);
+        const cId = getCalTopoId(rowCopy);
+        if (cId) serverIdMap.set(cId, mIdx);
+        const sName = getSegName(rowCopy);
+        if (sName) serverNameMap.set(sName, mIdx);
     });
 
     localRows.forEach(localRow => {
-        if (!Array.isArray(localRow) || !localRow[0]) return;
-        const id = localRow[0].toString().trim();
-        if (serverMap.has(id)) {
-            const sIdx = serverMap.get(id);
-            const sRow = merged[sIdx];
-            // Merge columns: if server is empty, take local. Server wins on conflicts (sMod > lMod)
-            for (let c = 1; c < Math.max(localRow.length, sRow.length); c++) {
-                if ((sRow[c] === '' || sRow[c] === undefined) && localRow[c] !== '' && localRow[c] !== undefined) {
-                    sRow[c] = localRow[c];
+        if (!isRowNonBlank(localRow)) return;
+        const lCopy = [...localRow];
+        while (lCopy.length < 10) lCopy.push('');
+
+        const cId = getCalTopoId(lCopy);
+        const sName = getSegName(lCopy);
+
+        let targetIdx = -1;
+        if (cId && serverIdMap.has(cId)) {
+            targetIdx = serverIdMap.get(cId);
+        } else if (sName && serverNameMap.has(sName)) {
+            targetIdx = serverNameMap.get(sName);
+        }
+
+        if (targetIdx !== -1) {
+            const targetRow = merged[targetIdx];
+            for (let c = 0; c < 10; c++) {
+                if ((targetRow[c] === '' || targetRow[c] === undefined || targetRow[c] === null) &&
+                    (lCopy[c] !== '' && lCopy[c] !== undefined && lCopy[c] !== null)) {
+                    targetRow[c] = lCopy[c];
                 }
             }
         } else {
-            // New row locally
-            merged.push(localRow);
+            const newIdx = merged.length;
+            merged.push(lCopy);
+            if (cId) serverIdMap.set(cId, newIdx);
+            if (sName) serverNameMap.set(sName, newIdx);
         }
     });
+
+    const minRows = typeof ROWS !== 'undefined' ? ROWS : 50;
+    while (merged.length < minRows) {
+        merged.push(Array.from({ length: 10 }, () => ''));
+    }
+
+    return merged;
+}
+
+function mergePersonnelRows(localRows, serverRows) {
+    if (!Array.isArray(localRows)) return Array.isArray(serverRows) ? serverRows : defaultPersonnelData();
+    if (!Array.isArray(serverRows)) return localRows;
+
+    const isRowNonBlank = (row) => Array.isArray(row) && row.some(c => c !== '' && c !== undefined && c !== null);
+    const getName = (row) => (Array.isArray(row) && row[0]) ? String(row[0]).trim().toLowerCase() : '';
+
+    const merged = [];
+    const nameMap = new Map();
+
+    serverRows.forEach(row => {
+        if (!isRowNonBlank(row)) return;
+        const rowCopy = [...row];
+        while (rowCopy.length < 14) rowCopy.push('');
+        const mIdx = merged.length;
+        merged.push(rowCopy);
+        const name = getName(rowCopy);
+        if (name) nameMap.set(name, mIdx);
+    });
+
+    localRows.forEach(localRow => {
+        if (!isRowNonBlank(localRow)) return;
+        const lCopy = [...localRow];
+        while (lCopy.length < 14) lCopy.push('');
+        const name = getName(lCopy);
+
+        if (name && nameMap.has(name)) {
+            const targetRow = merged[nameMap.get(name)];
+            for (let c = 0; c < 14; c++) {
+                if ((targetRow[c] === '' || targetRow[c] === undefined || targetRow[c] === null) &&
+                    (lCopy[c] !== '' && lCopy[c] !== undefined && lCopy[c] !== null)) {
+                    targetRow[c] = lCopy[c];
+                }
+            }
+        } else {
+            const newIdx = merged.length;
+            merged.push(lCopy);
+            if (name) nameMap.set(name, newIdx);
+        }
+    });
+
+    const minRows = typeof ROWS !== 'undefined' ? ROWS : 50;
+    while (merged.length < minRows) {
+        merged.push(Array.from({ length: 14 }, () => ''));
+    }
+
+    return merged;
+}
+
+function mergeSearchLogRows(localRows, serverRows) {
+    if (!Array.isArray(localRows)) return Array.isArray(serverRows) ? serverRows : defaultSearchLogData();
+    if (!Array.isArray(serverRows)) return localRows;
+
+    const isRowNonBlank = (row) => Array.isArray(row) && row.some(c => c !== '' && c !== undefined && c !== null);
+    const getLogKey = (row) => {
+        if (!Array.isArray(row)) return '';
+        return [row[0], row[1], row[2], row[3], row[4], row[5]]
+            .map(v => (v || '').toString().trim().toLowerCase())
+            .join('|');
+    };
+
+    const merged = [];
+    const keyMap = new Map();
+
+    serverRows.forEach(row => {
+        if (!isRowNonBlank(row)) return;
+        const rowCopy = [...row];
+        const mIdx = merged.length;
+        merged.push(rowCopy);
+        const key = getLogKey(rowCopy);
+        if (key && key !== '|||||') keyMap.set(key, mIdx);
+    });
+
+    localRows.forEach(localRow => {
+        if (!isRowNonBlank(localRow)) return;
+        const lCopy = [...localRow];
+        const key = getLogKey(lCopy);
+
+        if (key && key !== '|||||' && keyMap.has(key)) {
+            const targetRow = merged[keyMap.get(key)];
+            for (let c = 0; c < Math.max(targetRow.length, lCopy.length); c++) {
+                if ((targetRow[c] === '' || targetRow[c] === undefined || targetRow[c] === null) &&
+                    (lCopy[c] !== '' && lCopy[c] !== undefined && lCopy[c] !== null)) {
+                    targetRow[c] = lCopy[c];
+                }
+            }
+        } else {
+            const newIdx = merged.length;
+            merged.push(lCopy);
+            if (key && key !== '|||||') keyMap.set(key, newIdx);
+        }
+    });
+
+    const minRows = typeof ROWS !== 'undefined' ? ROWS : 50;
+    while (merged.length < minRows) {
+        merged.push(Array.from({ length: 13 }, () => ''));
+    }
+
+    return merged;
+}
+
+function mergeTableRows(localRows, serverRows) {
+    if (!Array.isArray(localRows) || !Array.isArray(serverRows)) return serverRows || localRows || [];
+    const isRowNonBlank = (row) => Array.isArray(row) && row.some(c => c !== '' && c !== undefined && c !== null);
+    const getRowKey = (row) => {
+        if (!Array.isArray(row)) return '';
+        if (row[0]) return row[0].toString().trim().toLowerCase();
+        return row.map(v => (v || '').toString().trim().toLowerCase()).join('|');
+    };
+
+    const merged = [];
+    const keyMap = new Map();
+
+    serverRows.forEach(row => {
+        if (!isRowNonBlank(row)) return;
+        const rowCopy = [...row];
+        const mIdx = merged.length;
+        merged.push(rowCopy);
+        const key = getRowKey(rowCopy);
+        if (key) keyMap.set(key, mIdx);
+    });
+
+    localRows.forEach(localRow => {
+        if (!isRowNonBlank(localRow)) return;
+        const lCopy = [...localRow];
+        const key = getRowKey(lCopy);
+
+        if (key && keyMap.has(key)) {
+            const targetRow = merged[keyMap.get(key)];
+            for (let c = 0; c < Math.max(targetRow.length, lCopy.length); c++) {
+                if ((targetRow[c] === '' || targetRow[c] === undefined || targetRow[c] === null) &&
+                    (lCopy[c] !== '' && lCopy[c] !== undefined && lCopy[c] !== null)) {
+                    targetRow[c] = lCopy[c];
+                }
+            }
+        } else {
+            const newIdx = merged.length;
+            merged.push(lCopy);
+            if (key) keyMap.set(key, newIdx);
+        }
+    });
+
+    const minRows = typeof ROWS !== 'undefined' ? ROWS : 50;
+    const colCount = (merged[0] && merged[0].length) ? merged[0].length : 10;
+    while (merged.length < minRows) {
+        merged.push(Array.from({ length: colCount }, () => ''));
+    }
+
     return merged;
 }
 
@@ -13574,9 +13800,18 @@ function mergeBundles(local, server) {
         merged.pages = { ...server.pages };
         for (const key in local.pages) {
             if (server.pages[key]) {
-                if (key === 'index') merged.pages[key] = mergeRegionsData(local.pages[key], server.pages[key]);
-                else if (Array.isArray(local.pages[key]) && Array.isArray(server.pages[key])) {
+                if (key === 'index') {
+                    merged.pages[key] = mergeRegionsData(local.pages[key], server.pages[key]);
+                } else if (key === 'page2') {
+                    merged.pages[key] = mergeSegmentsRows(local.pages[key], server.pages[key]);
+                } else if (key === 'page3') {
+                    merged.pages[key] = mergePersonnelRows(local.pages[key], server.pages[key]);
+                } else if (key === 'page4') {
+                    merged.pages[key] = mergeSearchLogRows(local.pages[key], server.pages[key]);
+                } else if (Array.isArray(local.pages[key]) && Array.isArray(server.pages[key])) {
                     merged.pages[key] = mergeTableRows(local.pages[key], server.pages[key]);
+                } else if (typeof local.pages[key] === 'object' && typeof server.pages[key] === 'object') {
+                    merged.pages[key] = { ...server.pages[key], ...local.pages[key] };
                 }
             } else {
                 merged.pages[key] = local.pages[key];
@@ -13593,6 +13828,54 @@ function mergeBundles(local, server) {
             if (!logMap.has(item.msg + item.time)) logMap.set(item.msg + item.time, item);
         });
         merged.activityLog = Array.from(logMap.values()).sort((a, b) => new Date(b.time) - new Date(a.time));
+    }
+    if (local.currentAssignments || server.currentAssignments) {
+        merged.currentAssignments = { ...(server.currentAssignments || {}), ...(local.currentAssignments || {}) };
+    }
+    if (local.teamStatuses || server.teamStatuses) {
+        merged.teamStatuses = { ...(server.teamStatuses || {}), ...(local.teamStatuses || {}) };
+    }
+    if (local.parChecks || server.parChecks) {
+        merged.parChecks = { ...(server.parChecks || {}), ...(local.parChecks || {}) };
+    }
+    if (local.teamLeaveTimes || server.teamLeaveTimes) {
+        merged.teamLeaveTimes = { ...(server.teamLeaveTimes || {}), ...(local.teamLeaveTimes || {}) };
+    }
+    if (local.teamAssignmentTimes || server.teamAssignmentTimes) {
+        merged.teamAssignmentTimes = { ...(server.teamAssignmentTimes || {}), ...(local.teamAssignmentTimes || {}) };
+    }
+    if (local.dismissedNotifications || server.dismissedNotifications) {
+        merged.dismissedNotifications = { ...(server.dismissedNotifications || {}), ...(local.dismissedNotifications || {}) };
+    }
+    if (local.maps || server.maps) {
+        const localMaps = Array.isArray(local.maps) ? local.maps : [];
+        const serverMaps = Array.isArray(server.maps) ? server.maps : [];
+        if (localMaps.length > 0 && serverMaps.length > 0) {
+            const mergedMaps = serverMaps.map(sm => {
+                const lm = localMaps.find(m => m.id === sm.id);
+                if (lm && Array.isArray(lm.features) && lm.features.length > (sm.features?.length || 0)) {
+                    return { ...sm, features: lm.features };
+                }
+                return sm;
+            });
+            localMaps.forEach(lm => {
+                if (!mergedMaps.some(m => m.id === lm.id)) mergedMaps.push(lm);
+            });
+            merged.maps = mergedMaps;
+        } else {
+            merged.maps = localMaps.length > 0 ? localMaps : serverMaps;
+        }
+    }
+    if (local.accounts && server.accounts) {
+        const accMap = new Map();
+        server.accounts.forEach(a => { if (a && a.pin) accMap.set(a.pin, a); });
+        local.accounts.forEach(a => {
+            if (a && a.pin) {
+                const existing = accMap.get(a.pin);
+                accMap.set(a.pin, existing ? { ...existing, ...a } : a);
+            }
+        });
+        merged.accounts = Array.from(accMap.values());
     }
     return merged;
 }
@@ -13643,11 +13926,18 @@ async function syncWithServer() {
     // 2s tick. Skip syncing entirely until a bucket is available.
     if (!bucket) return;
 
+    // If a push is currently in flight, wait for it first so we don't fetch older server state
+    if (_inFlightPushPromise) {
+        try {
+            await _inFlightPushPromise;
+        } catch (e) {}
+    }
+
     const apiBase = `${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}`;
     
     isSyncing = true;
     try {
-        const isNewDevice = !_memoryStorage[BUNDLE_STORAGE_KEY];
+        const isNewDevice = !getStorageItem(BUNDLE_STORAGE_KEY);
         
         // 1. Sync entire file list
         const listResp = await fetch(`${apiBase}/all-files?_=${Date.now()}`, {
@@ -13676,7 +13966,7 @@ async function syncWithServer() {
             }
 
             if (localChanged) {
-                _memoryStorage[FILE_LIST_STORAGE_KEY] = JSON.stringify(localFiles);
+                setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(localFiles));
                 refreshSyncUI();
             }
             if (serverNeedsUpdate) {
@@ -13698,25 +13988,25 @@ async function syncWithServer() {
             const serverBundle = await resp.json();
             if (serverBundle) {
                 const localBundle = loadBundle();
-                const sMod = new Date(serverBundle.lastModified || 0);
-                const lMod = new Date(localBundle.lastModified || 0);
+                const sMod = new Date(serverBundle.lastModified || 0).getTime();
+                const lMod = new Date(localBundle.lastModified || 0).getTime();
 
                 if (sMod > lMod) {
                     const merged = mergeBundles(localBundle, serverBundle);
                     if (areBundlesEqual(merged, serverBundle)) {
-                        _memoryStorage[BUNDLE_STORAGE_KEY] = JSON.stringify(serverBundle);
+                        setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(serverBundle));
                     } else {
                         // Local has some unique data, push the merged result
-                        saveBundle(merged, true);
+                        saveBundle(merged, false);
                     }
                     
                     const files = getSavedFiles();
                     if (serverBundle.fileName) {
                         files[serverBundle.fileName] = {
-                            bundle: loadBundle(), // Use potentially merged bundle
+                            bundle: loadBundle(),
                             lastModified: loadBundle().lastModified
                         };
-                        _memoryStorage[FILE_LIST_STORAGE_KEY] = JSON.stringify(files);
+                        setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
                     }
                     refreshSyncUI();
                 } else if (lMod > sMod && !isNewDevice) {
@@ -13724,17 +14014,8 @@ async function syncWithServer() {
                 }
             }
         } else if (resp.status === 404) {
-            // The server has no bundle for this CASE # yet. Seed it with the
-            // current bundle (a freshly-opened case starts from defaultBundle(),
-            // which already contains the blank placeholder rows every page needs)
-            // so the database is populated and pages have data to render instead
-            // of crashing on an empty case. This runs even on a fresh device/reload
-            // so opening a brand-new case immediately writes its rows to the DB.
             pushBundleToServer(loadBundle());
         }
-
-        // 4. Discovery step removed to prevent downloading all bundles into localStorage and exceeding quota.
-        // The list is fetched directly from the backend dynamically instead.
     } catch (err) {
         console.warn("Sync background check failed:", err);
     } finally {
@@ -13755,28 +14036,24 @@ async function pushBundleToServer(bundle, isReconcileRetry = false) {
         const resp = await fetch(`${baseUrl}/api/v1/${bucket}/bundle`, {
             method: 'PUT',
             headers: headers,
-            body: JSON.stringify(bundle)
+            body: JSON.stringify(bundle),
+            keepalive: true
         });
 
         // 2. Also push to a file-specific endpoint to aid discovery and prevent truncation
         if (bundle.fileName) {
             const fileKey = bundle.fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-            // A conflict on this secondary endpoint is handled by the bundle push below,
-            // so ignore its failures instead of letting them surface as console noise.
             await fetch(`${baseUrl}/api/v1/${bucket}/${fileKey}`, {
                 method: 'PUT',
                 headers: headers,
-                body: JSON.stringify(bundle)
+                body: JSON.stringify(bundle),
+                keepalive: true
             }).catch(() => {});
         }
 
         if (!resp.ok) {
             const errorData = await resp.json().catch(() => ({}));
             if (resp.status === 403 && (errorData.message || '').includes('older than server data')) {
-                // The server holds a newer (or clock-skewed future) timestamp. Left alone,
-                // this rejects the user's just-made edit and the next sync reverts it. Merge
-                // the server copy with the local edit (local wins), bump the timestamp above
-                // the server's, and push once so the edit reliably persists.
                 if (!isReconcileRetry) {
                     await reconcileAndRepushBundle(bundle, baseUrl, bucket, headers);
                 }
@@ -13792,18 +14069,16 @@ async function pushBundleToServer(bundle, isReconcileRetry = false) {
 async function reconcileAndRepushBundle(localBundle, baseUrl, bucket, headers) {
     try {
         const resp = await fetch(`${baseUrl}/api/v1/${bucket}/bundle?_=${Date.now()}`, { headers });
-        if (!resp.ok) return; // Nothing to reconcile against; leave the local copy as-is.
+        if (!resp.ok) return;
         const serverBundle = await resp.json();
         if (!serverBundle || typeof serverBundle !== 'object') return;
 
-        // mergeBundles lets its second argument win on conflicts, so pass the local
-        // bundle second to keep the user's edit while still absorbing server-only rows.
         const reconciled = mergeBundles(serverBundle, localBundle);
         const serverTime = new Date(serverBundle.lastModified || 0).getTime() || 0;
         reconciled.lastModified = new Date(Math.max(serverTime, Date.now()) + 1000).toISOString();
 
         const sanitized = sanitizeBundle(reconciled);
-        _memoryStorage[BUNDLE_STORAGE_KEY] = JSON.stringify(sanitized);
+        setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
         await pushBundleToServer(sanitized, true);
         refreshSyncUI();
     } catch (err) {
@@ -13824,12 +14099,13 @@ async function pushFileListToServer(files) {
         const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/all-files`, {
             method: 'PUT',
             headers: headers,
-            body: JSON.stringify(files)
+            body: JSON.stringify(files),
+            keepalive: true
         });
         if (!resp.ok) {
             const errorData = await resp.json().catch(() => ({}));
             if (resp.status === 403 && (errorData.message || '').includes('older than server data')) {
-                return; // Silently ignore sync conflicts
+                return;
             }
             console.error("Push file list failed:", resp.status, errorData.message || '');
         }
@@ -13849,12 +14125,13 @@ async function notifyActiveUser(user) {
         const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/user-${user.pin}`, {
             method: 'PUT',
             headers: headers,
-            body: JSON.stringify({deviceId: getDeviceId(), lastModified: new Date().toISOString()})
+            body: JSON.stringify({deviceId: getDeviceId(), lastModified: new Date().toISOString()}),
+            keepalive: true
         });
         if (!resp.ok) {
             const errorData = await resp.json().catch(() => ({}));
             if (resp.status === 403 && (errorData.message || '').includes('older than server data')) {
-                return; // Silently ignore sync conflicts
+                return;
             }
             console.error("Notify active user failed:", resp.status, errorData.message || '');
         }
@@ -13863,9 +14140,19 @@ async function notifyActiveUser(user) {
     }
 }
 
-// True while the user is actively editing a field (an input/textarea/select or a
-// contenteditable cell). Rebuilding a table replaces the focused element and moves
-// the caret out of the cell, so pulls must never refresh the UI while this is true.
+let _activeActionCount = 0;
+
+function beginUserAction() {
+    _activeActionCount++;
+}
+
+function endUserAction() {
+    if (_activeActionCount > 0) _activeActionCount--;
+    if (!isUserActionActive()) {
+        flushPendingSyncUI();
+    }
+}
+
 function isEditingActive() {
     const el = document.activeElement;
     if (!el) return false;
@@ -13873,8 +14160,10 @@ function isEditingActive() {
     return tag === 'input' || tag === 'textarea' || tag === 'select' || el.isContentEditable === true;
 }
 
-// Set when a UI refresh was skipped because the user was editing; flushed once
-// editing stops so pulled server changes still render without disturbing typing.
+function isUserActionActive() {
+    return _activeActionCount > 0 || isEditingActive() || _inFlightPushPromise !== null;
+}
+
 let _pendingUIRefresh = false;
 
 function performSyncUIRefresh() {
@@ -13893,10 +14182,7 @@ function performSyncUIRefresh() {
 }
 
 function refreshSyncUI() {
-    // Never rebuild the current page's table while the user is editing a cell or
-    // field: a full rebuild replaces the focused element and yanks the caret out.
-    // Defer the refresh and flush it once editing stops (see flushPendingSyncUI).
-    if (isEditingActive()) {
+    if (isUserActionActive()) {
         _pendingUIRefresh = true;
         return;
     }
@@ -13904,37 +14190,28 @@ function refreshSyncUI() {
     performSyncUIRefresh();
 }
 
-// Apply a refresh that was deferred while the user was editing, once they leave
-// the field. No-op if nothing is pending or the user is still editing.
 function flushPendingSyncUI() {
-    if (_pendingUIRefresh && !isEditingActive()) {
+    if (_pendingUIRefresh && !isUserActionActive()) {
         _pendingUIRefresh = false;
         performSyncUIRefresh();
     }
 }
 
-// Sync on demand instead of continuously polling in the background. Changes are
-// pushed to (and pulled from) the server only when:
-//   - the user leaves an editable cell or text box (focusout), and
-//   - the user leaves / switches away from the page (pagehide / tab hidden),
-//   - plus one initial sync when arriving on a page (page load below).
-
-// A tiny debounce lets the blur-triggered local save (saveBundle) finish first,
-// so the follow-up sync actually carries the just-entered value. It also collapses
-// rapid focus changes (e.g. tabbing between cells) into a single sync.
 let _syncOnLeaveTimer = null;
 function scheduleSyncOnLeave() {
     if (_syncOnLeaveTimer) clearTimeout(_syncOnLeaveTimer);
-    _syncOnLeaveTimer = setTimeout(() => {
+    _syncOnLeaveTimer = setTimeout(async () => {
         _syncOnLeaveTimer = null;
-        // Focus may have simply moved to another editable cell (e.g. the user
-        // tabbed from one field to the next). Pulling/rebuilding now would move
-        // the caret out of the cell they just entered, so defer until they truly
-        // leave the fields — the next focusout reschedules this check.
         if (isEditingActive()) return;
-        // Not editing anymore: pull, then apply any refresh that was deferred
-        // while the user was typing.
-        Promise.resolve(syncWithServer()).then(flushPendingSyncUI);
+        beginUserAction();
+        try {
+            if (_inFlightPushPromise) {
+                await _inFlightPushPromise;
+            }
+            await syncWithServer();
+        } finally {
+            endUserAction();
+        }
     }, 200);
 }
 
@@ -13948,10 +14225,55 @@ document.addEventListener('focusout', (e) => {
     }
 });
 
-// Push/pull when the page is being left or hidden (i.e. switching pages).
-window.addEventListener('pagehide', () => { syncWithServer(); });
+// Capture user actions on buttons and interactive controls to guard against refresh conflicts
+document.addEventListener('click', (e) => {
+    const btn = e.target && e.target.closest && e.target.closest('button, [role="button"], input[type="submit"], input[type="button"], .mini-pill, .clear-btn, .popup-btn, .toggle-switch');
+    if (btn) {
+        beginUserAction();
+        setTimeout(async () => {
+            try {
+                if (_inFlightPushPromise) {
+                    await _inFlightPushPromise;
+                }
+            } catch (err) {
+                // ignore
+            } finally {
+                endUserAction();
+            }
+        }, 50);
+    }
+}, true);
+
+// Save and sync when leaving or switching away from the page
+window.addEventListener('beforeunload', () => {
+    if (isEditingActive()) {
+        const el = document.activeElement;
+        if (el && typeof el.blur === 'function') {
+            el.blur();
+        }
+    }
+});
+
+window.addEventListener('pagehide', () => {
+    if (isEditingActive()) {
+        const el = document.activeElement;
+        if (el && typeof el.blur === 'function') {
+            el.blur();
+        }
+    }
+    syncWithServer();
+});
+
 document.addEventListener('visibilitychange', () => {
-    if (document.visibilityState === 'hidden') syncWithServer();
+    if (document.visibilityState === 'hidden') {
+        if (isEditingActive()) {
+            const el = document.activeElement;
+            if (el && typeof el.blur === 'function') {
+                el.blur();
+            }
+        }
+        syncWithServer();
+    }
 });
 
 // Initial sync when arriving on a page.
