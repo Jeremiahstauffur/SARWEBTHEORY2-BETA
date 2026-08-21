@@ -1,18 +1,90 @@
-window.SARMapSegmentUtils = (function() {
+(function (root, factory) {
+    const api = factory();
+    if (typeof module !== 'undefined' && module.exports) {
+        module.exports = api;
+    }
+    if (root) {
+        root.SARMapSegmentUtils = api;
+    }
+})(typeof window !== 'undefined' ? window : null, function () {
+    'use strict';
+
     function getFeatureTypeKey(feature) {
-        const attrs = feature.attributes || feature.properties || {};
-        const geomType = (feature.geometry && feature.geometry.type) || attrs.class || attrs.type || '';
+        const attrs = feature?.attributes || feature?.properties || {};
+        const geomType = (feature?.geometry && feature?.geometry.type) || attrs.class || attrs.type || '';
         
-        if (geomType === 'Polygon' || geomType === 'GeometryCollection' || geomType === 'Shape') {
+        if (attrs.class === 'Assignment' || attrs.type === 'Assignment' || attrs.assignment || geomType === 'Assignment' || geomType === 'Polygon' || geomType === 'GeometryCollection' || geomType === 'Shape') {
             return 'assignment';
         }
-        if (geomType === 'LineString' || geomType === 'Polyline' || geomType === 'Line') {
+        if (geomType === 'LineString' || geomType === 'Polyline' || geomType === 'Line' || geomType === 'Route' || geomType === 'Track') {
             return 'route';
         }
         if (geomType === 'Point' || geomType === 'Marker') {
             return 'marker';
         }
         return 'other';
+    }
+
+    function getCalTopoApiObjectType(feature) {
+        const attrs = feature?.attributes || feature?.properties || {};
+        const geom = feature?.geometry || {};
+        const rawClass = attrs.class || attrs.type || geom.class || geom.type || '';
+        if (typeof rawClass === 'string' && rawClass) {
+            const lower = rawClass.toLowerCase();
+            if (lower === 'assignment') return 'Assignment';
+            if (lower === 'shape') return 'Shape';
+            if (lower === 'marker') return 'Marker';
+            if (lower === 'folder') return 'Folder';
+        }
+        if (attrs.assignment || rawClass === 'Assignment') {
+            return 'Assignment';
+        }
+        if (attrs.class === 'Shape') {
+            return 'Shape';
+        }
+        return 'Assignment';
+    }
+
+    function captureCalTopoFeatureStyle(attributes = {}) {
+        return {
+            color: Object.prototype.hasOwnProperty.call(attributes, 'color') ? attributes.color : null,
+            stroke: Object.prototype.hasOwnProperty.call(attributes, 'stroke') ? attributes.stroke : null,
+            fill: Object.prototype.hasOwnProperty.call(attributes, 'fill') ? attributes.fill : null,
+            'fill-opacity': Object.prototype.hasOwnProperty.call(attributes, 'fill-opacity') ? attributes['fill-opacity'] : null,
+            opacity: Object.prototype.hasOwnProperty.call(attributes, 'opacity') ? attributes.opacity : null,
+            'stroke-opacity': Object.prototype.hasOwnProperty.call(attributes, 'stroke-opacity') ? attributes['stroke-opacity'] : null
+        };
+    }
+
+    function applyCapturedCalTopoFeatureStyle(attributes, style = {}) {
+        ['color', 'stroke', 'fill', 'fill-opacity', 'opacity', 'stroke-opacity'].forEach(key => {
+            if (!Object.prototype.hasOwnProperty.call(style, key)) {
+                return;
+            }
+            const value = style[key];
+            if (value === null || value === undefined || value === '') {
+                delete attributes[key];
+            } else {
+                attributes[key] = value;
+            }
+        });
+    }
+
+    function buildCalTopoFeatureUpdatePayload(feature, styleOverrides = {}) {
+        const attributes = {...(feature?.attributes || feature?.properties || {})};
+        const geometry = feature?.geometry ? JSON.parse(JSON.stringify(feature.geometry)) : null;
+
+        delete attributes.ObjectID;
+        delete attributes.id;
+
+        applyCapturedCalTopoFeatureStyle(attributes, styleOverrides);
+
+        return {
+            id: feature?.attributes?.id || feature?.id || null,
+            type: 'Feature',
+            geometry,
+            properties: attributes
+        };
     }
 
     function getFeatureTypeLabel(feature) {
@@ -169,6 +241,10 @@ window.SARMapSegmentUtils = (function() {
 
     return {
         getFeatureTypeKey,
+        getCalTopoApiObjectType,
+        captureCalTopoFeatureStyle,
+        applyCapturedCalTopoFeatureStyle,
+        buildCalTopoFeatureUpdatePayload,
         getFeatureTypeLabel,
         normalizeSegmentName,
         formatSegmentAssignmentLabel,
@@ -178,4 +254,4 @@ window.SARMapSegmentUtils = (function() {
         filterSegmentImportsByType,
         ensureSegmentsPageRows
     };
-})();
+});

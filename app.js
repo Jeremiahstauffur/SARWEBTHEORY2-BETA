@@ -213,12 +213,23 @@ function setCalTopoAssignmentOverlayEnabled(enabled) {
     }
 }
 
+function getCalTopoApiObjectType(feature) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.getCalTopoApiObjectType === 'function' ? utils.getCalTopoApiObjectType(feature) : 'Assignment';
+}
+
 function captureCalTopoFeatureStyle(attributes = {}) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.captureCalTopoFeatureStyle === 'function') {
+        return utils.captureCalTopoFeatureStyle(attributes);
+    }
     return {
+        color: Object.prototype.hasOwnProperty.call(attributes, 'color') ? attributes.color : null,
         stroke: Object.prototype.hasOwnProperty.call(attributes, 'stroke') ? attributes.stroke : null,
         fill: Object.prototype.hasOwnProperty.call(attributes, 'fill') ? attributes.fill : null,
         'fill-opacity': Object.prototype.hasOwnProperty.call(attributes, 'fill-opacity') ? attributes['fill-opacity'] : null,
-        opacity: Object.prototype.hasOwnProperty.call(attributes, 'opacity') ? attributes.opacity : null
+        opacity: Object.prototype.hasOwnProperty.call(attributes, 'opacity') ? attributes.opacity : null,
+        'stroke-opacity': Object.prototype.hasOwnProperty.call(attributes, 'stroke-opacity') ? attributes['stroke-opacity'] : null
     };
 }
 
@@ -228,7 +239,11 @@ function resolveOverlayOpacity(value, fallback = 1) {
 }
 
 function applyCapturedCalTopoFeatureStyle(attributes, style = {}) {
-    ['stroke', 'fill', 'fill-opacity', 'opacity'].forEach(key => {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.applyCapturedCalTopoFeatureStyle === 'function') {
+        return utils.applyCapturedCalTopoFeatureStyle(attributes, style);
+    }
+    ['color', 'stroke', 'fill', 'fill-opacity', 'opacity', 'stroke-opacity'].forEach(key => {
         if (!Object.prototype.hasOwnProperty.call(style, key)) {
             return;
         }
@@ -242,7 +257,11 @@ function applyCapturedCalTopoFeatureStyle(attributes, style = {}) {
 }
 
 function buildCalTopoFeatureUpdatePayload(feature, styleOverrides = {}) {
-    const attributes = {...(feature?.attributes || {})};
+    const utils = getMapSegmentUtils();
+    if (typeof utils.buildCalTopoFeatureUpdatePayload === 'function') {
+        return utils.buildCalTopoFeatureUpdatePayload(feature, styleOverrides);
+    }
+    const attributes = {...(feature?.attributes || feature?.properties || {})};
     const geometry = feature?.geometry ? JSON.parse(JSON.stringify(feature.geometry)) : null;
 
     delete attributes.ObjectID;
@@ -251,7 +270,7 @@ function buildCalTopoFeatureUpdatePayload(feature, styleOverrides = {}) {
     applyCapturedCalTopoFeatureStyle(attributes, styleOverrides);
 
     return {
-        id: feature?.attributes?.id || null,
+        id: feature?.attributes?.id || feature?.id || null,
         type: 'Feature',
         geometry,
         properties: attributes
@@ -310,6 +329,9 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
         throw new Error('No matching assignment shapes were found for your current segments.');
     }
 
+    let updatedCount = 0;
+    const errors = [];
+
     for (const feature of matchingAssignments) {
         const featureId = feature.attributes.id;
         const featureName = feature.attributes.name || featureId;
@@ -328,23 +350,47 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
 
         const isActiveSearch = enabled && isFeatureActivelyBeingSearched(feature, activeSearchNames);
         const opacityFactor = isActiveSearch ? segmentDisplaySettings.activeSearchOpacity : 1;
+        const overlayColor = style.stroke || style.fill || (style.color ? style.color.css : null) || '#40c057';
+        const fillOpacity = Number((resolveOverlayOpacity(originalStyle['fill-opacity'], resolveOverlayOpacity(feature.attributes['fill-opacity'], 0.35)) * opacityFactor).toFixed(4));
+        const strokeOpacity = Number((resolveOverlayOpacity(originalStyle.opacity || originalStyle['stroke-opacity'], resolveOverlayOpacity(feature.attributes.opacity || feature.attributes['stroke-opacity'], 1)) * opacityFactor).toFixed(4));
+
         const overlayStyle = enabled
             ? {
-                stroke: style.stroke,
-                fill: style.fill,
-                'fill-opacity': Number((resolveOverlayOpacity(originalStyle['fill-opacity'], resolveOverlayOpacity(feature.attributes['fill-opacity'], 0.35)) * opacityFactor).toFixed(4)),
-                opacity: Number((resolveOverlayOpacity(originalStyle.opacity, resolveOverlayOpacity(feature.attributes.opacity, 1)) * opacityFactor).toFixed(4))
+                color: overlayColor,
+                stroke: overlayColor,
+                fill: overlayColor,
+                'fill-opacity': fillOpacity,
+                opacity: strokeOpacity,
+                'stroke-opacity': strokeOpacity
             }
             : style;
 
         const payload = buildCalTopoFeatureUpdatePayload(feature, overlayStyle);
-        const endpoint = `/api/v1/map/${encodeURIComponent(map.id)}/Shape/${encodeURIComponent(featureId)}`;
-        const result = await caltopo_api_call('POST', endpoint, payload, map.domain || 'caltopo.com');
+        const primaryType = getCalTopoApiObjectType(feature);
+        const fallbackType = primaryType === 'Assignment' ? 'Shape' : 'Assignment';
+
+        let endpoint = `/api/v1/map/${encodeURIComponent(map.id)}/${encodeURIComponent(primaryType)}/${encodeURIComponent(featureId)}`;
+        let result = await caltopo_api_call('POST', endpoint, payload, map.domain || 'caltopo.com', {silent: true});
+
+        if (!result && fallbackType) {
+            const fallbackEndpoint = `/api/v1/map/${encodeURIComponent(map.id)}/${encodeURIComponent(fallbackType)}/${encodeURIComponent(featureId)}`;
+            result = await caltopo_api_call('POST', fallbackEndpoint, payload, map.domain || 'caltopo.com', {silent: true});
+            if (result) {
+                feature.attributes.class = fallbackType;
+            }
+        }
+
         if (!result) {
-            throw new Error(`CalTopo could not update assignment "${featureName}".`);
+            errors.push(`CalTopo could not update assignment "${featureName}".`);
+            continue;
         }
 
         applyCapturedCalTopoFeatureStyle(feature.attributes, overlayStyle);
+        updatedCount++;
+    }
+
+    if (errors.length > 0 && updatedCount === 0) {
+        throw new Error(errors.join('\n'));
     }
 
     if (enabled) {
@@ -354,7 +400,7 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
     }
 
     saveBundle(bundle);
-    return {updatedCount: matchingAssignments.length};
+    return {updatedCount, errors};
 }
 
 function wait(ms) {
@@ -12404,15 +12450,18 @@ function importCalTopoSegments(selected) {
     })));
 }
 
-async function caltopo_api_call(method, endpoint, payload = null, domain = null) {
+async function caltopo_api_call(method, endpoint, payload = null, domain = null, options = {}) {
+  const { silent = false } = (typeof options === 'object' && options !== null) ? options : {};
   try {
     return await _execute_caltopo_api_call(method, endpoint, payload, domain);
   } catch (error) {
     console.error('CalTopo API Call Error:', error);
-    if (error.message.includes('Unexpected token')) {
-       alert('CalTopo API Call Error: The server returned an invalid response (not JSON). This usually happens when the proxy URL is incorrect or the server is down.');
-    } else {
-       alert('CalTopo API Call Error: ' + error.message);
+    if (!silent) {
+      if (error.message.includes('Unexpected token')) {
+         alert('CalTopo API Call Error: The server returned an invalid response (not JSON). This usually happens when the proxy URL is incorrect or the server is down.');
+      } else {
+         alert('CalTopo API Call Error: ' + error.message);
+      }
     }
     return null;
   }
