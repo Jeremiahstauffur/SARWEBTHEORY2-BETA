@@ -2854,6 +2854,15 @@ tr.log-sweeps-due::after {
 }
 
 @media (max-width: 860px) {
+  /* backdrop-filter on .site-shell creates a containing block that makes
+     position: fixed resolve against .site-shell instead of the viewport,
+     which prevented the bottom nav from sticking to the screen. Disable it
+     on mobile so the fixed bottom nav is anchored to the viewport. */
+  .site-shell {
+    backdrop-filter: none !important;
+    -webkit-backdrop-filter: none !important;
+  }
+
   .bottom-nav {
     display: flex !important;
   }

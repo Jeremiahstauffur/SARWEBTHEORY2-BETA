@@ -6331,8 +6331,7 @@ function renderMemberIncidentCards(memberName, container) {
     
     const bundle = loadBundle();
     const memberRows = (bundle.pages.page3 || []).filter(r => r[0] === memberName);
-    const hasIncidentTime = row => [9, 10, 11, 12].some(idx => (row && row[idx] ? String(row[idx]).trim() : '') !== '');
-    const allRows = memberRows.filter(hasIncidentTime);
+    const allRows = memberRows;
 
     const cardsWrapper = document.createElement('div');
     cardsWrapper.className = 'incident-times-container';
@@ -6356,7 +6355,7 @@ function renderMemberIncidentCards(memberName, container) {
             e.stopPropagation();
             if (confirm('Delete this incident row?')) {
                 const page3 = bundle.pages.page3 || [];
-                const memberIncidentRows = page3.filter(row => row[0] === memberName && hasIncidentTime(row));
+                const memberIncidentRows = page3.filter(row => row[0] === memberName);
                 if (memberIncidentRows.length <= 1) {
                     pRow[9] = '';
                     pRow[10] = '';
@@ -13241,6 +13240,7 @@ function buildUserAccountPage() {
             <div class="tool-actions" style="margin-top: 20px; justify-content: center; grid-column: span 6;">
                 <button id="save-user-btn" class="update-pill" style="padding: 12px 40px; font-size: 1rem;">Update Account</button>
                 <button id="switch-user-btn" class="mini-pill" style="padding: 12px 20px; font-size: 1rem; margin-left: 10px; background: rgba(235, 87, 87, 0.1); border-color: rgba(235, 87, 87, 0.4);">Switch User</button>
+                <button id="logout-btn" class="mini-pill" style="padding: 12px 20px; font-size: 1rem; margin-left: 10px; background: rgba(235, 87, 87, 0.1); border-color: rgba(235, 87, 87, 0.4);">Log Out</button>
             </div>
         </div>
     `;
@@ -13312,6 +13312,14 @@ function buildUserAccountPage() {
         switchBtn.onclick = () => {
             sessionStorage.removeItem('sar-current-user');
             window.location.href = 'home.html';
+        };
+    }
+
+    const logoutBtn = document.getElementById('logout-btn');
+    if (logoutBtn) {
+        logoutBtn.onclick = () => {
+            setCurrentUser(null);
+            window.location.href = 'index.html';
         };
     }
 
