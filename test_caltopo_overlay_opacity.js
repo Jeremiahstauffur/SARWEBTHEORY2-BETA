@@ -32,6 +32,7 @@ console.log('--- Testing CalTopo overlay opacity resolution ---');
 const appSource = fs.readFileSync(path.join(__dirname, 'app.js'), 'utf8');
 const settingsSrc = extractFunctionSource(appSource, 'function getSegmentDisplaySettings(bundle)');
 const opacitySrc = extractFunctionSource(appSource, 'function resolveDisplayedSegmentOpacity(isActiveSearch, settings, baseOpacity = 0.2)');
+const overlayStyleSrc = extractFunctionSource(appSource, 'function buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings)');
 
 const sandbox = {
     console,
@@ -40,7 +41,7 @@ const sandbox = {
 };
 
 vm.createContext(sandbox);
-vm.runInContext(`${settingsSrc}\n${opacitySrc}`, sandbox);
+vm.runInContext(`${settingsSrc}\n${opacitySrc}\n${overlayStyleSrc}`, sandbox);
 
 // The user's configured active-search opacity must be honored.
 const settings = sandbox.getSegmentDisplaySettings({
@@ -90,4 +91,24 @@ assert.strictEqual(
 );
 
 console.log('  ok - overlay opacity honors gradient-scale + active-search opacity settings');
+
+// --- CalTopo overlay style: border stays CONSTANT, only the fill reacts ---
+const overlaySettings = sandbox.getSegmentDisplaySettings({ segmentActiveSearchOpacityPercent: 30 });
+
+// Non active-search: fill uses the overlay base opacity; the border is fully opaque.
+const restingStyle = sandbox.buildCalTopoOverlayStyle('#123456', false, overlaySettings);
+assert.strictEqual(restingStyle.stroke, '#123456', 'Overlay stroke uses the PSRc color');
+assert.strictEqual(restingStyle.fill, '#123456', 'Overlay fill uses the PSRc color');
+assert.strictEqual(restingStyle['fill-opacity'], 0.42, 'Resting fill opacity equals the overlay base (0.42)');
+assert.strictEqual(restingStyle['stroke-opacity'], 1, 'Resting border opacity is constant (1)');
+assert.strictEqual(restingStyle.opacity, 1, 'Resting overall/border opacity is constant (1)');
+
+// Active-search: ONLY the fill opacity changes; the border opacity must stay constant.
+const activeStyle = sandbox.buildCalTopoOverlayStyle('#123456', true, overlaySettings);
+assert.strictEqual(activeStyle['fill-opacity'], 0.3, 'Active fill opacity reflects the 30% active-search setting');
+assert.strictEqual(activeStyle['stroke-opacity'], restingStyle['stroke-opacity'], 'Border (stroke) opacity must NOT change when actively searched');
+assert.strictEqual(activeStyle.opacity, restingStyle.opacity, 'Overall/border opacity must NOT change when actively searched');
+assert.notStrictEqual(activeStyle['fill-opacity'], restingStyle['fill-opacity'], 'Fill opacity MUST change when actively searched');
+console.log('  ok - overlay keeps the border opacity constant while the fill reacts to active-search');
+
 console.log('All CalTopo overlay opacity checks passed.');

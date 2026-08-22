@@ -398,6 +398,25 @@ function buildCalTopoFeatureUpdatePayload(feature, styleOverrides = {}) {
     return payload;
 }
 
+// Builds the CalTopo style overlay for an assignment shape.
+// Invariant: the border/outline opacity is CONSTANT (fully opaque) so that only the
+// FILL communicates status. The fill opacity is the only thing that reacts to the
+// active-search state: non-searched segments use the overlay base opacity, while
+// actively-searched segments reset to the opacity configured in Settings.
+function buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings) {
+    const STROKE_OVERLAY_OPACITY = 1;
+    const fillOpacity = Number(resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, 0.42).toFixed(4));
+    const strokeOpacity = STROKE_OVERLAY_OPACITY;
+    return {
+        color: overlayColor,
+        stroke: overlayColor,
+        fill: overlayColor,
+        'fill-opacity': fillOpacity,
+        opacity: strokeOpacity,
+        'stroke-opacity': strokeOpacity
+    };
+}
+
 async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
     const {ensureFeaturesLoaded = false} = options;
     let bundle = loadBundle();
@@ -472,20 +491,8 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
 
         const isActiveSearch = enabled && isFeatureActivelyBeingSearched(feature, activeSearchNames);
         const overlayColor = style.stroke || style.fill || (style.color ? style.color.css : null) || '#40c057';
-        // Mirror the app's own map display so the color/opacity written to SARTopo
-        // matches the gradient-scale + active-search opacity settings the user configured.
-        const fillOpacity = Number(resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, 0.42).toFixed(4));
-        const strokeOpacity = Number(resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, 1).toFixed(4));
-
         const overlayStyle = enabled
-            ? {
-                color: overlayColor,
-                stroke: overlayColor,
-                fill: overlayColor,
-                'fill-opacity': fillOpacity,
-                opacity: strokeOpacity,
-                'stroke-opacity': strokeOpacity
-            }
+            ? buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings)
             : style;
 
         const payload = buildCalTopoFeatureUpdatePayload(feature, overlayStyle);
@@ -13062,15 +13069,21 @@ function renderArcGISMap() {
 
         const overlayColor = usePsrcOverlay ? getFeaturePsrcColor(f, psrcLookup, segmentDisplaySettings) : null;
         const isActiveSearch = isFeatureActivelyBeingSearched(f, activeSearchNames);
+        // The area border/outline opacity stays CONSTANT so that only the fill
+        // communicates active-search status. `strokeOpacity` remains responsive for
+        // line/marker features (which have no fill), where the stroke is the primary
+        // visual; `borderOpacity` is the constant value used for area outlines.
         const strokeOpacity = resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, overlayColor ? 1 : 0.2);
+        const borderOpacity = overlayColor ? 1 : 0.2;
         const fillOpacity = resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, overlayColor ? 0.42 : 0.4);
         const overlayRgb = overlayColor ? [...overlayColor.rgb, strokeOpacity] : [64, 192, 87, strokeOpacity];
+        const overlayBorderRgb = overlayColor ? [...overlayColor.rgb, borderOpacity] : [64, 192, 87, borderOpacity];
         const overlayFillRgb = overlayColor ? [...overlayColor.rgb, fillOpacity] : [64, 192, 87, fillOpacity];
 
       let symbol = {
         type: "simple-fill",
           color: overlayFillRgb,
-          outline: {color: overlayRgb, width: overlayColor ? 3 : 2}
+          outline: {color: overlayBorderRgb, width: overlayColor ? 3 : 2}
       };
 
       if (arcgisGeom.type === 'polyline') {
