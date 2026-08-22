@@ -13635,7 +13635,7 @@ function buildMapsPage() {
   container.innerHTML = `
     <section class="hero">
       <h1>Maps Management</h1>
-      <p>Manage your CalTopo maps here. Add a Map ID to embed and fetch shapes. Polygons are imported as segments, lines are not imported.</p>
+      <p>Manage your CalTopo maps here. Add a Map ID to embed the map and enable the website to fetch shapes (aka assignments). Assignments are imported as segments, lines are not imported. Also, use the toggle button to enable color scaling and opacity effects for the linked segments based on the color scale and opacity set in the settings page.</p>
       
       <div class="tabs" style="display: flex; gap: 10px; margin-top: 20px;">
         <button id="tab-map" class="mini-pill ${activeTab === 'map' ? 'active' : ''}" style="padding: 10px 24px; font-size: 1rem; cursor: pointer;">CalTopo View</button>
