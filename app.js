@@ -2038,6 +2038,15 @@ function sanitizeBundle(bundle) {
 
   const parCheckFrequency = (bundle.parCheckFrequency !== undefined) ? bundle.parCheckFrequency : 20;
   const showTips = (bundle.showTips !== undefined) ? bundle.showTips : true;
+
+  // Preserve the segment color-scale / active-search opacity display settings.
+  // Normalize them through the shared helper so saved values stay valid.
+  const segmentDisplaySettings = getSegmentDisplaySettings(bundle);
+  const segmentColorScaleUsePsriMax = segmentDisplaySettings.usePsriMax;
+  const segmentColorScaleLowColor = segmentDisplaySettings.lowColor;
+  const segmentColorScaleMidColor = segmentDisplaySettings.midColor;
+  const segmentColorScaleHighColor = segmentDisplaySettings.highColor;
+  const segmentActiveSearchOpacityPercent = segmentDisplaySettings.activeSearchOpacityPercent;
   const theme = bundle.theme || 'dark';
   const lastModified = bundle.lastModified || new Date().toISOString();
   const forms = bundle.forms || {};
@@ -2149,6 +2158,11 @@ function sanitizeBundle(bundle) {
     dismissedNotifications,
     parCheckFrequency, 
     showTips, 
+    segmentColorScaleUsePsriMax,
+    segmentColorScaleLowColor,
+    segmentColorScaleMidColor,
+    segmentColorScaleHighColor,
+    segmentActiveSearchOpacityPercent,
     pages, 
     forms, 
     profile, 
