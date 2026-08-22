@@ -545,6 +545,74 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
     return {updatedCount, errors};
 }
 
+// Re-push the CalTopo/SARTopo assignment overlay (PSRc colors + active-search
+// fill opacity) whenever the underlying data changes - e.g. a search log edit
+// that recomputes a segment's PSRc, or that flips a segment between actively
+// searched and idle.
+//
+// This is a best-effort, debounced, SILENT refresh: it does nothing unless the
+// assignment overlay is currently enabled and a CalTopo map with already
+// fetched shapes exists. That way ordinary edits on devices that never turned
+// the overlay on (or never fetched shapes) pay no cost and trigger no network
+// requests.
+let _caltopoOverlayRefreshTimer = null;
+let _caltopoOverlayRefreshInFlight = false;
+let _caltopoOverlayRefreshPending = false;
+
+function refreshCalTopoAssignmentOverlayIfEnabled(options = {}) {
+    const {delay = 1200} = options;
+    if (typeof isCalTopoAssignmentOverlayEnabled !== 'function' || !isCalTopoAssignmentOverlayEnabled()) {
+        return;
+    }
+    // A map with already-fetched shapes must exist; otherwise there is nothing
+    // to recolor and we must not surprise the user with a background fetch.
+    let bundle;
+    try {
+        bundle = loadBundle();
+    } catch (e) {
+        return;
+    }
+    const map = bundle && bundle.maps && bundle.maps[0] ? bundle.maps[0] : null;
+    if (!map || !map.id || !Array.isArray(map.features) || map.features.length === 0) {
+        return;
+    }
+    if (_caltopoOverlayRefreshTimer) {
+        clearTimeout(_caltopoOverlayRefreshTimer);
+    }
+    _caltopoOverlayRefreshTimer = setTimeout(runCalTopoAssignmentOverlayRefresh, delay);
+}
+
+async function runCalTopoAssignmentOverlayRefresh() {
+    _caltopoOverlayRefreshTimer = null;
+    // Collapse overlapping requests: if a push is already running, remember that
+    // another refresh was requested and run it once the current one settles so
+    // the map always ends on the latest colors/opacity.
+    if (_caltopoOverlayRefreshInFlight) {
+        _caltopoOverlayRefreshPending = true;
+        return;
+    }
+    if (typeof isCalTopoAssignmentOverlayEnabled !== 'function' || !isCalTopoAssignmentOverlayEnabled()) {
+        return;
+    }
+    _caltopoOverlayRefreshInFlight = true;
+    try {
+        await updateCalTopoAssignmentOverlay(true);
+        if (typeof refreshCalTopoIframe === 'function') {
+            try { refreshCalTopoIframe(); } catch (e) {}
+        }
+    } catch (err) {
+        // Silent by design: an auto-refresh must never interrupt data entry with
+        // an error dialog. The manual toggle still surfaces problems to the user.
+        console.warn('CalTopo assignment overlay auto-refresh failed:', err);
+    } finally {
+        _caltopoOverlayRefreshInFlight = false;
+        if (_caltopoOverlayRefreshPending) {
+            _caltopoOverlayRefreshPending = false;
+            _caltopoOverlayRefreshTimer = setTimeout(runCalTopoAssignmentOverlayRefresh, 300);
+        }
+    }
+}
+
 function wait(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
 }
@@ -2404,6 +2472,12 @@ function saveCurrentPageData(data) {
     bundle.pages[key] = data;
   }
   saveBundle(bundle);
+  // A Search Log edit can change a segment's active/inactive search state (e.g.
+  // logging that a team searched or finished a segment). Push the refreshed
+  // colors/opacity to SARTopo when the assignment overlay is enabled.
+  if (key === 'page4') {
+    refreshCalTopoAssignmentOverlayIfEnabled();
+  }
   const status = document.getElementById('save-status');
   if (status) {
     const now = new Date();
@@ -2765,6 +2839,11 @@ function recalculateEverything() {
   });
 
   saveBundle(bundle);
+
+  // Segment PSRc values (column 7) were just recomputed. If the CalTopo
+  // assignment overlay is on, re-color and re-opacity the shapes on SARTopo so
+  // the map always reflects the latest PSRc scale.
+  refreshCalTopoAssignmentOverlayIfEnabled();
 }
 
 function buildRegionsTable() {
