@@ -175,7 +175,16 @@ function resolveDisplayedSegmentOpacity(isActiveSearch, settings, baseOpacity = 
     }
 
     const safeBaseOpacity = Number.isFinite(baseOpacity) ? Math.min(1, Math.max(0, baseOpacity)) : 0.2;
-    return isActiveSearch ? getSegmentDisplaySettings(settings).activeSearchOpacity : safeBaseOpacity;
+    if (!isActiveSearch) {
+        return safeBaseOpacity;
+    }
+    // `settings` may already be a normalized display-settings object (with a numeric
+    // activeSearchOpacity) or a raw bundle; use the normalized value directly when
+    // present so the user's configured active-search opacity is honored.
+    const normalizedSettings = (settings && typeof settings.activeSearchOpacity === 'number')
+        ? settings
+        : getSegmentDisplaySettings(settings);
+    return normalizedSettings.activeSearchOpacity;
 }
 
 function buildSegmentNameSet(rows) {
@@ -456,10 +465,11 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
         }
 
         const isActiveSearch = enabled && isFeatureActivelyBeingSearched(feature, activeSearchNames);
-        const opacityFactor = isActiveSearch ? segmentDisplaySettings.activeSearchOpacity : 1;
         const overlayColor = style.stroke || style.fill || (style.color ? style.color.css : null) || '#40c057';
-        const fillOpacity = Number((resolveOverlayOpacity(originalStyle['fill-opacity'], resolveOverlayOpacity(feature.attributes['fill-opacity'], 0.35)) * opacityFactor).toFixed(4));
-        const strokeOpacity = Number((resolveOverlayOpacity(originalStyle.opacity || originalStyle['stroke-opacity'], resolveOverlayOpacity(feature.attributes.opacity || feature.attributes['stroke-opacity'], 1)) * opacityFactor).toFixed(4));
+        // Mirror the app's own map display so the color/opacity written to SARTopo
+        // matches the gradient-scale + active-search opacity settings the user configured.
+        const fillOpacity = Number(resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, 0.42).toFixed(4));
+        const strokeOpacity = Number(resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, 1).toFixed(4));
 
         const overlayStyle = enabled
             ? {
