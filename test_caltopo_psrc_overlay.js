@@ -154,6 +154,44 @@ console.log('--- Testing SARMapSegmentUtils & CalTopo Object Helpers ---');
     console.log('  ok - buildSegmentPsrcLookup and getFeaturePsrcAssignmentStyle compute correct colors');
 }
 
+// 5b. Test color scale max source (highest PSRi vs highest PSRc) and gradient placement
+{
+    // PSRi lives at index 6, PSRc at index 7.
+    const rows = [
+        ['', 'Alpha', '', '', '', '', '80', '20', '', 'cal-a'],
+        ['', 'Bravo', '', '', '', '', '40', '40', '', 'cal-b']
+    ];
+
+    const lookup = mapSegmentUtils.buildSegmentPsrcLookup(rows);
+    assert.strictEqual(lookup.maxPsrc, 40, 'maxPsrc should be highest PSRc (40)');
+    assert.strictEqual(lookup.maxPsri, 80, 'maxPsri should be highest PSRi (80)');
+    assert.strictEqual(lookup.maxValue, 40, 'maxValue stays the highest PSRc for backward compatibility');
+
+    const gradient = { lowColor: '#000000', midColor: '#808080', highColor: '#ffffff' };
+    const featureAlpha = { attributes: { id: 'cal-a', name: 'Alpha', class: 'Assignment' } };
+    const featureBravo = { attributes: { id: 'cal-b', name: 'Bravo', class: 'Assignment' } };
+
+    // Scale to highest PSRc (40): Alpha PSRc 20 -> ratio 0.5 (mid), Bravo PSRc 40 -> ratio 1.0 (high).
+    const alphaPsrc = mapSegmentUtils.getFeaturePsrcColor(featureAlpha, lookup, { ...gradient, usePsriMax: false });
+    const bravoPsrc = mapSegmentUtils.getFeaturePsrcColor(featureBravo, lookup, { ...gradient, usePsriMax: false });
+    assert.strictEqual(alphaPsrc.ratio, 0.5, 'PSRc scale: Alpha ratio is 0.5');
+    assert.strictEqual(alphaPsrc.css, '#808080', 'PSRc scale: Alpha renders the mid color');
+    assert.strictEqual(bravoPsrc.ratio, 1, 'PSRc scale: Bravo ratio is 1.0');
+    assert.strictEqual(bravoPsrc.css, '#ffffff', 'PSRc scale: Bravo renders the high color');
+    assert.notStrictEqual(alphaPsrc.css, bravoPsrc.css, 'Different PSRc must produce different colors, not all-max');
+
+    // Scale to highest PSRi (80): Alpha PSRc 20 -> ratio 0.25, Bravo PSRc 40 -> ratio 0.5 (mid).
+    const alphaPsri = mapSegmentUtils.getFeaturePsrcColor(featureAlpha, lookup, { ...gradient, usePsriMax: true });
+    const bravoPsri = mapSegmentUtils.getFeaturePsrcColor(featureBravo, lookup, { ...gradient, usePsriMax: true });
+    assert.strictEqual(alphaPsri.ratio, 0.25, 'PSRi scale: Alpha ratio is 0.25');
+    assert.strictEqual(alphaPsri.css, '#404040', 'PSRi scale: Alpha interpolates low->mid at 0.25');
+    assert.strictEqual(bravoPsri.ratio, 0.5, 'PSRi scale: Bravo ratio is 0.5');
+    assert.strictEqual(bravoPsri.css, '#808080', 'PSRi scale: Bravo renders the mid color');
+
+    assert.deepStrictEqual(bravoPsrc.rgb, [255, 255, 255], 'Color object exposes an rgb array for the map overlay');
+    console.log('  ok - color scale honors highest-PSRi vs highest-PSRc setting and spreads gradient by PSRc');
+}
+
 // 6. Test CalTopo assignment overlay update simulation (with fallback)
 {
     const simulatedCalls = [];

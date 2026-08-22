@@ -69,23 +69,24 @@ assert.strictEqual(
     'Non active-search stroke opacity should equal the overlay base (1)'
 );
 
-// Active-search segments must use the configured opacity, NOT the previous default of 0.5.
+// Active-search segments RESET to the configured opacity absolutely, ignoring the
+// segment's base opacity.
 assert.strictEqual(
     sandbox.resolveDisplayedSegmentOpacity(true, settings, 0.42),
     0.3,
-    'Active-search fill opacity must use the configured active-search opacity'
+    'Active-search fill opacity must be the absolute configured value (0.3)'
 );
 assert.strictEqual(
     sandbox.resolveDisplayedSegmentOpacity(true, settings, 1),
     0.3,
-    'Active-search stroke opacity must use the configured active-search opacity'
+    'Active-search stroke opacity must be the absolute configured value (0.3)'
 );
 
-// A raw bundle (not yet normalized) must also resolve correctly.
+// A raw bundle (not yet normalized) must also resolve to the absolute configured value.
 assert.strictEqual(
     sandbox.resolveDisplayedSegmentOpacity(true, { segmentActiveSearchOpacityPercent: 80 }, 0.42),
     0.8,
-    'Raw bundle active-search opacity should be normalized and honored'
+    'Raw bundle active-search opacity should be normalized and used as an absolute value'
 );
 
 console.log('  ok - overlay opacity honors gradient-scale + active-search opacity settings');

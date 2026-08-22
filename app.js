@@ -184,7 +184,13 @@ function resolveDisplayedSegmentOpacity(isActiveSearch, settings, baseOpacity = 
     const normalizedSettings = (settings && typeof settings.activeSearchOpacity === 'number')
         ? settings
         : getSegmentDisplaySettings(settings);
-    return normalizedSettings.activeSearchOpacity;
+    // The active-search opacity setting is an ABSOLUTE reset: actively-searched
+    // segments are drawn at exactly the configured opacity, regardless of the
+    // segment's existing/base opacity.
+    const activeSearchOpacity = Number.isFinite(normalizedSettings.activeSearchOpacity)
+        ? normalizedSettings.activeSearchOpacity
+        : 0.5;
+    return Math.min(1, Math.max(0, activeSearchOpacity));
 }
 
 function buildSegmentNameSet(rows) {
