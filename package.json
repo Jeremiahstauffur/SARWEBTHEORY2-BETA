@@ -5,7 +5,7 @@
   "main": "sync-server.js",
   "scripts": {
     "start": "node sync-server.js",
-    "test": "node test_structured_tables.js && node test_sync_bucket_decoupling.js && node test_row_level_sync.js && node test_row_sync_endpoint.js"
+    "test": "node test_structured_tables.js && node test_sync_bucket_decoupling.js && node test_row_level_sync.js && node test_row_sync_endpoint.js && node test_user_isolation.js && node test_case_delete.js"
   },
   "dependencies": {
     "axios": "^1.14.0",

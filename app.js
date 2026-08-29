@@ -737,6 +737,18 @@ function removeStorageItem(key) {
 
 const SERVER_SETTINGS_CACHE_KEY = 'sar-server-settings-cache-v1';
 
+// URL-safe suffix that namespaces every synced bucket to the logged-in user.
+// Data is scoped per login (not per shared PIN), so two accounts that share a
+// PIN never land in the same bucket. encodeURIComponent keeps the suffix valid
+// inside an API path even when the username contains spaces or other reserved
+// characters. This is the single place the suffix is built, so getSyncBucket(),
+// caseNumberToBucket() and bucketToCaseNumber() stay in lockstep.
+function getUserBucketSuffix() {
+    const creds = getUserCredentials();
+    if (!creds || !creds.name) return '';
+    return encodeURIComponent(creds.name);
+}
+
 function getSyncBucket() {
     let bucket = _serverSettings && _serverSettings[SYNC_BUCKET_STORAGE_KEY] ? _serverSettings[SYNC_BUCKET_STORAGE_KEY] : '';
     if (!bucket) {
@@ -750,9 +762,9 @@ function getSyncBucket() {
             }
         } catch (e) {}
     }
-    const creds = getUserCredentials();
-    if (bucket && creds && creds.password) {
-        return `${bucket}_${creds.password}`;
+    const suffix = getUserBucketSuffix();
+    if (bucket && suffix) {
+        return `${bucket}_${suffix}`;
     }
     return bucket;
 }
@@ -767,19 +779,51 @@ function setSyncBucket(bucket) {
 }
 
 // Convert an internal sync-bucket id back to the clean CASE # to show the user.
-// getSyncBucket() appends "_<pin>" so each team's data is namespaced in the
-// shared store; that suffix is an internal detail and must never be displayed
+// getSyncBucket() appends "_<username>" so each login's data is namespaced in
+// the shared store; that suffix is an internal detail and must never be shown
 // or fed back into setSyncBucket() (doing so would double the suffix). The list
 // returned by /api/auth/history stores those suffixed ids, so anything shown to
 // the user or used for duplicate detection must pass through here first.
+//
+// The server persists the URL-decoded bucket, so a username that was
+// percent-encoded on the way out (e.g. one containing spaces) comes back
+// decoded; strip whichever form is present so the round-trip is exact.
 function bucketToCaseNumber(bucket) {
     if (!bucket) return '';
     const creds = getUserCredentials();
-    const suffix = creds && creds.password ? `_${creds.password}` : '';
-    if (suffix && bucket.endsWith(suffix)) {
-        return bucket.slice(0, -suffix.length);
+    if (!creds || !creds.name) return bucket;
+    const encodedSuffix = `_${encodeURIComponent(creds.name)}`;
+    const rawSuffix = `_${creds.name}`;
+    if (bucket.endsWith(encodedSuffix)) {
+        return bucket.slice(0, -encodedSuffix.length);
+    }
+    if (bucket.endsWith(rawSuffix)) {
+        return bucket.slice(0, -rawSuffix.length);
     }
     return bucket;
+}
+
+// Inverse of bucketToCaseNumber(): build the internal, per-login bucket id for a
+// clean CASE #. Load/Delete callers only know the case number, so they use this
+// to reach the same bucket getSyncBucket() would produce for the active case.
+function caseNumberToBucket(caseNumber) {
+    if (!caseNumber) return '';
+    const suffix = getUserBucketSuffix();
+    return suffix ? `${caseNumber}_${suffix}` : caseNumber;
+}
+
+// True when a bucket id returned by /api/auth/history belongs to the current
+// login. Pre-existing "_<pin>" buckets from before per-user namespacing stay in
+// the database but must not be surfaced, so history-derived lists filter on this
+// ("start fresh", no migration). Matches either the encoded suffix or the
+// decoded form the server stores.
+function bucketBelongsToCurrentUser(bucket) {
+    if (!bucket) return false;
+    const creds = getUserCredentials();
+    if (!creds || !creds.name) return false;
+    const encodedSuffix = `_${encodeURIComponent(creds.name)}`;
+    const rawSuffix = `_${creds.name}`;
+    return bucket.endsWith(encodedSuffix) || bucket.endsWith(rawSuffix);
 }
 
 function setCookie(name, value, days = 365) {
@@ -2308,6 +2352,73 @@ function deleteFileFromList(fileName) {
     delete files[fileName];
     setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
     // No longer push to server immediately to prevent race conditions during sync.
+}
+
+// Permanently delete a whole case everywhere it lives. The server side (store
+// rows, case history, and structured tables) is removed via DELETE
+// /api/v1/:bucket, then the local cache is dropped. This keys off the CASE #
+// rather than a loadable bundle, so a corrupt or never-cached case can still be
+// deleted and, because the server copy is gone, it will not resync back.
+//
+// If the deleted case is the one currently open, the active bundle and sync
+// bucket are reset so the app stops showing (and re-pushing) a case that no
+// longer exists. Local removal only happens after the server confirms the
+// delete, so an offline/refused delete never leaves a half-deleted case.
+// Returns true when the case was removed, false when the server refused it
+// (e.g. Super-Admin protection) or could not be reached.
+async function deleteCaseEverywhere(caseNumber) {
+    const clean = String(caseNumber || '').replace(/\.json$/i, '');
+    if (!clean) return false;
+
+    const serverUrl = getSyncServerUrl();
+    if (serverUrl) {
+        // Build and interpolate the bucket exactly like syncWithServer() does
+        // (getSyncBucket()-style) so the DELETE targets the same bucket the data
+        // was written under.
+        const bucket = caseNumberToBucket(clean);
+        try {
+            const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}`, {
+                method: 'DELETE',
+                headers: getAuthHeaders()
+            });
+            if (!resp.ok) {
+                // Surface the server's reason (e.g. Super-Admin protection) and
+                // leave the case in place so nothing is half-deleted.
+                let message = 'Failed to delete this case on the server. Please try again.';
+                try {
+                    const body = await resp.json();
+                    if (body && body.message) message = body.message;
+                } catch (e) {}
+                alert(message);
+                return false;
+            }
+        } catch (e) {
+            alert('Could not reach the server to delete this case. Please try again when online.');
+            return false;
+        }
+    }
+
+    // Local cleanup: drop any cached copy (keyed by the CASE # or "<CASE>.json").
+    const files = getSavedFiles();
+    Object.keys(files).forEach((key) => {
+        if (String(key).replace(/\.json$/i, '') === clean) {
+            deleteFileFromList(key);
+        }
+    });
+
+    // If the deleted case is the one currently open, reset the active bundle and
+    // sync bucket. Await the setSyncBucket('') write so a caller that reloads
+    // cannot abort it, and refresh the file-name display for the current view.
+    try {
+        const active = loadBundle();
+        if (active && String(active.fileName || '').replace(/\.json$/i, '') === clean) {
+            removeStorageItem(BUNDLE_STORAGE_KEY);
+            await setSyncBucket('');
+            if (typeof updateFileNameDisplay === 'function') updateFileNameDisplay();
+        }
+    } catch (e) {}
+
+    return true;
 }
 
 function confirmDeleteRow(rowElement, onConfirm) {
@@ -7653,6 +7764,9 @@ async function buildSavedFilesTable() {
         history = [];
     }
     (history || []).forEach(item => {
+        // Fresh start: skip legacy "_<pin>" buckets from before per-user
+        // namespacing so another login's (or the old shared) cases never show.
+        if (!bucketBelongsToCurrentUser(item.bucket)) return;
         const caseNumber = normalizeCase(bucketToCaseNumber(item.bucket));
         if (!caseNumber) return;
         addCase(caseNumber);
@@ -7777,14 +7891,15 @@ async function buildSavedFilesTable() {
                 alert('You do not have permission to delete files. Contact Super Admin or a File Manager.');
                 return;
             }
-            if (!hasLocal) {
-                alert('This case is not stored locally; open it (Load) before deleting.');
-                return;
-            }
-            const localKey = info.localKey;
             const b = loadBundle();
-            const doDelete = () => {
-                deleteFileFromList(localKey);
+            // Permanently remove the case everywhere (server + local). No local
+            // copy is required, so a corrupt or never-cached case can still be
+            // deleted; deleteCaseEverywhere() also resets the active bundle/sync
+            // bucket when the deleted case is the one currently open. Super-Admin
+            // protection and any server error are surfaced from inside the helper.
+            const doDelete = async () => {
+                const ok = await deleteCaseEverywhere(caseNumber);
+                if (!ok) return;
                 buildSavedFilesTable();
             };
             if (b.deleteMode) {

@@ -40,13 +40,15 @@ const query = (rawSql, params, cb) => {
     if (/^REPLACE INTO user_buckets/.test(sql)) {
         return cb(null, {affectedRows: 1});
     }
-    if (/^SELECT value, userPin FROM store WHERE bucket = \? AND `key` = \?$/.test(sql)) {
+    if (/^SELECT value, userPin FROM store WHERE bucket = \? AND `key` = \? AND userName = \?$/.test(sql)) {
         const row = store.get(`${p[0]}\u0000${p[1]}`);
-        return cb(null, row ? [{value: row.value, userPin: row.userPin}] : []);
+        // Reads are now scoped to the authenticated login, so a row only
+        // matches when its userName equals the caller's.
+        return cb(null, (row && row.userName === p[2]) ? [{value: row.value, userPin: row.userPin}] : []);
     }
-    if (/^SELECT userPin, updatedAt FROM store WHERE bucket = \? AND `key` = \?$/.test(sql)) {
+    if (/^SELECT userPin, updatedAt FROM store WHERE bucket = \? AND `key` = \? AND userName = \?$/.test(sql)) {
         const row = store.get(`${p[0]}\u0000${p[1]}`);
-        return cb(null, row ? [{userPin: row.userPin, updatedAt: row.updatedAt}] : []);
+        return cb(null, (row && row.userName === p[2]) ? [{userPin: row.userPin, updatedAt: row.updatedAt}] : []);
     }
     if (/^REPLACE INTO store \(bucket, `key`, value, userName, userPin, updatedAt\)/.test(sql)) {
         store.set(`${p[0]}\u0000${p[1]}`, {value: p[2], userName: p[3], userPin: p[4], updatedAt: p[5]});

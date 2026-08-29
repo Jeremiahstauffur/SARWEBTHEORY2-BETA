@@ -920,10 +920,10 @@ const withBucketLock = (bucket, task) => {
     return current;
 };
 
-const readStoredBundle = async (bucket) => {
+const readStoredBundle = async (bucket, userName) => {
     const row = await getAsync(
-        "SELECT value, userPin FROM store WHERE bucket = ? AND `key` = ?",
-        [bucket, STORE_BUNDLE_KEY]
+        "SELECT value, userPin FROM store WHERE bucket = ? AND `key` = ? AND userName = ?",
+        [bucket, STORE_BUNDLE_KEY, userName]
     );
     if (!row) { return null; }
     const parsed = safeJsonParse(row.value);
@@ -953,7 +953,7 @@ app.post('/api/v1/:bucket/rows', authMiddleware, async (req, res) => {
 
     try {
         const result = await withBucketLock(bucket, async () => {
-            const stored = await readStoredBundle(bucket);
+            const stored = await readStoredBundle(bucket, userName);
             // Nothing to merge into yet: ask the device to seed the search file
             // once with a full upload, after which it sends rows only.
             if (!stored) {
@@ -1003,7 +1003,7 @@ app.post('/api/v1/:bucket/rows', authMiddleware, async (req, res) => {
 app.get('/api/v1/:bucket/page/:page', authMiddleware, async (req, res) => {
     const {bucket, page} = req.params;
     try {
-        const stored = await readStoredBundle(bucket);
+        const stored = await readStoredBundle(bucket, req.user.username);
         if (!stored) {
             return res.json({page, found: false, data: null, lastModified: null});
         }
@@ -1092,6 +1092,69 @@ app.delete('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
     });
 });
 
+// Strip the per-login "_<username>" suffix a bucket id carries so the clean
+// CASE # can be matched against structured-table rows (whose search_case is the
+// CASE #, never the internal bucket id). Express URL-decodes the :bucket param,
+// so the decoded "_<username>" form is the common case; the percent-encoded
+// form is a fallback for any path that reaches here still encoded. Mirrors the
+// client's bucketToCaseNumber() so both ends agree on the round-trip.
+const caseNumberFromBucket = (bucket, userName) => {
+    if (!bucket) { return ''; }
+    if (!userName) { return bucket; }
+    const encodedSuffix = `_${encodeURIComponent(userName)}`;
+    const rawSuffix = `_${userName}`;
+    if (bucket.endsWith(encodedSuffix)) { return bucket.slice(0, -encodedSuffix.length); }
+    if (bucket.endsWith(rawSuffix)) { return bucket.slice(0, -rawSuffix.length); }
+    return bucket;
+};
+
+// Permanently delete an entire case (search file) for the authenticated login.
+// Unlike DELETE /:bucket/:key (which removes a single store key), this wipes
+// every trace of the case for this user so it cannot resync back: all store
+// rows for (bucket, userName), the user_buckets history row (username, bucket),
+// and every structured-table row for (username, search_case = CASE #). Saved
+// Cases calls it so a corrupt or never-cached case can still be removed.
+app.delete('/api/v1/:bucket', authMiddleware, async (req, res) => {
+    const {bucket} = req.params;
+    const userName = req.user.username;
+    const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
+    const isSuperAdmin = userPin === '1976';
+    const searchCase = caseNumberFromBucket(bucket, userName);
+
+    try {
+        // Super-Admin protection: a regular user cannot delete a case whose
+        // stored bundle was written by the Super-Admin (userPin '1976'). Mirrors
+        // the guard on DELETE /:bucket/:key.
+        const guard = await getAsync(
+            "SELECT userPin FROM store WHERE bucket = ? AND userName = ? AND userPin = ? LIMIT 1",
+            [bucket, userName, '1976']
+        );
+        if (guard && !isSuperAdmin) {
+            return res.status(403).json({
+                error: 'Conflict',
+                message: 'Cannot delete Super-Admin created files.'
+            });
+        }
+
+        // 1) Every store key for this case owned by the caller.
+        await runAsync("DELETE FROM store WHERE bucket = ? AND userName = ?", [bucket, userName]);
+        // 2) The case-history row so it stops appearing in Saved Cases.
+        await runAsync("DELETE FROM user_buckets WHERE username = ? AND bucket = ?", [userName, bucket]);
+        // 3) Structured rows for the specific CASE # (never the shared 'bundle'
+        //    store key, which is common to every case).
+        if (searchCase) {
+            for (const table of STRUCTURED_TABLES) {
+                await runAsync(`DELETE FROM \`${table}\` WHERE username = ? AND search_case = ?`, [userName, searchCase]);
+            }
+        }
+
+        res.json({success: true});
+    } catch (err) {
+        console.error('[SYNC] case delete failed:', err.message);
+        res.status(500).json({error: 'Failed to delete case'});
+    }
+});
+
 app.put('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
     const {bucket, key} = req.params;
     const userName = req.user.username || 'Unknown';
@@ -1119,7 +1182,7 @@ app.put('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
         }
     }
 
-    db.get("SELECT userPin, updatedAt FROM store WHERE bucket = ? AND `key` = ?", [bucket, key], (err, row) => {
+    db.get("SELECT userPin, updatedAt FROM store WHERE bucket = ? AND `key` = ? AND userName = ?", [bucket, key, userName], (err, row) => {
         if (err) return res.status(500).json({error: 'Failed to query database'});
 
         if (row) {

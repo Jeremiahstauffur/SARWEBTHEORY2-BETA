@@ -296,14 +296,33 @@ if ($method === 'GET') {
     echo json_encode(["success" => true]);
 } elseif ($method === 'DELETE') {
     trackBucketAccess($db, $bucket);
-    if (!$key) {
-        http_response_code(400);
-        echo json_encode(["error" => "Key required for DELETE"]);
-        exit;
-    }
-    
+
     $userPin = isset($_SERVER['HTTP_X_USER_PIN']) ? $_SERVER['HTTP_X_USER_PIN'] : (isset($_SERVER['HTTP_X_USER_PASSWORD']) ? $_SERVER['HTTP_X_USER_PASSWORD'] : '');
     $isSuperAdmin = ($userPin === '1976');
+
+    if (!$key) {
+        // Whole-case delete (mirrors the Node server's DELETE /api/v1/:bucket):
+        // remove every store row for (bucket, userName) and the bucket_history
+        // row (username, bucket) so a corrupt or never-cached case can be deleted
+        // and will not resync back. This legacy backend has no structured tables,
+        // so there is nothing else to clear.
+        $stmt = $db->prepare("SELECT userPin FROM store WHERE bucket = ? AND userName = ? AND userPin = ? LIMIT 1");
+        $stmt->execute([$bucket, $username, '1976']);
+        $guard = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($guard && !$isSuperAdmin) {
+            http_response_code(403);
+            echo json_encode(["error" => "Conflict", "message" => "Cannot delete Super-Admin created files."]);
+            exit;
+        }
+
+        $stmt = $db->prepare("DELETE FROM store WHERE bucket = ? AND userName = ?");
+        $stmt->execute([$bucket, $username]);
+        $stmt = $db->prepare("DELETE FROM bucket_history WHERE username = ? AND bucket = ?");
+        $stmt->execute([$username, $bucket]);
+
+        echo json_encode(["success" => true]);
+        exit;
+    }
     
     // Only consider the caller's own file: a login can never delete (or even
     // detect) a file created by another login.
