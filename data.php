@@ -207,8 +207,10 @@ function trackBucketAccess($db, $bucket) {
 if ($method === 'GET') {
     trackBucketAccess($db, $bucket);
     if ($key === 'latest') {
-        $stmt = $db->prepare("SELECT value FROM store WHERE bucket = ? ORDER BY updatedAt DESC LIMIT 1");
-        $stmt->execute([$bucket]);
+        // Scoped to the authenticated login: only the caller's own files are
+        // ever returned, so one login never sees another login's data.
+        $stmt = $db->prepare("SELECT value FROM store WHERE bucket = ? AND userName = ? ORDER BY updatedAt DESC LIMIT 1");
+        $stmt->execute([$bucket, $username]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if ($row) {
             echo $row['value'];
@@ -217,8 +219,8 @@ if ($method === 'GET') {
             echo json_encode(["error" => "No data found"]);
         }
     } elseif ($key === 'all-files') {
-        $stmt = $db->prepare("SELECT `key`, updatedAt FROM store WHERE bucket = ?");
-        $stmt->execute([$bucket]);
+        $stmt = $db->prepare("SELECT `key`, updatedAt FROM store WHERE bucket = ? AND userName = ?");
+        $stmt->execute([$bucket, $username]);
         $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
         $files = [];
         foreach ($rows as $row) {
@@ -226,8 +228,8 @@ if ($method === 'GET') {
         }
         echo json_encode($files);
     } elseif ($key) {
-        $stmt = $db->prepare("SELECT value FROM store WHERE bucket = ? AND `key` = ?");
-        $stmt->execute([$bucket, $key]);
+        $stmt = $db->prepare("SELECT value FROM store WHERE bucket = ? AND `key` = ? AND userName = ?");
+        $stmt->execute([$bucket, $key, $username]);
         $row = $stmt->fetch(PDO::FETCH_ASSOC);
         if ($row) {
             echo $row['value'];
@@ -236,8 +238,8 @@ if ($method === 'GET') {
             echo json_encode(["error" => "Not found"]);
         }
     } else {
-        $stmt = $db->prepare("SELECT `key` FROM store WHERE bucket = ?");
-        $stmt->execute([$bucket]);
+        $stmt = $db->prepare("SELECT `key` FROM store WHERE bucket = ? AND userName = ?");
+        $stmt->execute([$bucket, $username]);
         echo json_encode($stmt->fetchAll(PDO::FETCH_COLUMN));
     }
 } elseif ($method === 'PUT') {
@@ -303,8 +305,10 @@ if ($method === 'GET') {
     $userPin = isset($_SERVER['HTTP_X_USER_PIN']) ? $_SERVER['HTTP_X_USER_PIN'] : (isset($_SERVER['HTTP_X_USER_PASSWORD']) ? $_SERVER['HTTP_X_USER_PASSWORD'] : '');
     $isSuperAdmin = ($userPin === '1976');
     
-    $stmt = $db->prepare("SELECT userPin FROM store WHERE bucket = ? AND `key` = ?");
-    $stmt->execute([$bucket, $key]);
+    // Only consider the caller's own file: a login can never delete (or even
+    // detect) a file created by another login.
+    $stmt = $db->prepare("SELECT userPin FROM store WHERE bucket = ? AND `key` = ? AND userName = ?");
+    $stmt->execute([$bucket, $key, $username]);
     $row = $stmt->fetch(PDO::FETCH_ASSOC);
     
     if ($row && $row['userPin'] === '1976' && !$isSuperAdmin) {
@@ -313,8 +317,8 @@ if ($method === 'GET') {
         exit;
     }
     
-    $stmt = $db->prepare("DELETE FROM store WHERE bucket = ? AND `key` = ?");
-    $stmt->execute([$bucket, $key]);
+    $stmt = $db->prepare("DELETE FROM store WHERE bucket = ? AND `key` = ? AND userName = ?");
+    $stmt->execute([$bucket, $key, $username]);
     
     echo json_encode(["success" => true]);
 }

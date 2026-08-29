@@ -1020,10 +1020,13 @@ app.get('/api/v1/:bucket/page/:page', authMiddleware, async (req, res) => {
 });
 
 // Get all files for a bucket
+// Scoped to the authenticated login: a user only ever sees the files they
+// created (store.userName), so one login never sees another login's data even
+// when they share a bucket (e.g. the same PIN).
 app.get('/api/v1/:bucket/all-files', authMiddleware, (req, res) => {
     const {bucket} = req.params;
     trackBucketAccess(req.user.username, bucket);
-    db.all("SELECT `key`, updatedAt FROM store WHERE bucket = ?", [bucket], (err, rows) => {
+    db.all("SELECT `key`, updatedAt FROM store WHERE bucket = ? AND userName = ?", [bucket, req.user.username], (err, rows) => {
         if (err) return res.status(500).json({error: 'Failed to query database'});
         const files = {};
         rows.forEach(row => {
@@ -1036,7 +1039,7 @@ app.get('/api/v1/:bucket/all-files', authMiddleware, (req, res) => {
 // Get latest bundle for a bucket
 app.get('/api/v1/:bucket/latest', authMiddleware, (req, res) => {
     const {bucket} = req.params;
-    db.get("SELECT value FROM store WHERE bucket = ? ORDER BY updatedAt DESC LIMIT 1", [bucket], (err, row) => {
+    db.get("SELECT value FROM store WHERE bucket = ? AND userName = ? ORDER BY updatedAt DESC LIMIT 1", [bucket, req.user.username], (err, row) => {
         if (err) return res.status(500).json({error: 'Failed to query database'});
         if (!row) return res.status(404).json({error: 'No data found'});
         try {
@@ -1050,7 +1053,7 @@ app.get('/api/v1/:bucket/latest', authMiddleware, (req, res) => {
 // Get a specific key
 app.get('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
     const {bucket, key} = req.params;
-    db.get("SELECT value FROM store WHERE bucket = ? AND `key` = ?", [bucket, key], (err, row) => {
+    db.get("SELECT value FROM store WHERE bucket = ? AND `key` = ? AND userName = ?", [bucket, key, req.user.username], (err, row) => {
         if (err) return res.status(500).json({error: 'Failed to query database'});
         if (!row) return res.status(404).json({error: 'Not found'});
         try {
@@ -1065,10 +1068,13 @@ app.get('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
 // Delete a value
 app.delete('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
     const {bucket, key} = req.params;
+    const userName = req.user.username;
     const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
     const isSuperAdmin = userPin === '1976';
 
-    db.get("SELECT userPin FROM store WHERE bucket = ? AND `key` = ?", [bucket, key], (err, row) => {
+    // Only consider the caller's own file: a login can never delete (or even
+    // detect) a file created by another login.
+    db.get("SELECT userPin FROM store WHERE bucket = ? AND `key` = ? AND userName = ?", [bucket, key, userName], (err, row) => {
         if (err) return res.status(500).json({error: 'Failed to query db'});
         if (!row) return res.json({success: true}); // already gone
         
@@ -1079,7 +1085,7 @@ app.delete('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
             });
         }
         
-        db.run("DELETE FROM store WHERE bucket = ? AND `key` = ?", [bucket, key], (err) => {
+        db.run("DELETE FROM store WHERE bucket = ? AND `key` = ? AND userName = ?", [bucket, key, userName], (err) => {
             if (err) return res.status(500).json({error: 'Failed to delete data'});
             res.json({success: true});
         });
