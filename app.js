@@ -2604,6 +2604,14 @@ function updateFileNameDisplay() {
   document.querySelectorAll('[data-file-name]').forEach((el) => {
     el.textContent = bundle.fileName;
   });
+
+  const creds = getUserCredentials();
+  const userName = creds && creds.name ? creds.name : '';
+  document.querySelectorAll('[data-username]').forEach((el) => {
+    el.textContent = userName;
+    const badge = el.closest('[data-user-badge]');
+    if (badge) badge.style.display = userName ? '' : 'none';
+  });
 }
 
 function downloadTextFile(filename, content, mimeType = 'application/json') {
