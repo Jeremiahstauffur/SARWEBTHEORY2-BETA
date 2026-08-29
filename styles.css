@@ -1226,7 +1226,7 @@ footer {
 
 .notif-toast {
   position: fixed;
-  top: 20px !important;
+  top: 20px;
   right: 20px !important;
   left: auto !important;
   bottom: auto !important;
@@ -1239,6 +1239,7 @@ footer {
   cursor: pointer;
   max-width: 300px;
   animation: notifFadeIn 0.3s ease-out forwards;
+  transition: top 0.35s ease;
   display: flex;
   align-items: center;
   gap: 12px;

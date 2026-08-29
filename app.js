@@ -4050,6 +4050,22 @@ function buildPersonnelAllMembersTable() {
   const teamOptions = ['Alpha', 'Bravo', 'Charlie', 'Delta', 'Echo', 'Foxtrot', 'Golf', 'Hotel', 'India', 'Juliett', 'Kilo', 'Lima', 'Mike', 'November', 'Oscar', 'Papa', 'Quebec', 'Romeo', 'Sierra', 'Tango', 'Uniform', 'Victor', 'Whiskey', 'X-ray', 'Yankee', 'Zulu', 'Command', 'Off Duty', 'Base Support'];
   
   let filteredData = [...data];
+
+  // Collapse duplicate members: a member can have several incident timecard
+  // "sets" stored as separate personnel rows sharing the same name (see
+  // getMemberIncidentStatus). The All Members table must show each member only
+  // once, so keep only the first row for each non-empty name. Rows with an empty
+  // name (e.g. a freshly added blank row) are always kept so they stay editable.
+  const seenMemberNames = new Set();
+  filteredData = filteredData.filter(row => {
+    const name = row && row[0] ? String(row[0]).trim() : '';
+    if (!name) return true;
+    const key = name.toLowerCase();
+    if (seenMemberNames.has(key)) return false;
+    seenMemberNames.add(key);
+    return true;
+  });
+
   filteredData.sort((a, b) => {
     if (sortByTeam) {
       const teamA = (a[1] || '').toLowerCase();
@@ -11145,6 +11161,11 @@ function getLogSweepsDue() {
   searchLog.forEach(row => {
     const taskNum = row[0];
     const numSweeps = row[9];
+    // Skip placeholder/empty rows that don't represent an actual task assignment.
+    // A real search log entry always has a task number (e.g. "#3"); a blank
+    // placeholder row has an empty task number even though its sweep count is
+    // also empty, and must not flag the Search Log nav link as due.
+    if (!taskNum || taskNum.toString().trim() === '') return;
     if ((!numSweeps || numSweeps.toString().trim() === '') && !isTaskUnfinished(taskNum)) {
       due.push({
         taskNum: taskNum,
