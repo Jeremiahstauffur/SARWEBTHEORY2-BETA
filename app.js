@@ -3738,6 +3738,36 @@ function buildSegmentsTable() {
 
 let currentPersonnelSubpage = 'activity';
 
+// Derive the status to show in the All Members table for a member from their
+// incident timecards instead of the raw stored status field. A member can have
+// several incident timecard "sets" (each stored as its own personnel row with the
+// same name) with times in columns 9=Enroute, 10=On Scene, 11=Returning,
+// 12=Arrived Home. A set is considered "finished" once Arrived Home is filled.
+// Per the requirement, the status shown is the most recently reached status of the
+// member's OLDEST unfinished set (e.g. if a new card is started while the old one
+// is still open, the old card drives the displayed status). Returns null when the
+// member has no unfinished set, so callers can fall back to the raw status.
+function getMemberIncidentStatus(memberName, allData) {
+  if (!memberName || !Array.isArray(allData)) return null;
+
+  const statusForSet = (row) => {
+    if (row[11]) return 'Returning Home';
+    if (row[10]) return 'On-Scene';
+    if (row[9]) return 'Enroute';
+    return null;
+  };
+
+  const sets = allData.filter(r => r && r[0] === memberName);
+  for (const row of sets) {
+    const hasActivity = row[9] || row[10] || row[11] || row[12];
+    // Oldest unfinished set: has activity but has not Arrived Home yet.
+    if (hasActivity && !row[12]) {
+      return statusForSet(row);
+    }
+  }
+  return null;
+}
+
 function buildPersonnelTable() {
   const btnAll = document.getElementById('btn-all-members');
   const btnAct = document.getElementById('btn-activity');
@@ -4168,7 +4198,13 @@ function buildPersonnelAllMembersTable() {
         cellContainer.appendChild(selectLead);
       } else {
         if (c === 6) { // Status column
-          const statusLabel = data[originalRowIndex][c] === 'true' ? 'On-Scene' : (data[originalRowIndex][c] || 'Off Duty');
+          // The displayed status must reflect the incident timecards rather than the
+          // raw stored status field: show the most recently updated status within the
+          // member's OLDEST unfinished incident timecard set (see getMemberIncidentStatus).
+          const rawStatus = data[originalRowIndex][c];
+          const baseLabel = rawStatus === 'true' ? 'On-Scene' : (rawStatus === 'false' ? 'Off Duty' : (rawStatus || 'Off Duty'));
+          const derivedStatus = getMemberIncidentStatus(data[originalRowIndex][0], data);
+          const statusLabel = derivedStatus || baseLabel;
           const statusBtn = document.createElement('button');
           statusBtn.className = 'mini-pill status-pill-btn';
           statusBtn.style.width = '100%';
@@ -7063,8 +7099,10 @@ function buildSearchLogTable() {
       
       cell.spellcheck = false;
 
-      // Highlight Team (7) and Num of Sweeps (9) when blank
-      if ([7, 9].includes(c) && cellValue === '') {
+      // Highlight Team (7) and Num of Sweeps (9) when blank.
+      // Skip the highlight entirely for rows that have no Task # yet
+      // (e.g. a freshly opened case with no search log record).
+      if ([7, 9].includes(c) && cellValue === '' && taskNum) {
         cell.classList.add('blank-highlight');
       }
 
@@ -7078,7 +7116,7 @@ function buildSearchLogTable() {
 
       cell.addEventListener('input', () => {
         if ([7, 9].includes(c)) {
-          if (cell.textContent.trim() === '') {
+          if (cell.textContent.trim() === '' && taskNum) {
             cell.classList.add('blank-highlight');
           } else {
             cell.classList.remove('blank-highlight');
