@@ -2095,6 +2095,7 @@ function sanitizeBundle(bundle) {
   const background = typeof bundle.background === 'string' && bundle.background.trim()
     ? bundle.background.trim()
     : 'assets/us-night.jpg';
+  const logo = typeof bundle.logo === 'string' ? bundle.logo.trim() : '';
 
   const activityLog = Array.isArray(bundle.activityLog) ? bundle.activityLog : [];
   const currentAssignments = (bundle.currentAssignments && typeof bundle.currentAssignments === 'object')
@@ -2260,6 +2261,7 @@ function sanitizeBundle(bundle) {
     deleteMode, 
     theme, 
     background, 
+    logo, 
     activityLog, 
     currentAssignments, 
     teamStatuses, 
