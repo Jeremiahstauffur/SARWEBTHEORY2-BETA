@@ -5,6 +5,20 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Settings | Search & Rescue Theory Software</title>
+  <script>
+    (function () {
+      try {
+        var t = localStorage.getItem('sar-theme-cache');
+        if (t === 'light') document.documentElement.classList.add('light-mode');
+        var a = localStorage.getItem('sar-accent-cache');
+        if (a) {
+          var p = a.split('|');
+          document.documentElement.style.setProperty('--accent', p[0]);
+          document.documentElement.style.setProperty('--accent-rgb', p[1]);
+        }
+      } catch (e) {}
+    })();
+  </script>
   <link rel="stylesheet" href="styles.css?v=20260829" />
 </head>
 <body data-page="settings">

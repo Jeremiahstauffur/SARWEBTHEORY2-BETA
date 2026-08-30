@@ -15,7 +15,7 @@
   --popup-bg: #1a1a1a;
 }
 
-body.light-mode {
+html.light-mode {
   --glass: rgba(255, 255, 255, 0.82);
   --glass-strong: rgba(255, 255, 255, 0.92);
   --line: rgba(26, 34, 48, 0.14);

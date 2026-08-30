@@ -5363,7 +5363,7 @@ function showMissingStepsPopup(teamName, targetStatus, onComplete) {
   
   const stepsToShow = [...missingSteps, currentStep];
   
-  const popup = createPopup('Missing Steps: ' + teamName);
+  const popup = createPopup('Update Timestamps: ' + teamName);
   const content = popup.querySelector('.popup-content');
   const btnContainer = popup.querySelector('.popup-buttons');
   
@@ -8454,10 +8454,14 @@ function applyTheme(bundle) {
   }
 
   if (theme === 'light') {
-    document.body.classList.add('light-mode');
+    document.documentElement.classList.add('light-mode');
   } else {
-    document.body.classList.remove('light-mode');
+    document.documentElement.classList.remove('light-mode');
   }
+
+  try {
+    localStorage.setItem('sar-theme-cache', theme === 'light' ? 'light' : 'dark');
+  } catch (e) {}
 }
 
 function hexToRgbTriple(hex) {
@@ -8478,6 +8482,9 @@ function applyAccentColor(bundle) {
   const clear = () => {
     root.style.removeProperty('--accent');
     root.style.removeProperty('--accent-rgb');
+    try {
+      localStorage.removeItem('sar-accent-cache');
+    } catch (e) {}
   };
 
   const user = getCurrentUser();
@@ -8510,6 +8517,9 @@ function applyAccentColor(bundle) {
 
   root.style.setProperty('--accent', hex);
   root.style.setProperty('--accent-rgb', triple);
+  try {
+    localStorage.setItem('sar-accent-cache', `${hex}|${triple}`);
+  } catch (e) {}
 }
 
 function applyBackground(bundle) {
@@ -13899,6 +13909,10 @@ function buildUserAccountPage() {
         if (oldPin === currentUser.pin) {
             setCurrentUser(userToEdit);
         }
+
+        // Immediately apply the selected theme and highlight-accent preference
+        applyTheme(bundle);
+        applyAccentColor(bundle);
 
         // If PIN changed and we are Admin editing another user, update the URL to prevent duplicate saves
         if (userPin && userPin !== newPin) {

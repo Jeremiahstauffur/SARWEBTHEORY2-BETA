@@ -5,148 +5,142 @@ sessionId: session-260829-224546-joyh
 # Requirements
 
 ### Overview & Goals
-The user Settings page currently offers a theme toggle labelled **Dark Mode / Grey Mode**. The "Grey Mode" is broken — it applies a class (`body.light-mode`) whose CSS variables are still dark grey, so nothing meaningfully lightens. This work:
+The Light Mode + per-user highlight-accent feature was implemented previously, but three defects remain. This work fixes them:
 
-1. **Converts "Grey Mode" into a real "Light Mode"** — selecting it puts the whole site into a genuine light theme (light backgrounds, dark text, lighter background-image dimming).
-2. **Adds a per-user "Use My Highlight Color" toggle** — when ON, the site-wide semi-transparent accent color (used across nav, focus states, buttons, form sections, etc.) becomes a semi-transparent version of the highlight color that user picked in their profile.
+1. **Highlight toggle has no visible effect** — turning on "Use My Highlight Color" does not recolor the UI (specifically while the site is in Light Mode).
+2. **Profile "Update Account" doesn't apply the theme** — after choosing Light Mode in the profile editor (`page8`) and pressing **Update Account**, the screen stays in the old theme.
+3. **Theme flash on load (FOUC)** — every page first renders in Dark Mode and then snaps to Light Mode a moment later, producing an unprofessional flash.
 
 ### Scope
 **In Scope**
-- Restyle `body.light-mode` in `styles.css` into a true light palette.
-- Rename all user-facing "Grey Mode" text to "Light Mode" (Settings page + profile editor).
-- Refactor the ~35 hardcoded `rgba(125, 198, 255, x)` accent values in `styles.css` to a CSS variable so the accent can be recolored dynamically.
-- Add a new **Use My Highlight Color** toggle to the Settings Theme area, stored per-user.
-- Apply the user's highlight color as the site accent on page load and when toggled.
+- Make the highlight-accent override actually win in Light Mode.
+- Re-apply theme + accent immediately when the profile **Update Account** button is pressed.
+- Eliminate the dark→light flash by applying the persisted theme/accent before first paint.
 
 **Out of Scope**
-- Changing how users pick their highlight color (the existing profile color picker stays as-is).
-- Adding new highlight colors to the palette.
-- Any data migration (the stored theme value stays `'light'`; only its meaning/appearance changes).
+- Changing the light palette colors, the highlight-color palette, or how users pick their highlight color.
+- Any data-model/migration changes (existing `theme`, `color`, `useHighlightColor` fields stay as-is).
 
 ### User Stories
-- As a user, I want the second theme option to actually produce a light-themed site so I can use the app comfortably in bright environments.
-- As a user, I want to turn on a toggle that recolors the app's accent/highlight tint to my personal highlight color, so the interface feels personalized.
-- As a user, I want that toggle to safely fall back to the default blue accent when it's off (or when my color is `none`/white), so the UI never becomes unreadable.
+- As a user, when I enable "Use My Highlight Color", I want the accent to change everywhere immediately, even in Light Mode.
+- As a user, when I select Light Mode in my profile and press Update Account, I want the site to switch to Light Mode right away.
+- As a user, I want pages to open directly in my chosen theme with no dark-then-light flash.
 
 ### Functional Requirements
-- The Theme toggle shows **Dark Mode** / **Light Mode** (no more "Grey Mode" anywhere).
-- Selecting Light Mode applies a light background, dark text, light panels/cards, and lighter background-image dimming across every page.
-- A new **Use My Highlight Color** toggle appears in Settings.
-  - The setting is stored on the current user's account (per-user), consistent with the per-user Highlight Color and Theme preferences.
-  - When ON and the user's highlight color is a usable color, all site-wide semi-transparent accent tints and the solid `--accent` become that color.
-  - When OFF, or the highlight color is `none` or white, the accent falls back to the existing default blue theme accent.
-- Changes take effect immediately on toggle and persist across reloads/devices (saved into the data bundle like other settings).
+- Toggling **Use My Highlight Color** ON recolors all site-wide accent tints and the solid `--accent` in **both** Dark and Light Mode; OFF (or a `none`/white color) falls back to the default blue accent.
+- Pressing **Update Account** in the profile editor persists and **immediately** applies the selected theme and highlight-accent preference.
+- On page load, the last-known theme and accent are applied **before the first paint**, so there is no visible theme flash; the server-synced value still corrects the display if it differs.
 
 # Technical Design
 
 ### Current Implementation
-- **Theme variables** live in `styles.css`: `:root` (dark) at lines 1-15 and `body.light-mode` at lines 17-31. The `light-mode` block currently holds dark-grey values, which is why "Grey Mode" looks broken.
-- **Theme application**: `applyTheme(bundle)` (`app.js` ~8390) resolves the theme from the logged-in account (`account.theme`) and toggles the `light-mode` class on `<body>`. It's called during init at `app.js` ~11675 alongside `applyBackground` / `applyTipsVisibility`.
-- **Settings wiring**: `buildSettingsPage()` (`app.js` ~8430) wires `#theme-toggle` / `#theme-label` (lines 8510-8522), currently writing `bundle.theme` and labelling the ON state "Grey Mode".
-- **Profile editor**: `app.js` ~13549-13630 renders per-user **Theme Preference** buttons (`Dark Mode` / `Grey Mode`, line 13553) and a **Highlight Color** picker that writes `account.color` (a key of `HIGHLIGHT_COLORS`, defined at `app.js` ~1536).
-- **Accent color**: solid accent is the `--accent` CSS var; the semi-transparent accent tint is **hardcoded** as `rgba(125, 198, 255, x)` in ~35 places in `styles.css` (nav hover/active, `.pill-cell:focus`, `.add-col-btn-inline`, `.pill-checkbox:checked`, `.form-section`, `.form-input:focus`, etc.), so it cannot currently be recolored from JS.
+- **Theme class scope**: `applyTheme(bundle)` (`app.js` ~8440) adds/removes the `light-mode` class on **`document.body`**. The light palette lives in the `body.light-mode` block in `styles.css` (line 18), which redefines `--accent` and `--accent-rgb`.
+- **Accent override**: `applyAccentColor(bundle)` (`app.js` ~8474) sets `--accent` / `--accent-rgb` inline on **`document.documentElement`** (`<html>`).
+- **Init timing**: in `DOMContentLoaded` (`app.js` ~11846) the code `await`s `loadServerSettings()` (~11860) and `syncWithServer()` (~11877) **before** `applyTheme` / `applyAccentColor` run (~11881-11882) — i.e. seconds after the first paint.
+- **Profile editor**: `buildUserAccountPage()` (`app.js` ~13678); the Light/Dark preview buttons call `applyTheme(bundle)` (~13829/13835), but the `save-user-btn` handler (~13855) calls `saveBundle` + `setCurrentUser` and does **not** re-apply theme/accent.
+
+### Root Cause Analysis
+- **Bug 1 — toggle does nothing in Light Mode (CSS custom-property scoping).** `body.light-mode` defines `--accent-rgb` **on `<body>`**, while `applyAccentColor` writes the override **on `<html>`**. For all visible content, `<body>` is the closer ancestor, so its `light-mode` value shadows the `<html>` inline override → the highlight color never applies in Light Mode. (In Dark Mode it works, because `<body>` doesn't redefine the var.)
+- **Bug 2 — profile Update Account.** The `save-user-btn` handler never calls `applyTheme` / `applyAccentColor`, so the chosen theme isn't applied on save.
+- **Bug 3 — FOUC.** Theme/accent are applied only after the awaited server round-trips in `DOMContentLoaded`; there is no synchronous, pre-paint theme application, and the theme lives in the server bundle (not available before first paint).
 
 ### Key Decisions
-- **Light Mode reuses the existing `light` theme value and `light-mode` class** — only the CSS variable values are rewritten to a real light palette. No data migration; existing users with `theme: 'light'` simply start seeing a proper light theme. (User confirmed: full light theme incl. lighter background dimming.)
-- **Highlight toggle is per-user** — stored as `account.useHighlightColor` on the account object, matching how `account.theme` and `account.color` already work. (User confirmed.)
-- **Accent recoloring via CSS variables** — introduce `--accent-rgb` (an `R, G, B` triple) in `:root` and replace hardcoded `rgba(125, 198, 255, x)` with `rgba(var(--accent-rgb), x)`. A JS helper overrides `--accent` and `--accent-rgb` on `document.documentElement` when the toggle is on. This recolors all ~35 semi-transparent usages plus solid accent in one place.
-- **Safe fallback** — when the toggle is off, or the resolved highlight color is `none` or white (`#ffffff`), no overrides are set, so the default blue accent from CSS applies. (User confirmed: default blue accent fallback.)
+- **Move the `light-mode` class to `<html>` (`document.documentElement`) and target `html.light-mode` in CSS.** This makes the inline `--accent`/`--accent-rgb` override on `<html>` win over the class-level palette (inline beats class), fixing Bug 1, and lets a `<head>` boot script apply the theme before `<body>` is parsed (needed for Bug 3). Only one CSS selector uses `body.light-mode`, so the change is contained.
+- **Persist a lightweight theme/accent cache in `localStorage`.** `applyTheme` / `applyAccentColor` write the resolved theme (`'light'`/`'dark'`) and accent (hex + rgb triple, or a default sentinel) to `localStorage`. A tiny synchronous boot snippet in each page's `<head>` reads that cache and applies the class + inline vars before first paint. The server sync still runs afterward and corrects the display if it differs.
+- **Re-apply on Update Account.** The `save-user-btn` handler calls `applyTheme` + `applyAccentColor` after saving so the profile change takes effect immediately.
 
 ### Proposed Changes
-1. **`styles.css` — Light Mode palette**: rewrite `body.light-mode` variables to a true light theme, e.g. light `--glass`/`--glass-strong` (white-ish), dark `--text` (`#1a2230`-ish), muted dark `--muted`, light `--header-bg`, light `--pill-bg`/`--pill-border`, light `--popup-bg`, and lighter `--bg-dim-start`/`--bg-dim-end` (white-based overlay) so the fixed background image reads as light.
-2. **`styles.css` — accent variable**: add `--accent-rgb: 125, 198, 255;` to `:root` (and an appropriate value in `body.light-mode` if needed); replace every hardcoded `rgba(125, 198, 255, x)` with `rgba(var(--accent-rgb), x)`.
-3. **`app.js` — accent helper**: add `hexToRgbTriple(hex)` and `applyAccentColor(bundle)`. `applyAccentColor` resolves the current user (via `getCurrentUser()` + lookup in `bundle.accounts`), checks `account.useHighlightColor`, maps `account.color` through `HIGHLIGHT_COLORS`, and — if enabled and the color is usable — sets `--accent` and `--accent-rgb` on `document.documentElement`; otherwise clears those overrides.
-4. **`app.js` — init**: call `applyAccentColor(bundle)` right after `applyTheme(bundle)` (~line 11675).
-5. **`app.js` + `settings.html` — new toggle**: add a **Use My Highlight Color** toggle (`#highlight-accent-toggle` / `#highlight-accent-label`) to the Theme panel in `settings.html`; wire it in `buildSettingsPage()` to read/write `useHighlightColor` on the current user's account within the bundle, `saveBundle`, then `applyAccentColor`.
-6. **Rename labels**: update the Theme panel copy in `settings.html` (line ~78), the ON-state label logic in `buildSettingsPage()` (lines 8512/8519) to "Light Mode", and the profile button text at `app.js` line 13553 (`Grey Mode` → `Light Mode`).
+1. **`styles.css`**: change the selector `body.light-mode` → `html.light-mode` (palette values unchanged).
+2. **`app.js` — `applyTheme`**: toggle the `light-mode` class on `document.documentElement` instead of `document.body`; write the resolved theme to `localStorage` (`sar-theme-cache`).
+3. **`app.js` — `applyAccentColor`**: keep setting `--accent`/`--accent-rgb` on `document.documentElement` (now authoritative over `html.light-mode`); write the resolved accent to `localStorage` (`sar-accent-cache`) when active, or clear the key + inline props on fallback.
+4. **`app.js` — profile save**: in the `save-user-btn` onclick (`buildUserAccountPage`, ~13855), after `saveBundle`/`setCurrentUser`, call `applyTheme(bundle)` and `applyAccentColor(bundle)`.
+5. **Early theme boot**: add an identical synchronous inline `<script>` in the `<head>` of each app HTML page (`index.html`, `home.html`, `settings.html`, `page2.html`–`page8.html`, `page10.html`, `more.html`, `mobile-status.html`) that reads `sar-theme-cache`/`sar-accent-cache` and applies the `light-mode` class + accent vars to `document.documentElement` before the body renders.
 
 ### Data Models / Contracts
 ```js
-// account object (per-user, in bundle.accounts)
-{
-  username, pin, handle,
-  theme: 'dark' | 'light',      // 'light' now means real Light Mode
-  color: 'none' | 'orange' | ... // key of HIGHLIGHT_COLORS
-  useHighlightColor: boolean     // NEW: apply personal accent when true
-}
+// localStorage cache (new; persists across reloads to kill FOUC)
+'sar-theme-cache'  = 'light' | 'dark'
+'sar-accent-cache' = '<hex>|<r, g, b>'   // e.g. '#800080|128, 0, 128'; absent => default blue
 
-// helpers (app.js)
-function hexToRgbTriple(hex): string        // '#7dc6ff' -> '125, 198, 255'
-function applyAccentColor(bundle): void     // sets/clears --accent & --accent-rgb on :root
+// early boot snippet (inline in each page <head>), pseudocode:
+(function () {
+  try {
+    var t = localStorage.getItem('sar-theme-cache');
+    if (t === 'light') document.documentElement.classList.add('light-mode');
+    var a = localStorage.getItem('sar-accent-cache');
+    if (a) {
+      var p = a.split('|');
+      document.documentElement.style.setProperty('--accent', p[0]);
+      document.documentElement.style.setProperty('--accent-rgb', p[1]);
+    }
+  } catch (e) {}
+})();
 ```
 
-### Components / File Structure
-- `styles.css` — light-mode palette rewrite; `--accent-rgb` var + replacement of hardcoded accent rgba values.
-- `settings.html` — updated Theme panel copy + new highlight-color toggle markup.
-- `app.js` — `applyAccentColor` / `hexToRgbTriple` helpers, init call, `buildSettingsPage` toggle wiring, and "Grey Mode" → "Light Mode" text updates.
+### File Structure
+- `styles.css` — one selector change (`body.light-mode` → `html.light-mode`).
+- `app.js` — `applyTheme` class target + cache write; `applyAccentColor` cache write; profile `save-user-btn` re-apply.
+- HTML pages — add the identical `<head>` boot snippet.
 
 ### Architecture Diagram
 ```mermaid
 graph TD
-    A[Page load / init ~line 11675] --> B[applyTheme bundle]
-    A --> C[applyAccentColor bundle]
-    S[Settings: Use My Highlight Color toggle] -->|saveBundle + call| C
-    P[Profile: Highlight Color picker sets account.color] --> C
-    C -->|reads current account.color + useHighlightColor| H[HIGHLIGHT_COLORS map]
-    C -->|sets --accent / --accent-rgb, or clears| R[:root CSS vars]
-    R --> U[rgba var --accent-rgb x used site-wide]
-    B -->|toggles .light-mode class| L[Light Mode CSS vars]
+    H[Head boot script] -->|reads localStorage cache| C1[sar-theme-cache / sar-accent-cache]
+    H -->|applies before first paint| DOC[html element: light-mode class + accent vars]
+    D[DOMContentLoaded after server sync] --> AT[applyTheme]
+    D --> AC[applyAccentColor]
+    AT -->|toggle class on html + write cache| DOC
+    AT --> C1
+    AC -->|set --accent/--accent-rgb on html + write cache| DOC
+    AC --> C1
+    S[Profile Update Account] -->|saveBundle then re-apply| AT
+    S --> AC
 ```
 
 ### Risks
-- **Missed hardcoded accent values**: any `rgba(125, 198, 255, ...)` left unconverted won't recolor — mitigate by grep-verifying zero remaining literals after the refactor.
-- **Contrast in Light Mode**: light-mode `--accent-rgb` and text colors must keep readable contrast; verify focus/hover states remain visible.
-- **White/none highlight**: guarded by the fallback so the accent never becomes invisible.
+- **Stale cache after user switch**: the cache reflects the last-applied user; the `DOMContentLoaded` server sync re-applies the correct value, so at worst there is a brief correction on the first load after switching users.
+- **Other `body.light-mode` references**: verified only one exists (the CSS definition); grep after the change to confirm none remain.
+- **localStorage unavailable**: the boot snippet is wrapped in try/catch, so failure simply falls back to the current post-sync behavior.
 
 # Testing
 
 ### Validation Approach
-Manual in-browser verification across a representative set of pages (Settings, Regions/index, Segments, Personnel, Forms, Home), since the app is a static multi-page site sharing `styles.css` and `app.js`. Confirm behavior on load, on toggle, and after reload (persistence).
+Manual in-browser verification across representative pages (Settings, Regions/index, Segments, Forms, profile `page8`), plus `node --check app.js` for syntax. Confirm behavior in both Dark and Light Mode, on toggle, on Update Account, and on reload.
 
 ### Key Scenarios
-- **Light Mode on**: selecting Light Mode gives light backgrounds, dark readable text, light panels/cards, and a light-tinted background image on every page; label reads "Light Mode".
-- **Dark Mode on**: reverts fully to the original dark theme.
-- **Highlight toggle ON** with a distinct color (e.g. green/purple): nav hover/active, `.pill-cell:focus`, buttons, `.form-section`, and other accent tints all recolor to a semi-transparent version of that color; solid `--accent` text/borders match.
-- **Persistence**: toggles survive a page reload and reflect on other pages (saved into the bundle per-user).
-- **Combined**: Light Mode + custom highlight color together render correctly (no unreadable combos).
+- **Highlight toggle in Light Mode**: with Light Mode active and a distinct highlight color, turning the toggle ON recolors nav hover/active, focus rings, buttons, and `.form-section` tints; turning it OFF reverts to the default blue.
+- **Highlight toggle in Dark Mode**: still works as before (no regression).
+- **Profile Update Account**: select Light Mode in `page8`, press Update Account → the site switches to Light Mode immediately and the choice persists.
+- **No FOUC**: reload several pages while in Light Mode → each opens directly in Light Mode with no dark flash.
 
 ### Edge Cases
-- Highlight color = `none` or `white` with toggle ON → accent falls back to default blue.
-- Toggle OFF → default blue accent regardless of stored color.
-- No logged-in user / Super Admin default → no crash; default accent used.
-- Confirm (via search) that no `rgba(125, 198, 255, ...)` literals remain in `styles.css` after refactor.
+- Highlight color `none`/`white` with toggle ON → default blue fallback in both modes.
+- No logged-in user → no crash; boot snippet + fallback apply defaults.
+- localStorage cleared/unavailable → first load may briefly correct after sync, then behaves normally.
+- Confirm no `body.light-mode` references remain after the selector change.
 
 ### Test Changes
-No automated test framework covers CSS/theming here; existing Node test scripts in the repo are unrelated (sync/proxy). No new automated tests planned — validation is manual as above.
+No automated theming tests exist in the repo; validation is manual plus `node --check app.js`.
 
 # Delivery Steps
 
-### ✓ Step 1: Convert Grey Mode into a real Light Mode
-Selecting the second theme option renders the whole site in a genuine light theme, and no user-facing text says "Grey Mode".
+### ✓ Step 1: Fix the highlight accent so it applies in Light Mode
+Turning on "Use My Highlight Color" recolors the whole UI in both Dark and Light Mode.
 
-- Rewrite the `body.light-mode` block in `styles.css` (lines ~17-31) to a true light palette: light `--glass`/`--glass-strong`, dark `--text`, dark-muted `--muted`, light `--header-bg`, light `--pill-bg`/`--pill-border`/`--pill-focus`, light `--popup-bg`, and lighter `--bg-dim-start`/`--bg-dim-end` so the fixed background image reads light.
-- Update the Theme panel description in `settings.html` (line ~78) from "Dark Mode and Grey Mode" wording to Light Mode.
-- Update `buildSettingsPage()` in `app.js` (lines 8512 & 8519) so the theme label shows "Light Mode" instead of "Grey Mode".
-- Update the profile editor button text in `app.js` (line 13553) from "Grey Mode" to "Light Mode".
-- Keep the stored theme value as `'light'` and the `light-mode` class name (no data migration).
+- In `styles.css`, change the selector `body.light-mode` → `html.light-mode` (palette values unchanged) so the light theme now keys off the `<html>` element.
+- In `app.js` `applyTheme(bundle)` (~8454), toggle the `light-mode` class on `document.documentElement` instead of `document.body`.
+- Confirm `applyAccentColor(bundle)` (~8474) continues setting `--accent`/`--accent-rgb` inline on `document.documentElement`; because inline styles beat the `html.light-mode` class rule, the highlight override now wins in Light Mode too.
+- Grep to confirm no `body.light-mode` references remain and run `node --check app.js`.
 
-### ✓ Step 2: Refactor the site-wide accent tint into a CSS variable
-All semi-transparent accent styling reads from a single CSS variable so the accent can be recolored dynamically.
+### ✓ Step 2: Apply theme & accent when the profile "Update Account" button is pressed
+Selecting Light Mode (or a highlight preference) in the profile editor and pressing Update Account switches the screen immediately.
 
-- Add `--accent-rgb: 125, 198, 255;` to `:root` in `styles.css` (and a suitable value under `body.light-mode` if needed for contrast).
-- Replace every hardcoded `rgba(125, 198, 255, x)` occurrence (~35, e.g. nav hover/active, `.pill-cell:focus`, `.add-col-btn-inline`, `.pill-checkbox:checked`, `.form-section`, `.form-input:focus`) with `rgba(var(--accent-rgb), x)`.
-- Verify via search that no `rgba(125, 198, 255, ...)` literals remain.
+- In `buildUserAccountPage()` (`app.js` ~13855), inside the `save-user-btn` onclick, after `saveBundle(bundle)` and `setCurrentUser(...)`, call `applyTheme(bundle)` and `applyAccentColor(bundle)`.
+- Verify the Light/Dark preview buttons still preview correctly and that the saved theme/accent stays applied after the save completes.
 
-### ✓ Step 3: Apply the user's highlight color as the site accent
-On load, the site accent reflects the logged-in user's highlight color when their per-user toggle is enabled, with a safe default fallback.
+### ✓ Step 3: Eliminate the dark→light theme flash on page load
+Pages open directly in the user's chosen theme with no visible dark-then-light flash.
 
-- Add a `hexToRgbTriple(hex)` helper in `app.js` that converts a hex color to an `R, G, B` string.
-- Add `applyAccentColor(bundle)` in `app.js` that resolves the current account (`getCurrentUser()` + lookup in `bundle.accounts`), reads `account.useHighlightColor` and `account.color`, maps the color via `HIGHLIGHT_COLORS`, and sets `--accent` + `--accent-rgb` on `document.documentElement` — or clears them when the toggle is off or the color is `none`/white (default blue fallback).
-- Call `applyAccentColor(bundle)` in the init flow right after `applyTheme(bundle)` (~line 11675).
-
-### ✓ Step 4: Add the per-user "Use My Highlight Color" toggle to Settings
-The Settings Theme area has a toggle that turns the personal highlight accent on/off per user, taking effect immediately and persisting.
-
-- Add a new toggle-switch panel row in `settings.html` (in/near the Theme panel) with `#highlight-accent-toggle` and `#highlight-accent-label`.
-- Wire it in `buildSettingsPage()` (`app.js`): initialize from the current user's `account.useHighlightColor`; on change, update that account within the bundle, `saveBundle(...)`, call `applyAccentColor(...)`, update the label, and set the status message.
-- Ensure the toggle updates the accent live and the choice persists across reloads.
+- In `app.js`, have `applyTheme` write the resolved theme to `localStorage` (`sar-theme-cache`) and `applyAccentColor` write/clear the resolved accent (`sar-accent-cache`, format `'<hex>|<r, g, b>'`).
+- Add an identical small synchronous inline `<script>` in the `<head>` of each app HTML page (`index.html`, `home.html`, `settings.html`, `page2.html`–`page8.html`, `page10.html`, `more.html`, `mobile-status.html`) that reads those keys and, before the body renders, adds the `light-mode` class and sets `--accent`/`--accent-rgb` on `document.documentElement` (wrapped in try/catch).
+- Verify reloading several pages in Light Mode shows no flash, and that the post-sync `DOMContentLoaded` call still corrects the theme if the cache is stale.
