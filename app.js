@@ -6413,6 +6413,25 @@ function printCurrentReport(type) {
     });
   }
 
+  // Build the incident timecards table for a single-member report (before the activity log).
+  let timecardsHtml = '';
+  if (type !== 'team') {
+    const page3 = bundle.pages.page3 || [];
+    const memberRows = page3.filter(r =>
+      r[0] === currentMemberReportSelection && (r[9] || r[10] || r[11] || r[12])
+    );
+    if (memberRows.length > 0) {
+      timecardsHtml += '<h2 class="section-title">Incident Timecards</h2>';
+      timecardsHtml += '<table class="timecards-table"><thead><tr>' +
+        '<th>Incident Set</th><th>Enroute</th><th>On Scene</th><th>Returning</th><th>Arrived Home</th>' +
+        '</tr></thead><tbody>';
+      memberRows.forEach((r, i) => {
+        timecardsHtml += `<tr><td>Set ${i + 1}</td><td>${r[9] || ''}</td><td>${r[10] || ''}</td><td>${r[11] || ''}</td><td>${r[12] || ''}</td></tr>`;
+      });
+      timecardsHtml += '</tbody></table>';
+    }
+  }
+
   const printWindow = window.open('', '_blank');
   if (!printWindow) { alert("Please allow popups to view the printout."); return; }
 
@@ -6421,6 +6440,10 @@ function printCurrentReport(type) {
     body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11pt; color: #000; background: #fff; margin: 0; padding: 0; }
     .print-container { max-width: 8.5in; margin: 0 auto; padding: 20px; }
     h1 { font-size: 18pt; border-bottom: 2px solid #000; margin: 0 0 15px 0; padding-bottom: 5px; }
+    h2.section-title { font-size: 13pt; margin: 0 0 8px 0; padding-bottom: 4px; border-bottom: 1px solid #000; }
+    .timecards-table { width: 100%; border-collapse: collapse; margin-bottom: 20px; font-size: 10pt; }
+    .timecards-table th, .timecards-table td { border: 1px solid #000; padding: 6px 8px; text-align: left; }
+    .timecards-table th { background: #eee !important; -webkit-print-color-adjust: exact; }
     .activity-log { font-size: 10pt; line-height: 1.0; }
     .activity-log-entry { margin-bottom: 1px; }
     .activity-log-time { font-weight: bold; margin-right: 5px; }
@@ -6441,6 +6464,8 @@ function printCurrentReport(type) {
       </div>
       <div class="print-container">
         <h1>${title}</h1>
+        ${timecardsHtml}
+        ${timecardsHtml ? '<h2 class="section-title">Activity Log</h2>' : ''}
         <div class="activity-log">
   `;
 
@@ -9123,16 +9148,21 @@ function printIncidentTimesReport() {
     <title>Incident Times Report - ${fileName}</title>
     <style>
         ${TASK_FORM_PRINT_STYLES}
-        table { width: 100%; border-collapse: collapse; margin-top: 20px; }
-        th, td { border: 1px solid #000; padding: 8px; text-align: left; font-size: 10pt; }
-        th { background: #eee !important; -webkit-print-color-adjust: exact; }
-        .mini-pill { border: 1px solid #ccc; padding: 2px 4px; border-radius: 4px; font-size: 8pt; display: block; margin: 2px 0; background: none !important; color: #000 !important; }
-        button.mini-pill { border: none; }
-        .pill-cell { background: none !important; padding: 0 !important; min-height: 0 !important; }
-        .readonly-pill { border: none !important; }
+        .incident-report-member-section { margin-bottom: 24px; page-break-inside: avoid; }
+        .incident-report-member-name { font-size: 13pt; font-weight: 700; margin: 0 0 8px 0; padding-bottom: 4px; border-bottom: 1px solid #000; color: #000 !important; }
+        .incident-times-container { display: flex; flex-direction: column; gap: 10px; margin-bottom: 10px; }
+        .incident-card { border: 1px solid #000; border-radius: 6px; padding: 10px; background: #fff !important; page-break-inside: avoid; }
+        .incident-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+        .incident-card-title { font-size: 9pt; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; color: #000 !important; }
+        .incident-times-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
+        .time-slot { border: 1px solid #999; border-radius: 4px; padding: 6px 8px; background: #fff !important; }
+        .time-slot-label { font-size: 7pt; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.8; color: #000 !important; }
+        .time-slot-value { font-size: 10pt; font-weight: 600; color: #000 !important; }
+        .time-slot-value.add-time-btn-small { color: #999 !important; }
+        .delete-card-btn, .add-card-placeholder { display: none !important; }
         @media print {
             button { display: none !important; }
-            .mini-pill { border: none !important; }
+            .no-print { display: none !important; }
         }
     </style>
 </head>
@@ -9174,25 +9204,47 @@ function buildIncidentTimesReport() {
   if (!container) return;
   container.innerHTML = '';
 
-  const table = document.createElement('table');
-  table.className = 'form-grid-table';
-  table.innerHTML = `
-    <thead>
-      <tr>
-        <th>Member</th>
-        <th>Enroute</th>
-        <th>On-Scene</th>
-        <th>Leave-Scene</th>
-        <th>Home/Hotel</th>
-      </tr>
-    </thead>
-    <tbody id="incident-times-body"></tbody>
-  `;
-  container.appendChild(table);
+  const bundle = loadBundle();
+  const roster = bundle.pages.page3 || [];
+  const memberNames = Array.from(new Set(roster.map(r => r[0]).filter(Boolean)))
+    .sort((a, b) => a.localeCompare(b));
 
+  if (memberNames.length === 0) {
+    const empty = document.createElement('div');
+    empty.style.textAlign = 'center';
+    empty.style.opacity = '0.5';
+    empty.style.padding = '40px';
+    empty.textContent = 'No members found in the roster.';
+    container.appendChild(empty);
+    return;
+  }
+
+  memberNames.forEach(name => {
+    const section = document.createElement('div');
+    section.className = 'incident-report-member-section';
+    section.style.marginBottom = '30px';
+
+    const heading = document.createElement('h3');
+    heading.className = 'incident-report-member-name';
+    heading.textContent = name;
+    heading.style.margin = '0 0 10px 0';
+    heading.style.padding = '8px 0';
+    heading.style.borderBottom = '1px solid var(--border, rgba(255,255,255,0.1))';
+    section.appendChild(heading);
+
+    const cardsContainer = document.createElement('div');
+    section.appendChild(cardsContainer);
+
+    container.appendChild(section);
+
+    renderMemberIncidentCards(name, cardsContainer);
+  });
+}
+
+function _retiredBuildIncidentTimesReport() {
+  const container = document.getElementById('interactive-form-container');
   const tableBody = document.getElementById('incident-times-body');
   if (!tableBody) return;
-  tableBody.innerHTML = '';
 
   const bundle = loadBundle();
   const logs = bundle.activityLog || [];
@@ -9663,23 +9715,24 @@ function addIncidentRow() {
     const memberName = select.value;
     if (!memberName) return;
 
-    // To create a row, we need a status change log. 
-    // We'll add an "Enroute" entry with current time to start a session.
-    let memberTeam = 'Unassigned';
-    for (const row of roster) {
-      if (row[0] === memberName) {
-        memberTeam = row[1] || 'Unassigned';
-        break;
-      }
-    }
+    // Add a new incident set (page3 row) for the selected member, matching the
+    // "Add Incident Row" card affordance used in the mobile/member-report views.
+    const page3 = bundle.pages.page3 || [];
+    const memberRows = page3.filter(r => r[0] === memberName);
+    const firstRow = memberRows[0];
+    const newRow = firstRow ? [...firstRow] : Array(14).fill('');
+    newRow[0] = memberName;
+    // Clear incident times in the new row (indexes 9-12)
+    newRow[9] = '';
+    newRow[10] = '';
+    newRow[11] = '';
+    newRow[12] = '';
+    // Clear old sets JSON if it exists
+    if (newRow[13]) newRow[13] = '';
 
-    const now = new Date();
-    const dateStr = `${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}-${now.getFullYear()}`;
-    const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-    const ts = now.getTime();
+    page3.push(newRow);
+    saveBundle(bundle);
 
-    addActivityLogEntry(memberTeam, `${memberName} status changed to Enroute at ${timeStr}`, null, null, dateStr, timeStr, ts);
-    
     closePopup(popup);
     buildIncidentTimesReport();
   };

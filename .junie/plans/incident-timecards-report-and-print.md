@@ -101,7 +101,7 @@ Manually exercise the three views against the same data to confirm the Forms rep
 
 # Delivery Steps
 
-### * Step 1: Rebuild the Forms Incident Times Report as per-member incident cards
+### ✓ Step 1: Rebuild the Forms Incident Times Report as per-member incident cards
 The Forms → Incident Times view lists every roster member with their editable incident cards, backed by page3 and edited identically to the mobile/member-report views.
 
 - Rewrite `buildIncidentTimesReport()` in `app.js` to clear `#interactive-form-container` and iterate unique member names from `bundle.pages.page3`.
@@ -109,14 +109,14 @@ The Forms → Incident Times view lists every roster member with their editable 
 - Render an empty-state message when the roster has no members.
 - Remove/retire the activity-log-derived table logic and its helpers used only here (`editIncidentTimestamp`, session-parsing loop, `addIncidentTimestamp`) as they are superseded by the card interaction.
 
-###   Step 2: Update the Forms toolbar and Print Report for the card layout
+### ✓ Step 2: Update the Forms toolbar and Print Report for the card layout
 The Forms toolbar and printed report work correctly with the new card-based view.
 
 - In the `incident-times` toolbar branch (`app.js` ~line 8972), ensure `Add Row` operates on page3 (add an incident set / pick a member) and `Print Report` still calls `printIncidentTimesReport()`.
 - Update `printIncidentTimesReport()` print CSS to style `.incident-card`, `.incident-times-grid`, and `.time-slot` for print output.
 - Rely on existing `.no-print` classes so delete and "Add Incident Row" controls are hidden in the printout.
 
-###   Step 3: Add incident timecards to the Member Reports print output
+### ✓ Step 3: Add incident timecards to the Member Reports print output
 Printing a member report outputs the member's incident timecards table first, then their activity log.
 
 - Extend `printCurrentReport('member')` in `app.js` to gather the selected member's `page3` rows (cols 9-12: Enroute/On Scene/Returning/Arrived Home).
