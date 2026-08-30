@@ -3591,7 +3591,7 @@ function buildSegmentsTable() {
             actionBtn.textContent = 'search';
             actionBtn.onclick = () => {
               showTeamSelectionPopup((teamName) => {
-                showMissingStepsPopup(teamName, null, () => {
+                showMissingStepsPopup(teamName, null, (currentStamp) => {
                   const region = sortedData[r][0] || '';
                   const segment = sortedData[r][1] || '';
                   const taskNumber = addAutoSearchLogEntry(teamName, region, segment);
@@ -3599,10 +3599,12 @@ function buildSegmentsTable() {
                   
                   const bundle2 = loadBundle();
                   bundle2.currentAssignments[teamName] = assignmentStr;
-                  bundle2.teamAssignmentTimes[teamName] = Date.now();
+                  bundle2.teamAssignmentTimes[teamName] = currentStamp.timestampMs;
                   bundle2.teamStatuses[teamName] = 'assigned';
+                  if (!bundle2.parChecks) bundle2.parChecks = {};
+                  bundle2.parChecks[teamName] = { lastTime: currentStamp.timestampMs };
                   saveBundle(bundle2);
-                  addActivityLogEntry(teamName, `Started search on ${assignmentStr}`);
+                  addActivityLogEntry(teamName, `Started search on ${assignmentStr}`, null, null, currentStamp.date, currentStamp.time);
                   
                   navigateToPage('page4.html?scroll=latest');
                 });
@@ -5051,17 +5053,17 @@ function showTeamUpdatePopup(teamName) {
   const currentIndex = getStatusIndex(currentStatus);
 
   const updateStatus = (newStatus, logAction) => {
-    showMissingStepsPopup(teamName, newStatus, () => {
+    showMissingStepsPopup(teamName, newStatus, (currentStamp) => {
       markTaskUpdated(teamName);
       const b = loadBundle();
       b.teamStatuses[teamName] = newStatus;
       if (newStatus === 'headed to assignment') {
-        b.teamLeaveTimes[teamName] = Date.now();
+        b.teamLeaveTimes[teamName] = currentStamp.timestampMs;
       }
       if (!b.parChecks) b.parChecks = {};
-      b.parChecks[teamName] = { lastTime: Date.now() };
+      b.parChecks[teamName] = { lastTime: currentStamp.timestampMs };
       saveBundle(b);
-      addActivityLogEntry(teamName, logAction);
+      addActivityLogEntry(teamName, logAction, null, null, currentStamp.date, currentStamp.time);
       popup.remove();
       refreshCurrentPageTable();
     });
@@ -5073,14 +5075,13 @@ function showTeamUpdatePopup(teamName) {
     { id: 'finished segment', label: 'Finish Assignment', action: () => updateStatus('finished segment', 'Finished assignment') },
     { id: 'returning', label: 'Return to Base', action: () => updateStatus('returning', 'Returning to base') },
     { id: 'at base', label: 'Arrived at Base', action: () => {
-        showMissingStepsPopup(teamName, 'at base', () => {
+        showMissingStepsPopup(teamName, 'at base', (currentStamp) => {
             markTaskUpdated(teamName);
             const b = loadBundle();
-            const now = new Date();
-            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+            const timeStr = currentStamp.time;
             b.teamStatuses[teamName] = `at base (${timeStr})`;
             b.currentAssignments[teamName] = 'Base';
-            b.teamAssignmentTimes[teamName] = Date.now();
+            b.teamAssignmentTimes[teamName] = currentStamp.timestampMs;
             
             if (b.parChecks) delete b.parChecks[teamName];
             if (b.teamLeaveTimes) delete b.teamLeaveTimes[teamName];
@@ -5090,7 +5091,7 @@ function showTeamUpdatePopup(teamName) {
             if (!b.arrivedTeams.includes(teamName)) b.arrivedTeams.push(teamName);
             
             saveBundle(b);
-            addActivityLogEntry(teamName, `Arrived at base at ${timeStr}`);
+            addActivityLogEntry(teamName, `Arrived at base at ${timeStr}`, null, null, currentStamp.date, currentStamp.time);
             popup.remove();
             refreshCurrentPageTable();
         });
@@ -5234,19 +5235,19 @@ function showNewSegmentPopup(teamName, parentPopup) {
       
       const {region, segment, val} = JSON.parse(select.value);
       
-      showMissingStepsPopup(teamName, null, () => {
+      showMissingStepsPopup(teamName, null, (currentStamp) => {
         const taskNumber = addAutoSearchLogEntry(teamName, region, segment);
         const fullAssignment = `#${taskNumber} ${val}`;
         
         const b2 = loadBundle();
         b2.currentAssignments[teamName] = fullAssignment;
-        b2.teamAssignmentTimes[teamName] = Date.now();
+        b2.teamAssignmentTimes[teamName] = currentStamp.timestampMs;
         b2.teamStatuses[teamName] = 'assigned';
         if (!b2.parChecks) b2.parChecks = {};
-        b2.parChecks[teamName] = { lastTime: Date.now() };
+        b2.parChecks[teamName] = { lastTime: currentStamp.timestampMs };
         saveBundle(b2);
         markTaskUpdated(teamName);
-        addActivityLogEntry(teamName, 'Assigned to segment: ' + fullAssignment);
+        addActivityLogEntry(teamName, 'Assigned to segment: ' + fullAssignment, null, null, currentStamp.date, currentStamp.time);
         closePopup(popup);
         refreshCurrentPageTable();
       });
@@ -5348,12 +5349,17 @@ function showMissingStepsPopup(teamName, targetStatus, onComplete) {
   const currentIndex = getStatusIndex(currentStatus);
   const targetIndex = getStatusIndex(targetStatus);
   
-  const missingSteps = sequence.slice(currentIndex + 1, targetIndex);
-  
-  if (missingSteps.length === 0) {
-    onComplete();
-    return;
+  let missingSteps = [];
+  let currentStep;
+  if (targetStatus === null || targetIndex === -1) {
+    // Assignment (null target) flow: single synthetic entry, no intermediate steps
+    currentStep = { id: '__current__', label: 'Assign Task', log: null };
+  } else {
+    missingSteps = sequence.slice(currentIndex + 1, targetIndex);
+    currentStep = sequence[targetIndex];
   }
+  
+  const stepsToShow = [...missingSteps, currentStep];
   
   const popup = createPopup('Missing Steps: ' + teamName);
   const content = popup.querySelector('.popup-content');
@@ -5376,7 +5382,8 @@ function showMissingStepsPopup(teamName, targetStatus, onComplete) {
   
   const stepData = [];
 
-    missingSteps.forEach((step) => {
+    stepsToShow.forEach((step, idx) => {
+    const isCurrent = (idx === stepsToShow.length - 1);
     const item = document.createElement('div');
     item.style.display = 'flex';
     item.style.alignItems = 'center';
@@ -5407,7 +5414,7 @@ function showMissingStepsPopup(teamName, targetStatus, onComplete) {
     stamp.style.cursor = 'pointer';
     stamp.textContent = `${initialDate} ${initialTime}`;
     
-    const currentStepData = { step, date: initialDate, time: initialTime };
+    const currentStepData = { step, date: initialDate, time: initialTime, isCurrent };
     stepData.push(currentStepData);
 
     stamp.onclick = () => {
@@ -5428,10 +5435,22 @@ function showMissingStepsPopup(teamName, targetStatus, onComplete) {
   submitBtn.onclick = () => {
     markTaskUpdated(teamName);
     const b = loadBundle();
+    let currentStamp = null;
     stepData.forEach(item => {
-        let logText = item.step.log;
         const d = item.date;
         const t = item.time;
+
+        if (item.isCurrent) {
+            // The current/target step is applied by the caller's onComplete via currentStamp.
+            let timestampMs;
+            const [mm, dd, yyyy] = (d || '').split('-');
+            timestampMs = new Date(`${yyyy}-${mm}-${dd}T${t}:00`).getTime();
+            if (isNaN(timestampMs)) timestampMs = Date.now();
+            currentStamp = { date: d, time: t, timestampMs };
+            return;
+        }
+
+        let logText = item.step.log;
 
         if (item.step.id === 'at base') {
           b.teamStatuses[teamName] = `at base (${t})`;
@@ -5460,9 +5479,15 @@ function showMissingStepsPopup(teamName, targetStatus, onComplete) {
 
         addActivityLogEntry(teamName, logText, b, null, d, t);
     });
+    if (!currentStamp) {
+        const now = new Date();
+        const d = `${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}-${now.getFullYear()}`;
+        const t = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+        currentStamp = { date: d, time: t, timestampMs: Date.now() };
+    }
     saveBundle(b);
     closePopup(popup);
-    onComplete();
+    onComplete(currentStamp);
   };
   btnContainer.appendChild(submitBtn);
 }
@@ -8408,10 +8433,75 @@ function applyTheme(bundle) {
   }
 }
 
+function hexToRgbTriple(hex) {
+  if (typeof hex !== 'string') return null;
+  let h = hex.trim().replace(/^#/, '');
+  if (h.length === 3) {
+    h = h.split('').map(c => c + c).join('');
+  }
+  if (!/^[0-9a-fA-F]{6}$/.test(h)) return null;
+  const r = parseInt(h.slice(0, 2), 16);
+  const g = parseInt(h.slice(2, 4), 16);
+  const b = parseInt(h.slice(4, 6), 16);
+  return `${r}, ${g}, ${b}`;
+}
+
+function applyAccentColor(bundle) {
+  const root = document.documentElement;
+  const clear = () => {
+    root.style.removeProperty('--accent');
+    root.style.removeProperty('--accent-rgb');
+  };
+
+  const user = getCurrentUser();
+  if (!user) {
+    clear();
+    return;
+  }
+
+  const account = (bundle.accounts || []).find(a =>
+    a.username === user.username && a.pin === user.pin
+  );
+  if (!account || !account.useHighlightColor) {
+    clear();
+    return;
+  }
+
+  const colorKey = account.color;
+  // 'none' and white have no usable/readable accent -> fall back to default blue.
+  if (!colorKey || colorKey === 'none' || colorKey === 'white') {
+    clear();
+    return;
+  }
+
+  const hex = HIGHLIGHT_COLORS[colorKey];
+  const triple = hexToRgbTriple(hex);
+  if (!triple) {
+    clear();
+    return;
+  }
+
+  root.style.setProperty('--accent', hex);
+  root.style.setProperty('--accent-rgb', triple);
+}
+
 function applyBackground(bundle) {
   if (bundle && bundle.background) {
     document.body.style.backgroundImage = `linear-gradient(var(--bg-dim-start), var(--bg-dim-end)), url('${bundle.background}')`;
   }
+}
+
+function applyLogo(bundle) {
+  const src = bundle && bundle.logo ? bundle.logo : '';
+  document.querySelectorAll('[data-header-logo]').forEach((img) => {
+    if (src) {
+      img.src = src;
+      img.style.display = '';
+    } else {
+      img.removeAttribute('src');
+      img.style.display = 'none';
+    }
+  });
 }
 
 function applyTipsVisibility(bundle) {
@@ -8509,15 +8599,43 @@ function buildSettingsPage() {
 
   if (themeToggle) {
     themeToggle.checked = bundle.theme === 'light';
-    themeLabel.textContent = bundle.theme === 'light' ? 'Grey Mode' : 'Dark Mode';
+    themeLabel.textContent = bundle.theme === 'light' ? 'Light Mode' : 'Dark Mode';
     themeToggle.onchange = () => {
       const nextBundle = loadBundle();
       nextBundle.theme = themeToggle.checked ? 'light' : 'dark';
       saveBundle(nextBundle);
       applyTheme(nextBundle);
       applyBackground(nextBundle);
-      themeLabel.textContent = nextBundle.theme === 'light' ? 'Grey Mode' : 'Dark Mode';
+      themeLabel.textContent = nextBundle.theme === 'light' ? 'Light Mode' : 'Dark Mode';
       status.textContent = 'Theme updated and saved.';
+    };
+  }
+
+  const highlightAccentToggle = document.getElementById('highlight-accent-toggle');
+  const highlightAccentLabel = document.getElementById('highlight-accent-label');
+  if (highlightAccentToggle && highlightAccentLabel) {
+    const currentUser = getCurrentUser();
+    const findAccount = (b) => (b.accounts || []).find(a =>
+      currentUser && a.username === currentUser.username && a.pin === currentUser.pin
+    );
+    const currentAccount = findAccount(bundle);
+    const isOn = !!(currentAccount && currentAccount.useHighlightColor);
+    highlightAccentToggle.checked = isOn;
+    highlightAccentToggle.disabled = !currentAccount;
+    highlightAccentLabel.textContent = `Use My Highlight Color is ${isOn ? 'ON' : 'OFF'}`;
+    highlightAccentToggle.onchange = () => {
+      const nextBundle = loadBundle();
+      const account = findAccount(nextBundle);
+      if (!account) {
+        status.textContent = 'No user is logged in to save this preference.';
+        highlightAccentToggle.checked = false;
+        return;
+      }
+      account.useHighlightColor = highlightAccentToggle.checked;
+      saveBundle(nextBundle);
+      applyAccentColor(nextBundle);
+      highlightAccentLabel.textContent = `Use My Highlight Color is ${highlightAccentToggle.checked ? 'ON' : 'OFF'}`;
+      status.textContent = 'Highlight accent preference updated and saved.';
     };
   }
 
@@ -8586,6 +8704,41 @@ function buildSettingsPage() {
       saveBundle(nextBundle);
       applyBackground(nextBundle);
         status.textContent = 'Background reverted to default us-night satellite image.';
+    };
+  }
+
+  const logoInput = document.getElementById('logo-image-input');
+  const resetLogoBtn = document.getElementById('reset-logo-btn');
+
+  if (logoInput) {
+    logoInput.onchange = async () => {
+      const file = logoInput.files?.[0];
+      if (!file) return;
+
+      try {
+        const reader = new FileReader();
+        reader.onload = (e) => {
+          const nextBundle = loadBundle();
+          nextBundle.logo = e.target.result;
+          saveBundle(nextBundle);
+          applyLogo(nextBundle);
+          status.textContent = 'Logo updated and saved.';
+        };
+        reader.readAsDataURL(file);
+      } catch (err) {
+        status.textContent = 'Could not load the image.';
+      }
+      logoInput.value = '';
+    };
+  }
+
+  if (resetLogoBtn) {
+    resetLogoBtn.onclick = () => {
+      const nextBundle = loadBundle();
+      nextBundle.logo = '';
+      saveBundle(nextBundle);
+      applyLogo(nextBundle);
+      status.textContent = 'Logo removed.';
     };
   }
 
@@ -11673,6 +11826,7 @@ document.addEventListener('DOMContentLoaded', async () => {
     
     const bundle = loadBundle();
     applyTheme(bundle);
+    applyAccentColor(bundle);
     applyBackground(bundle);
     applyTipsVisibility(bundle);
     updateFileNameDisplay();
@@ -11961,17 +12115,26 @@ const haversine = (p1, p2) => {
 const polygonArea = (rings) => {
     let totalArea = 0;
     for (const ring of rings) {
-        if (ring.length < 3) continue;
-        let area = 0;
-        const latRef = ring[0][1];
+        if (!ring || ring.length < 3) continue;
+        // Determine whether the ring is already closed (first vertex repeated at the end).
+        const first = ring[0];
+        const last = ring[ring.length - 1];
+        const isClosed = first[0] === last[0] && first[1] === last[1];
+        // Number of distinct vertices to iterate over (drop the duplicate closing vertex if present).
+        const n = isClosed ? ring.length - 1 : ring.length;
+        if (n < 3) continue;
+        const lonRef = first[0];
+        const latRef = first[1];
         const k = Math.cos(latRef * Math.PI / 180);
-        for (let i = 0; i < ring.length - 1; i++) {
+        let area = 0;
+        for (let i = 0; i < n; i++) {
             const p1 = ring[i];
-            const p2 = ring[i+1];
-            const x1 = p1[0] * k * 69.172; // miles per degree lon
-            const y1 = p1[1] * 69.172; // miles per degree lat
-            const x2 = p2[0] * k * 69.172;
-            const y2 = p2[1] * 69.172;
+            const p2 = ring[(i + 1) % n]; // cyclic: last vertex wraps to the first, always closing the ring
+            // Translate relative to the first vertex before scaling to miles to avoid large-number cancellation.
+            const x1 = (p1[0] - lonRef) * k * 69.172; // miles per degree lon
+            const y1 = (p1[1] - latRef) * 69.172; // miles per degree lat
+            const x2 = (p2[0] - lonRef) * k * 69.172;
+            const y2 = (p2[1] - latRef) * 69.172;
             area += (x1 * y2 - x2 * y1);
         }
         totalArea += Math.abs(area) / 2;
@@ -12008,9 +12171,18 @@ const calculateGeometry = (item) => {
     if (['Shape', 'Assignment', 'Track', 'Route', 'Area', 'Sector', 'Buffer', 'Graphic', 'graphic'].includes(geom.type || props.class) && (item.vertices || props.vertices || item.pts || props.pts || item.coords || props.coords || item.coordinates || props.coordinates)) {
         const vertices = item.vertices || props.vertices || item.pts || props.pts || item.coords || props.coords || item.coordinates || props.coordinates;
         const isClosed = item.closed === true || props.closed === true || (isAssignment && (item.closed !== false && props.closed !== false));
+        let ring = vertices;
+        if (isClosed && Array.isArray(vertices) && vertices.length > 0) {
+            // Ensure a proper closed GeoJSON ring: repeat the first vertex at the end if not already closed.
+            const firstV = vertices[0];
+            const lastV = vertices[vertices.length - 1];
+            if (!lastV || firstV[0] !== lastV[0] || firstV[1] !== lastV[1]) {
+                ring = vertices.concat([firstV]);
+            }
+        }
         geom = {
             type: isClosed ? 'Polygon' : 'LineString',
-            coordinates: isClosed ? [vertices] : vertices
+            coordinates: isClosed ? [ring] : vertices
         };
     } else if (['Marker', 'Clue', 'Point'].includes(geom.type || props.class) && (item.position || props.position)) {
         geom = {
@@ -13532,7 +13704,7 @@ function buildUserAccountPage() {
                 <label style="display: block; margin-bottom: 8px; color: var(--text); font-weight: bold;">Theme Preference</label>
                 <div style="display: flex; gap: 10px;">
                     <button id="theme-dark-btn" class="mini-pill ${userToEdit.theme !== 'light' ? 'active' : ''}" style="flex: 1;">Dark Mode</button>
-                    <button id="theme-light-btn" class="mini-pill ${userToEdit.theme === 'light' ? 'active' : ''}" style="flex: 1;">Grey Mode</button>
+                    <button id="theme-light-btn" class="mini-pill ${userToEdit.theme === 'light' ? 'active' : ''}" style="flex: 1;">Light Mode</button>
                 </div>
             </div>
             <div class="form-group large">

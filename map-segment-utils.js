@@ -284,6 +284,38 @@
         if (!typeKey || typeKey === 'all') return items.slice();
         return items.filter(item => item.typeKey === typeKey);
     }
+
+    // Planar shoelace area for one or more lon/lat rings, returned in acres.
+    // Mirrors app.js `polygonArea`: robust to both closed (first vertex repeated
+    // at the end) and open rings, and translates coordinates relative to the
+    // ring's first vertex to avoid large-number floating-point cancellation.
+    function polygonAreaAcres(rings) {
+        if (!Array.isArray(rings)) return 0;
+        let totalArea = 0;
+        for (const ring of rings) {
+            if (!ring || ring.length < 3) continue;
+            const first = ring[0];
+            const last = ring[ring.length - 1];
+            const isClosed = first[0] === last[0] && first[1] === last[1];
+            const n = isClosed ? ring.length - 1 : ring.length;
+            if (n < 3) continue;
+            const lonRef = first[0];
+            const latRef = first[1];
+            const k = Math.cos(latRef * Math.PI / 180);
+            let area = 0;
+            for (let i = 0; i < n; i++) {
+                const p1 = ring[i];
+                const p2 = ring[(i + 1) % n];
+                const x1 = (p1[0] - lonRef) * k * 69.172;
+                const y1 = (p1[1] - latRef) * 69.172;
+                const x2 = (p2[0] - lonRef) * k * 69.172;
+                const y2 = (p2[1] - latRef) * 69.172;
+                area += (x1 * y2 - x2 * y1);
+            }
+            totalArea += Math.abs(area) / 2;
+        }
+        return totalArea * 640; // sq miles -> acres
+    }
     
     function ensureSegmentsPageRows(bundle, defaultSegmentsData) {
         if (!bundle.pages) bundle.pages = {};
@@ -305,6 +337,7 @@
         getFeaturePsrcColor,
         getFeaturePsrcAssignmentStyle,
         filterSegmentImportsByType,
+        polygonAreaAcres,
         ensureSegmentsPageRows
     };
 });

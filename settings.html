@@ -11,6 +11,7 @@
   <div class="site-shell">
     <header>
       <div class="nav-wrap">
+        <img class="header-logo" data-header-logo alt="Logo" style="display:none;">
         <div>
           <div class="brand">Search & Rescue Theory Software</div>
           <div class="file-badge">Case #: <span data-file-name>us-pill-data.json</span></div>
@@ -73,9 +74,23 @@
           </div>
 
           <div class="home-panel">
+            <h2>Application Logo</h2>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              Choose a logo to display in the header. The image is stored within your data file.
+            </p>
+            <div class="home-actions">
+              <label class="clear-btn upload-btn">
+                <span>Choose Image</span>
+                <input type="file" id="logo-image-input" accept="image/*">
+              </label>
+              <button class="clear-btn" id="reset-logo-btn" type="button">Remove Logo</button>
+            </div>
+          </div>
+
+          <div class="home-panel">
             <h2>Theme</h2>
             <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
-              Switch between Dark Mode and Grey Mode.
+              Switch between Dark Mode and Light Mode.
             </p>
             <div class="home-row">
               <label class="toggle-switch">
@@ -83,6 +98,16 @@
                 <span class="slider"></span>
               </label>
               <span id="theme-label">Dark Mode</span>
+            </div>
+            <p style="margin: 20px 0 15px; color: var(--muted); font-size: 0.95rem;">
+              When ON, the site's accent color uses your personal highlight color. When OFF, the default blue accent is used.
+            </p>
+            <div class="home-row">
+              <label class="toggle-switch">
+                <input type="checkbox" id="highlight-accent-toggle">
+                <span class="slider"></span>
+              </label>
+              <span id="highlight-accent-label">Use My Highlight Color is OFF</span>
             </div>
           </div>
 
