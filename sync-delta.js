@@ -58,7 +58,11 @@
         segmentColorScaleLowColor: 'settings_page',
         segmentColorScaleMidColor: 'settings_page',
         segmentColorScaleHighColor: 'settings_page',
-        segmentActiveSearchOpacityPercent: 'settings_page'
+        segmentActiveSearchOpacityPercent: 'settings_page',
+        segmentActiveSearchFillColor: 'settings_page',
+        segmentActiveSearchBorderOpacityPercent: 'settings_page',
+        segmentActiveSearchBorderColor: 'settings_page',
+        segmentActiveSearchBorderWidth: 'settings_page'
     };
 
     const isPlainObject = (value) => !!value && typeof value === 'object' && !Array.isArray(value);

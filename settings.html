@@ -178,13 +178,43 @@
                 <input id="segment-scale-high-color-input" type="color" value="#fa5252">
               </label>
             </div>
-            <div class="home-row" style="flex-wrap: wrap; gap: 12px; align-items: center;">
-              <label for="segment-search-opacity-input">Opacity of Segments Activly Being Searched</label>
-              <input class="pill-cell no-spinner-number-input" id="segment-search-opacity-input" inputmode="numeric"
-                     max="100"
-                     min="0" step="1" style="width: 90px; text-align: center;" type="number" value="50">
-              <span id="segment-search-opacity-label">%</span>
+            <h3 style="margin: 20px 0 5px;">Segments Actively Being Searched</h3>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              Segments that a team is currently searching are drawn with the fill and border below instead of their
+              PSRc gradient color. The opacities are absolute values, so they replace the segment's normal opacity.
+            </p>
+            <div class="home-row" style="flex-wrap: wrap; gap: 16px; align-items: flex-end;">
+              <label for="segment-search-opacity-input"
+                     style="display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem;">
+                <span>Fill Opacity (%)</span>
+                <input class="pill-cell no-spinner-number-input" id="segment-search-opacity-input" inputmode="numeric"
+                       max="100"
+                       min="0" step="1" style="width: 90px; text-align: center;" type="number" value="10">
+              </label>
+              <label style="display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem;">
+                <span>Fill Color</span>
+                <input id="segment-search-fill-color-input" type="color" value="#228be6">
+              </label>
+              <label for="segment-search-border-opacity-input"
+                     style="display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem;">
+                <span>Border Opacity (%)</span>
+                <input class="pill-cell no-spinner-number-input" id="segment-search-border-opacity-input"
+                       inputmode="numeric" max="100"
+                       min="0" step="1" style="width: 90px; text-align: center;" type="number" value="100">
+              </label>
+              <label style="display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem;">
+                <span>Border Color</span>
+                <input id="segment-search-border-color-input" type="color" value="#228be6">
+              </label>
+              <label for="segment-search-border-width-input"
+                     style="display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem;">
+                <span>Border Thickness (px)</span>
+                <input class="pill-cell no-spinner-number-input" id="segment-search-border-width-input"
+                       inputmode="decimal" max="20"
+                       min="0" step="0.5" style="width: 90px; text-align: center;" type="number" value="3">
+              </label>
             </div>
+            <div id="segment-search-opacity-label" style="margin-top: 10px; font-size: 0.85rem; color: var(--muted);"></div>
           </div>
 
           <div class="home-panel full-width">

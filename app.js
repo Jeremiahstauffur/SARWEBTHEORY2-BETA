@@ -100,11 +100,43 @@ function getSegmentDisplaySettings(bundle) {
             : stripped;
         return `#${expanded}`;
     };
-    const normalizeOpacity = value => {
-        const parsed = parseFloat(value);
-        return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : 50;
+    // Defaults for segments that are actively being searched: a light blue fill so the
+    // underlying map stays readable, and a fully opaque blue border that outlines it.
+    const ACTIVE_SEARCH_DEFAULTS = {
+        fillOpacityPercent: 10,
+        fillColor: '#228be6',
+        borderOpacityPercent: 100,
+        borderColor: '#228be6',
+        borderWidth: 3
     };
-    const activeSearchOpacityPercent = normalizeOpacity(bundle?.segmentActiveSearchOpacityPercent);
+    const normalizeOpacity = (value, fallback) => {
+        const parsed = parseFloat(value);
+        return Number.isFinite(parsed) ? Math.min(100, Math.max(0, parsed)) : fallback;
+    };
+    // Border thickness is expressed in pixels/points and is clamped to a range that
+    // stays usable on both the in-app map symbols and the CalTopo stroke-width.
+    const normalizeBorderWidth = (value, fallback) => {
+        const parsed = parseFloat(value);
+        if (!Number.isFinite(parsed)) return fallback;
+        return Math.min(20, Math.max(0, Math.round(parsed * 10) / 10));
+    };
+    const toRgbTriple = hex => {
+        const stripped = String(hex || '').replace(/^#/, '');
+        const full = stripped.length === 3
+            ? stripped.split('').map(char => char + char).join('')
+            : stripped;
+        return [
+            parseInt(full.slice(0, 2), 16) || 0,
+            parseInt(full.slice(2, 4), 16) || 0,
+            parseInt(full.slice(4, 6), 16) || 0
+        ];
+    };
+
+    const activeSearchOpacityPercent = normalizeOpacity(bundle?.segmentActiveSearchOpacityPercent, ACTIVE_SEARCH_DEFAULTS.fillOpacityPercent);
+    const activeSearchBorderOpacityPercent = normalizeOpacity(bundle?.segmentActiveSearchBorderOpacityPercent, ACTIVE_SEARCH_DEFAULTS.borderOpacityPercent);
+    const activeSearchFillColor = normalizeColor(bundle?.segmentActiveSearchFillColor, ACTIVE_SEARCH_DEFAULTS.fillColor);
+    const activeSearchBorderColor = normalizeColor(bundle?.segmentActiveSearchBorderColor, ACTIVE_SEARCH_DEFAULTS.borderColor);
+    const activeSearchBorderWidth = normalizeBorderWidth(bundle?.segmentActiveSearchBorderWidth, ACTIVE_SEARCH_DEFAULTS.borderWidth);
 
     return {
         usePsriMax: bundle?.segmentColorScaleUsePsriMax === true,
@@ -112,8 +144,23 @@ function getSegmentDisplaySettings(bundle) {
         midColor: normalizeColor(bundle?.segmentColorScaleMidColor, '#ffd43b'),
         highColor: normalizeColor(bundle?.segmentColorScaleHighColor, '#fa5252'),
         activeSearchOpacityPercent,
-        activeSearchOpacity: activeSearchOpacityPercent / 100
+        activeSearchOpacity: activeSearchOpacityPercent / 100,
+        activeSearchFillColor,
+        activeSearchFillRgb: toRgbTriple(activeSearchFillColor),
+        activeSearchBorderColor,
+        activeSearchBorderRgb: toRgbTriple(activeSearchBorderColor),
+        activeSearchBorderOpacityPercent,
+        activeSearchBorderOpacity: activeSearchBorderOpacityPercent / 100,
+        activeSearchBorderWidth
     };
+}
+
+// Returns the normalized display settings for either an already-normalized settings
+// object or a raw bundle, so callers can accept both shapes.
+function normalizeSegmentDisplaySettingsInput(settings) {
+    return (settings && typeof settings.activeSearchOpacity === 'number')
+        ? settings
+        : getSegmentDisplaySettings(settings);
 }
 
 function formatSegmentAssignmentLabel(region, segment) {
@@ -181,16 +228,69 @@ function resolveDisplayedSegmentOpacity(isActiveSearch, settings, baseOpacity = 
     // `settings` may already be a normalized display-settings object (with a numeric
     // activeSearchOpacity) or a raw bundle; use the normalized value directly when
     // present so the user's configured active-search opacity is honored.
-    const normalizedSettings = (settings && typeof settings.activeSearchOpacity === 'number')
-        ? settings
-        : getSegmentDisplaySettings(settings);
+    const normalizedSettings = normalizeSegmentDisplaySettingsInput(settings);
     // The active-search opacity setting is an ABSOLUTE reset: actively-searched
     // segments are drawn at exactly the configured opacity, regardless of the
     // segment's existing/base opacity.
     const activeSearchOpacity = Number.isFinite(normalizedSettings.activeSearchOpacity)
         ? normalizedSettings.activeSearchOpacity
-        : 0.5;
+        : 0.1;
     return Math.min(1, Math.max(0, activeSearchOpacity));
+}
+
+// Like resolveDisplayedSegmentOpacity, the active-search border opacity is an
+// ABSOLUTE reset applied only to segments that are actively being searched.
+function resolveDisplayedSegmentBorderOpacity(isActiveSearch, settings, baseOpacity = 1) {
+    const safeBaseOpacity = Number.isFinite(baseOpacity) ? Math.min(1, Math.max(0, baseOpacity)) : 1;
+    if (!isActiveSearch) {
+        return safeBaseOpacity;
+    }
+    const normalizedSettings = normalizeSegmentDisplaySettingsInput(settings);
+    const borderOpacity = Number.isFinite(normalizedSettings.activeSearchBorderOpacity)
+        ? normalizedSettings.activeSearchBorderOpacity
+        : 1;
+    return Math.min(1, Math.max(0, borderOpacity));
+}
+
+// Actively-searched segments override their computed (PSRc gradient) fill color with
+// the color configured in Settings; every other segment keeps `baseColor`.
+function resolveDisplayedSegmentFillColor(isActiveSearch, settings, baseColor) {
+    if (!isActiveSearch) {
+        return baseColor;
+    }
+    const normalizedSettings = normalizeSegmentDisplaySettingsInput(settings);
+    return normalizedSettings.activeSearchFillColor || baseColor;
+}
+
+function resolveDisplayedSegmentBorderColor(isActiveSearch, settings, baseColor) {
+    if (!isActiveSearch) {
+        return baseColor;
+    }
+    const normalizedSettings = normalizeSegmentDisplaySettingsInput(settings);
+    return normalizedSettings.activeSearchBorderColor || baseColor;
+}
+
+function resolveDisplayedSegmentBorderWidth(isActiveSearch, settings, baseWidth) {
+    if (!isActiveSearch) {
+        return baseWidth;
+    }
+    const normalizedSettings = normalizeSegmentDisplaySettingsInput(settings);
+    return Number.isFinite(normalizedSettings.activeSearchBorderWidth)
+        ? normalizedSettings.activeSearchBorderWidth
+        : baseWidth;
+}
+
+// Returns the [r, g, b] triple an actively-searched segment should use, falling back
+// to `baseRgb` for segments that are not actively being searched.
+function resolveDisplayedSegmentRgb(isActiveSearch, settings, baseRgb, kind) {
+    if (!isActiveSearch) {
+        return baseRgb;
+    }
+    const normalizedSettings = normalizeSegmentDisplaySettingsInput(settings);
+    const override = kind === 'border'
+        ? normalizedSettings.activeSearchBorderRgb
+        : normalizedSettings.activeSearchFillRgb;
+    return Array.isArray(override) && override.length === 3 ? override : baseRgb;
 }
 
 function buildSegmentNameSet(rows) {
@@ -262,7 +362,8 @@ function captureCalTopoFeatureStyle(attributes = {}) {
         fill: Object.prototype.hasOwnProperty.call(attributes, 'fill') ? attributes.fill : null,
         'fill-opacity': Object.prototype.hasOwnProperty.call(attributes, 'fill-opacity') ? attributes['fill-opacity'] : null,
         opacity: Object.prototype.hasOwnProperty.call(attributes, 'opacity') ? attributes.opacity : null,
-        'stroke-opacity': Object.prototype.hasOwnProperty.call(attributes, 'stroke-opacity') ? attributes['stroke-opacity'] : null
+        'stroke-opacity': Object.prototype.hasOwnProperty.call(attributes, 'stroke-opacity') ? attributes['stroke-opacity'] : null,
+        'stroke-width': Object.prototype.hasOwnProperty.call(attributes, 'stroke-width') ? attributes['stroke-width'] : null
     };
 }
 
@@ -276,7 +377,7 @@ function applyCapturedCalTopoFeatureStyle(attributes, style = {}) {
     if (typeof utils.applyCapturedCalTopoFeatureStyle === 'function') {
         return utils.applyCapturedCalTopoFeatureStyle(attributes, style);
     }
-    ['color', 'stroke', 'fill', 'fill-opacity', 'opacity', 'stroke-opacity'].forEach(key => {
+    ['color', 'stroke', 'fill', 'fill-opacity', 'opacity', 'stroke-opacity', 'stroke-width'].forEach(key => {
         if (!Object.prototype.hasOwnProperty.call(style, key)) {
             return;
         }
@@ -399,22 +500,31 @@ function buildCalTopoFeatureUpdatePayload(feature, styleOverrides = {}) {
 }
 
 // Builds the CalTopo style overlay for an assignment shape.
-// Invariant: the border/outline opacity is CONSTANT (fully opaque) so that only the
-// FILL communicates status. The fill opacity is the only thing that reacts to the
-// active-search state: non-searched segments use the overlay base opacity, while
-// actively-searched segments reset to the opacity configured in Settings.
+// Segments that are NOT actively being searched keep the PSRc gradient color, a base
+// fill opacity, and a fully opaque border. Actively-searched segments override the
+// fill color/opacity, border color/opacity, and border thickness with the values
+// configured on the Settings page.
 function buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings) {
     const STROKE_OVERLAY_OPACITY = 1;
     const fillOpacity = Number(resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, 0.42).toFixed(4));
-    const strokeOpacity = STROKE_OVERLAY_OPACITY;
-    return {
-        color: overlayColor,
-        stroke: overlayColor,
-        fill: overlayColor,
+    const strokeOpacity = Number(resolveDisplayedSegmentBorderOpacity(isActiveSearch, segmentDisplaySettings, STROKE_OVERLAY_OPACITY).toFixed(4));
+    const fillColor = resolveDisplayedSegmentFillColor(isActiveSearch, segmentDisplaySettings, overlayColor);
+    const borderColor = resolveDisplayedSegmentBorderColor(isActiveSearch, segmentDisplaySettings, overlayColor);
+    const borderWidth = resolveDisplayedSegmentBorderWidth(isActiveSearch, segmentDisplaySettings, null);
+    const style = {
+        color: borderColor,
+        stroke: borderColor,
+        fill: fillColor,
         'fill-opacity': fillOpacity,
         opacity: strokeOpacity,
         'stroke-opacity': strokeOpacity
     };
+    // Only send a stroke-width when the user's active-search thickness applies, so
+    // resting segments keep whatever border thickness they already had in CalTopo.
+    if (Number.isFinite(borderWidth)) {
+        style['stroke-width'] = borderWidth;
+    }
+    return style;
 }
 
 async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
@@ -1977,7 +2087,11 @@ function defaultBundle() {
       segmentColorScaleLowColor: '#40c057',
       segmentColorScaleMidColor: '#ffd43b',
       segmentColorScaleHighColor: '#fa5252',
-      segmentActiveSearchOpacityPercent: 50,
+      segmentActiveSearchOpacityPercent: 10,
+      segmentActiveSearchFillColor: '#228be6',
+      segmentActiveSearchBorderOpacityPercent: 100,
+      segmentActiveSearchBorderColor: '#228be6',
+      segmentActiveSearchBorderWidth: 3,
     background: 'assets/us-night.jpg',
     activityLog: [],
     currentAssignments: {},
@@ -2160,6 +2274,10 @@ function sanitizeBundle(bundle) {
   const segmentColorScaleMidColor = segmentDisplaySettings.midColor;
   const segmentColorScaleHighColor = segmentDisplaySettings.highColor;
   const segmentActiveSearchOpacityPercent = segmentDisplaySettings.activeSearchOpacityPercent;
+  const segmentActiveSearchFillColor = segmentDisplaySettings.activeSearchFillColor;
+  const segmentActiveSearchBorderOpacityPercent = segmentDisplaySettings.activeSearchBorderOpacityPercent;
+  const segmentActiveSearchBorderColor = segmentDisplaySettings.activeSearchBorderColor;
+  const segmentActiveSearchBorderWidth = segmentDisplaySettings.activeSearchBorderWidth;
   const theme = bundle.theme || 'dark';
   const lastModified = bundle.lastModified || new Date().toISOString();
   const forms = bundle.forms || {};
@@ -2277,6 +2395,10 @@ function sanitizeBundle(bundle) {
     segmentColorScaleMidColor,
     segmentColorScaleHighColor,
     segmentActiveSearchOpacityPercent,
+    segmentActiveSearchFillColor,
+    segmentActiveSearchBorderOpacityPercent,
+    segmentActiveSearchBorderColor,
+    segmentActiveSearchBorderWidth,
     pages, 
     forms, 
     profile, 
@@ -8568,6 +8690,10 @@ function buildSettingsPage() {
     const segmentScaleHighColorInput = document.getElementById('segment-scale-high-color-input');
     const segmentSearchOpacityInput = document.getElementById('segment-search-opacity-input');
     const segmentSearchOpacityLabel = document.getElementById('segment-search-opacity-label');
+    const segmentSearchFillColorInput = document.getElementById('segment-search-fill-color-input');
+    const segmentSearchBorderOpacityInput = document.getElementById('segment-search-border-opacity-input');
+    const segmentSearchBorderColorInput = document.getElementById('segment-search-border-color-input');
+    const segmentSearchBorderWidthInput = document.getElementById('segment-search-border-width-input');
   const status = document.getElementById('settings-status');
   const bgInput = document.getElementById('bg-image-input');
   const resetBgBtn = document.getElementById('reset-bg-btn');
@@ -8582,9 +8708,27 @@ function buildSettingsPage() {
             : 'Scale max uses highest PSRc';
     };
 
-    const updateSegmentSearchOpacityLabel = () => {
+    const updateSegmentSearchOpacityLabel = settings => {
         if (!segmentSearchOpacityLabel) return;
-        segmentSearchOpacityLabel.textContent = '%';
+        const active = settings || getSegmentDisplaySettings(loadBundle());
+        segmentSearchOpacityLabel.textContent = `Actively searched segments: ${active.activeSearchOpacityPercent}% ${active.activeSearchFillColor} fill, `
+            + `${active.activeSearchBorderOpacityPercent}% ${active.activeSearchBorderColor} border at ${active.activeSearchBorderWidth}px.`;
+    };
+
+    // Applies one active-search display input to the bundle, normalizing the value so
+    // the input always reflects what was actually stored.
+    const bindSegmentSearchInput = (input, bundleKey, settingsKey, message, eventName = 'onchange') => {
+        if (!input) return;
+        input.value = segmentDisplaySettings[settingsKey];
+        input[eventName] = () => {
+            const nextBundle = loadBundle();
+            const nextSettings = getSegmentDisplaySettings({...nextBundle, [bundleKey]: input.value});
+            nextBundle[bundleKey] = nextSettings[settingsKey];
+            input.value = nextSettings[settingsKey];
+            saveBundle(nextBundle);
+            updateSegmentSearchOpacityLabel(nextSettings);
+            status.textContent = message;
+        };
     };
 
     if (segmentScaleMaxToggle) {
@@ -8614,22 +8758,17 @@ function buildSettingsPage() {
         };
     });
 
-    if (segmentSearchOpacityInput) {
-        segmentSearchOpacityInput.value = segmentDisplaySettings.activeSearchOpacityPercent;
-        updateSegmentSearchOpacityLabel(segmentDisplaySettings);
-        segmentSearchOpacityInput.onchange = () => {
-            const nextBundle = loadBundle();
-            const nextSettings = getSegmentDisplaySettings({
-                ...nextBundle,
-                segmentActiveSearchOpacityPercent: segmentSearchOpacityInput.value
-            });
-            nextBundle.segmentActiveSearchOpacityPercent = nextSettings.activeSearchOpacityPercent;
-            segmentSearchOpacityInput.value = nextSettings.activeSearchOpacityPercent;
-            saveBundle(nextBundle);
-            updateSegmentSearchOpacityLabel(nextSettings);
-            status.textContent = 'Active-search segment opacity updated.';
-        };
-    }
+    updateSegmentSearchOpacityLabel(segmentDisplaySettings);
+    bindSegmentSearchInput(segmentSearchOpacityInput, 'segmentActiveSearchOpacityPercent',
+        'activeSearchOpacityPercent', 'Active-search segment fill opacity updated.');
+    bindSegmentSearchInput(segmentSearchFillColorInput, 'segmentActiveSearchFillColor',
+        'activeSearchFillColor', 'Active-search segment fill color updated.', 'oninput');
+    bindSegmentSearchInput(segmentSearchBorderOpacityInput, 'segmentActiveSearchBorderOpacityPercent',
+        'activeSearchBorderOpacityPercent', 'Active-search segment border opacity updated.');
+    bindSegmentSearchInput(segmentSearchBorderColorInput, 'segmentActiveSearchBorderColor',
+        'activeSearchBorderColor', 'Active-search segment border color updated.', 'oninput');
+    bindSegmentSearchInput(segmentSearchBorderWidthInput, 'segmentActiveSearchBorderWidth',
+        'activeSearchBorderWidth', 'Active-search segment border thickness updated.');
 
   toggle.checked = !!bundle.deleteMode;
   label.textContent = `Delete Mode is ${toggle.checked ? 'ON' : 'OFF'}`;
@@ -13581,28 +13720,35 @@ function renderArcGISMap() {
 
         const overlayColor = usePsrcOverlay ? getFeaturePsrcColor(f, psrcLookup, segmentDisplaySettings) : null;
         const isActiveSearch = isFeatureActivelyBeingSearched(f, activeSearchNames);
-        // The area border/outline opacity stays CONSTANT so that only the fill
-        // communicates active-search status. `strokeOpacity` remains responsive for
-        // line/marker features (which have no fill), where the stroke is the primary
-        // visual; `borderOpacity` is the constant value used for area outlines.
+        // For segments that are NOT actively being searched the border/outline opacity
+        // stays CONSTANT so that only the fill communicates status. Actively-searched
+        // segments instead use the fill color/opacity, border color/opacity and border
+        // thickness configured on the Settings page.
+        // `strokeOpacity` drives line/marker features (which have no fill), where the
+        // stroke is the primary visual; `borderOpacity` is used for area outlines.
         const strokeOpacity = resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, overlayColor ? 1 : 0.2);
-        const borderOpacity = overlayColor ? 1 : 0.2;
+        const borderOpacity = resolveDisplayedSegmentBorderOpacity(isActiveSearch, segmentDisplaySettings, overlayColor ? 1 : 0.2);
         const fillOpacity = resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, overlayColor ? 0.42 : 0.4);
-        const overlayRgb = overlayColor ? [...overlayColor.rgb, strokeOpacity] : [64, 192, 87, strokeOpacity];
-        const overlayBorderRgb = overlayColor ? [...overlayColor.rgb, borderOpacity] : [64, 192, 87, borderOpacity];
-        const overlayFillRgb = overlayColor ? [...overlayColor.rgb, fillOpacity] : [64, 192, 87, fillOpacity];
+        const baseRgb = overlayColor ? overlayColor.rgb : [64, 192, 87];
+        const fillRgb = resolveDisplayedSegmentRgb(isActiveSearch, segmentDisplaySettings, baseRgb, 'fill');
+        const borderRgb = resolveDisplayedSegmentRgb(isActiveSearch, segmentDisplaySettings, baseRgb, 'border');
+        const overlayRgb = [...borderRgb, strokeOpacity];
+        const overlayBorderRgb = [...borderRgb, borderOpacity];
+        const overlayFillRgb = [...fillRgb, fillOpacity];
+        const areaBorderWidth = resolveDisplayedSegmentBorderWidth(isActiveSearch, segmentDisplaySettings, overlayColor ? 3 : 2);
+        const lineWidth = resolveDisplayedSegmentBorderWidth(isActiveSearch, segmentDisplaySettings, overlayColor ? 4 : 3);
 
       let symbol = {
         type: "simple-fill",
           color: overlayFillRgb,
-          outline: {color: overlayBorderRgb, width: overlayColor ? 3 : 2}
+          outline: {color: overlayBorderRgb, width: areaBorderWidth}
       };
 
       if (arcgisGeom.type === 'polyline') {
         symbol = {
           type: "simple-line",
             color: overlayRgb,
-            width: overlayColor ? 4 : 3
+            width: lineWidth
         };
       } else if (arcgisGeom.type === 'point') {
         symbol = {

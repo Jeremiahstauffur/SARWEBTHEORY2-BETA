@@ -52,12 +52,13 @@
             fill: Object.prototype.hasOwnProperty.call(attributes, 'fill') ? attributes.fill : null,
             'fill-opacity': Object.prototype.hasOwnProperty.call(attributes, 'fill-opacity') ? attributes['fill-opacity'] : null,
             opacity: Object.prototype.hasOwnProperty.call(attributes, 'opacity') ? attributes.opacity : null,
-            'stroke-opacity': Object.prototype.hasOwnProperty.call(attributes, 'stroke-opacity') ? attributes['stroke-opacity'] : null
+            'stroke-opacity': Object.prototype.hasOwnProperty.call(attributes, 'stroke-opacity') ? attributes['stroke-opacity'] : null,
+            'stroke-width': Object.prototype.hasOwnProperty.call(attributes, 'stroke-width') ? attributes['stroke-width'] : null
         };
     }
 
     function applyCapturedCalTopoFeatureStyle(attributes, style = {}) {
-        ['color', 'stroke', 'fill', 'fill-opacity', 'opacity', 'stroke-opacity'].forEach(key => {
+        ['color', 'stroke', 'fill', 'fill-opacity', 'opacity', 'stroke-opacity', 'stroke-width'].forEach(key => {
             if (!Object.prototype.hasOwnProperty.call(style, key)) {
                 return;
             }

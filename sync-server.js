@@ -481,6 +481,10 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
                 segmentColorScaleMidColor: bundle.segmentColorScaleMidColor,
                 segmentColorScaleHighColor: bundle.segmentColorScaleHighColor,
                 segmentActiveSearchOpacityPercent: bundle.segmentActiveSearchOpacityPercent,
+                segmentActiveSearchFillColor: bundle.segmentActiveSearchFillColor,
+                segmentActiveSearchBorderOpacityPercent: bundle.segmentActiveSearchBorderOpacityPercent,
+                segmentActiveSearchBorderColor: bundle.segmentActiveSearchBorderColor,
+                segmentActiveSearchBorderWidth: bundle.segmentActiveSearchBorderWidth,
                 parCheckFrequency: bundle.parCheckFrequency
             }
         }
