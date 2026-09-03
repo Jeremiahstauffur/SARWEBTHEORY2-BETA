@@ -2105,6 +2105,7 @@ function defaultBundle() {
     forms: {},
     uploads: [],
     maps: [],
+    permanentPersonnel: {},
     accounts: [
       { username: 'Super Admin', pin: '1976', color: 'none', handle: 'Super-Admin', isFileManager: true, theme: 'dark', visiblePages: ['index', 'page2', 'page3', 'page4', 'page5', 'page6', 'page7', 'settings', 'home', 'page8', 'page9', 'page10'] }
     ],
@@ -2234,6 +2235,13 @@ function sanitizeBundle(bundle) {
 
   const arrivedTeams = Array.isArray(bundle.arrivedTeams) ? bundle.arrivedTeams : [];
   const dismissedNotifications = Array.isArray(bundle.dismissedNotifications) ? bundle.dismissedNotifications : [];
+
+  // The GPS / Radio / Medic flags of every member live here (see
+  // splitPersonnelData). This key used to be dropped by the sanitizer, which
+  // silently threw those three toggles away on every save, so it must be kept.
+  const permanentPersonnel = (bundle.permanentPersonnel && typeof bundle.permanentPersonnel === 'object' && !Array.isArray(bundle.permanentPersonnel))
+    ? bundle.permanentPersonnel
+    : {};
 
   const pages = {};
   for (const page of PAGE_DEFS) {
@@ -2404,6 +2412,7 @@ function sanitizeBundle(bundle) {
     profile, 
     uploads, 
     maps,
+    permanentPersonnel,
     accounts: syncedAccounts 
   };
 }
@@ -2593,19 +2602,26 @@ function confirmDeleteRow(rowElement, onConfirm) {
 
 const PERMANENT_PERSONNEL_KEY = 'permanent_personnel_global';
 
-function getPermanentPersonnel() {
-    const bundle = loadBundle();
-    return bundle.permanentPersonnel || {};
+// `bundle` is optional. When a caller already holds the bundle it is about to
+// save, it must pass it in: reading/writing through a second loadBundle() would
+// otherwise let the caller's older copy overwrite the roles that were just set.
+function getPermanentPersonnel(bundle) {
+    const source = bundle || loadBundle();
+    return source.permanentPersonnel || {};
 }
 
-function setPermanentPersonnel(data) {
-    const bundle = loadBundle();
-    bundle.permanentPersonnel = data;
-    saveBundle(bundle);
+function setPermanentPersonnel(data, bundle) {
+    if (bundle) {
+        bundle.permanentPersonnel = data;
+        return;
+    }
+    const loaded = loadBundle();
+    loaded.permanentPersonnel = data;
+    saveBundle(loaded);
 }
 
-function syncPersonnelData(fileData) {
-  const global = getPermanentPersonnel();
+function syncPersonnelData(fileData, bundle) {
+  const global = getPermanentPersonnel(bundle);
   const merged = [];
   const processedNames = new Set();
 
@@ -2623,9 +2639,12 @@ function syncPersonnelData(fileData) {
       // Ensure it has enough columns if it came from an older file
       while (mergedRow.length < 14) mergedRow.push('');
       
-      mergedRow[3] = global[name].gps || row[3] || '';
-      mergedRow[4] = global[name].radio || row[4] || '';
-      mergedRow[5] = global[name].medic || row[5] || '';
+      // The row wins over the local global map: the row is what travels between
+      // devices, so a role another device just turned on/off must not be
+      // reverted by this device's older cached copy.
+      mergedRow[3] = row[3] || global[name].gps || '';
+      mergedRow[4] = row[4] || global[name].radio || '';
+      mergedRow[5] = row[5] || global[name].medic || '';
       merged.push(mergedRow);
     } else {
       global[name] = {
@@ -2652,12 +2671,12 @@ function syncPersonnelData(fileData) {
     }
   }
 
-  setPermanentPersonnel(global);
+  setPermanentPersonnel(global, bundle);
   return merged;
 }
 
-function splitPersonnelData(mergedData) {
-  const global = getPermanentPersonnel();
+function splitPersonnelData(mergedData, bundle) {
+  const global = getPermanentPersonnel(bundle);
   const filePart = [];
 
   mergedData.forEach(row => {
@@ -2673,14 +2692,14 @@ function splitPersonnelData(mergedData) {
       medic: row[5] || ''
     };
 
-    const rowForFile = [...row];
-    rowForFile[3] = ''; // GPS is stored globally
-    rowForFile[4] = ''; // Radio is stored globally
-    rowForFile[5] = ''; // Medic is stored globally
-    filePart.push(rowForFile);
+    // The GPS / Radio / Medic values are ALSO kept in the personnel row itself.
+    // They used to be blanked here because they were considered "global only",
+    // but the row is what actually reaches the server (one synced row per
+    // member), so clearing them meant the three toggles never left the device.
+    filePart.push([...row]);
   });
 
-  setPermanentPersonnel(global);
+  setPermanentPersonnel(global, bundle);
   return filePart;
 }
 
@@ -2688,12 +2707,12 @@ function loadData() {
   const bundle = loadBundle();
   const key = pageKey();
   if (bundle.pages[key]) {
-    if (key === 'page3') return syncPersonnelData(bundle.pages[key]);
+    if (key === 'page3') return syncPersonnelData(bundle.pages[key], bundle);
     return bundle.pages[key];
   }
   if (isRegionsPage()) return defaultRegionsData();
   if (isSegmentsPage()) return defaultSegmentsData();
-  if (isPersonnelPage()) return syncPersonnelData(defaultPersonnelData());
+  if (isPersonnelPage()) return syncPersonnelData(defaultPersonnelData(), bundle);
   if (isSearchLogPage()) return defaultSearchLogData();
   return defaultData();
 }
@@ -2702,7 +2721,7 @@ function saveCurrentPageData(data) {
   const bundle = loadBundle();
   const key = pageKey();
   if (key === 'page3') {
-    bundle.pages[key] = splitPersonnelData(data);
+    bundle.pages[key] = splitPersonnelData(data, bundle);
   } else {
     bundle.pages[key] = data;
   }
@@ -4242,23 +4261,6 @@ function buildPersonnelAllMembersTable() {
         cell.spellcheck = false;
         cell.textContent = filteredData[r][c] || '';
         
-        const nameClick = document.createElement('div');
-        nameClick.style.position = 'absolute';
-        nameClick.style.right = '8px';
-        nameClick.style.top = '50%';
-        nameClick.style.transform = 'translateY(-50%)';
-        nameClick.style.opacity = '0.5';
-        nameClick.style.cursor = 'pointer';
-        nameClick.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 3h6a4 4 0 0 1 4 4v14a3 3 0 0 0-3-3H2z"></path><path d="M22 3h-6a4 4 0 0 0-4 4v14a3 3 0 0 1 3-3h7z"></path></svg>';
-        nameClick.title = 'View Incident Times';
-        nameClick.onclick = (e) => {
-            e.stopPropagation();
-            currentMemberReportSelection = filteredData[r][c];
-            currentPersonnelSubpage = 'member-reports';
-            buildPersonnelTable();
-        };
-        cellContainer.appendChild(nameClick);
-
         cell.addEventListener('blur', () => {
           const newName = cell.textContent.trim();
           if (data[originalRowIndex][c] !== newName) {
