@@ -3191,6 +3191,86 @@ function deleteFileFromList(fileName) {
     // No longer push to server immediately to prevent race conditions during sync.
 }
 
+// Import a case (.json) file exported from the Saved Cases table.
+//
+// The whole file goes to the server in ONE request (PUT .../bundle?import=1) as
+// this login's copy of the CASE #: the bucket is "<CASE #>_<username>" (see
+// getSyncBucket / caseNumberToBucket) and the server rewrites the structured
+// tables for (username, CASE #) from it before answering. Nothing is diffed or
+// merged with the case that happens to be open, and the file is authoritative
+// over any copy the server already holds, so a re-import restores every row of
+// a backup. Only once the server confirmed the import does this device switch
+// to the case: the local copy is then exactly the server's, so nothing is
+// queued and the poll cursor is current. Resolves to the clean CASE #; throws
+// with a user-facing message when nothing was imported (nothing changes then).
+async function importCaseFromJson(text) {
+    let imported;
+    try {
+        imported = JSON.parse(text);
+    } catch (e) {
+        throw new Error('This file is not a valid JSON case file.');
+    }
+    if (!imported || typeof imported !== 'object' || Array.isArray(imported)
+        || !imported.pages || typeof imported.pages !== 'object'
+        || typeof imported.fileName !== 'string' || !imported.fileName.trim()) {
+        throw new Error('Invalid case file format. Missing pages or case number.');
+    }
+
+    // The CASE # is the file name carried inside the case, minus any ".json"
+    // suffix; the bucket id is that CASE # in URL-safe form (same rule as the
+    // case-number popup), and the login is appended by caseNumberToBucket().
+    const caseNumber = imported.fileName.trim().replace(/\.json$/i, '');
+    const bucketId = caseNumber.replace(/[^a-zA-Z0-9_-]/g, '_');
+    if (!bucketId) throw new Error('The case file has no usable case number.');
+    const bucket = caseNumberToBucket(bucketId);
+
+    const serverUrl = getSyncServerUrl();
+    if (!serverUrl || !getUserCredentials()) {
+        throw new Error('Log in and connect to the sync server before importing a case.');
+    }
+
+    const bundle = sanitizeBundle({...imported, fileName: caseNumber});
+    // Bookkeeping of the server the file came from; ours stamps it afresh.
+    delete bundle._sectionUpdatedAt;
+    logCreation('Imported Case #', caseNumber, bundle);
+    bundle.lastModified = new Date().toISOString();
+
+    let resp;
+    try {
+        resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/bundle?import=1`, {
+            method: 'PUT',
+            headers: getAuthHeaders(),
+            body: JSON.stringify(bundle)
+        });
+    } catch (e) {
+        throw new Error('Could not reach the server to import this case. Please try again when online.');
+    }
+    if (!resp.ok) {
+        let message = `The server refused the import (HTTP ${resp.status}).`;
+        try {
+            const body = await resp.json();
+            if (body && (body.message || body.error)) message = body.message || body.error;
+        } catch (e) {}
+        throw new Error(message);
+    }
+    const result = await resp.json().catch(() => ({}));
+    if (result && typeof result.lastModified === 'string' && result.lastModified) {
+        bundle.lastModified = result.lastModified;
+    }
+
+    // The server holds the whole case: make it the active case on this device.
+    await setSyncBucket(bucketId);
+    removeOutboxRecordsForBucket(getSyncBucket());
+    setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(bundle));
+    tagLocalBundleBucket();
+    writeOutboxRecord(bundle, {cursor: bundle.lastModified, changes: [], inFlight: null, needsFullUpload: false});
+    const files = getSavedFiles();
+    files[caseNumber] = {bundle, lastModified: bundle.lastModified};
+    setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
+    updateFileNameDisplay();
+    return caseNumber;
+}
+
 // Permanently delete a whole case everywhere it lives. The server side (store
 // rows, case history, and structured tables) is removed via DELETE
 // /api/v1/:bucket, then the local cache is dropped. This keys off the CASE #
@@ -9223,22 +9303,15 @@ function buildHomePage() {
       if (!file) return;
       const reader = new FileReader();
       reader.onload = async (event) => {
+        // The whole case is written to the database (tied to this login and
+        // the file's CASE #) and only then made the active case; the reload
+        // waits for that so nothing is aborted half-way. See importCaseFromJson.
+        importBtn.disabled = true;
         try {
-          const importedBundle = JSON.parse(event.target.result);
-          if (!importedBundle.pages || !importedBundle.fileName) {
-              alert('Invalid case file format. Missing pages or case number.');
-              return;
-          }
-          logCreation('Imported Case #', importedBundle.fileName, importedBundle);
-          
-          // Set the internal bucket for the imported CASE #.
-          const newBucket = importedBundle.fileName.replace('.json', '').replace(/[^a-zA-Z0-9_-]/g, '_');
-          // Await the server writes before reloading; otherwise the reload aborts
-          // the in-flight case-number PUT and bundle push and the import is lost.
-          await setSyncBucket(newBucket);
-          await saveBundle(importedBundle);
+          await importCaseFromJson(event.target.result);
           window.location.reload();
         } catch (err) {
+          importBtn.disabled = false;
           alert('Error importing file: ' + err.message);
         }
       };

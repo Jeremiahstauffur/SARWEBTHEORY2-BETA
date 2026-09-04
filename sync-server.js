@@ -1302,14 +1302,23 @@ app.delete('/api/v1/:bucket', authMiddleware, async (req, res) => {
 // only used to seed a CASE # the database has never seen (?seed=1), so it runs
 // under the same per-case lock as the row writes and refuses to replace a file
 // that already exists - two devices seeding at once cannot wipe each other out.
-// Without ?seed=1 it still accepts a whole file (imports, older clients), but
-// the stored copy is stamped with server time so state polls stay consistent.
+// Without ?seed=1 it still accepts a whole file (older clients), but the
+// stored copy is stamped with server time so state polls stay consistent.
+//
+// ?import=1 is the home page's "Import" of a case (.json) file. The file the
+// user picked is authoritative: it replaces whatever this login already has
+// under the CASE # (the file is usually an older backup, so the "older than
+// server data" rule must not apply), and the structured tables for
+// (username, CASE #) are rewritten from it BEFORE the answer goes out, so the
+// whole case exists in the database - one row per region/segment/person -
+// the moment the client reloads.
 const putActiveBundle = async (req, res) => {
     const {bucket} = req.params;
     const userName = req.user.username || 'Unknown';
     const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
     const isSuperAdmin = userPin === '1976';
     const seedOnly = String(req.query.seed || '') === '1';
+    const isImport = String(req.query.import || '') === '1';
     const incoming = req.body;
 
     if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
@@ -1339,10 +1348,11 @@ const putActiveBundle = async (req, res) => {
                     };
                 }
                 // Legacy whole-file clients: never let an older copy replace a
-                // newer one (they reconcile and retry on this answer).
+                // newer one (they reconcile and retry on this answer). An import
+                // is exempt: the user explicitly chose the file to restore.
                 const incomingMs = new Date(req.headers['x-last-modified'] || incoming.lastModified || Date.now()).getTime();
                 const storedMs = new Date(stored.bundle.lastModified || 0).getTime();
-                if ((stored.userPin === '1976') === isSuperAdmin && Number.isFinite(incomingMs) && incomingMs < storedMs) {
+                if (!isImport && (stored.userPin === '1976') === isSuperAdmin && Number.isFinite(incomingMs) && incomingMs < storedMs) {
                     return {
                         status: 403,
                         body: {error: 'Conflict', message: 'Incoming data is older than server data.'}
@@ -1351,11 +1361,23 @@ const putActiveBundle = async (req, res) => {
             }
 
             const bundle = JSON.parse(JSON.stringify(incoming));
+            // Server-side bookkeeping from the exporting server must not travel
+            // with an imported file; the stamps below describe THIS copy.
+            if (isImport) { delete bundle._sectionUpdatedAt; }
             const nowIso = nextLastModified(stored ? stored.bundle.lastModified : null);
             bundle.lastModified = nowIso;
             syncDelta.stampSections(bundle, null, nowIso);
 
             await writeStoredBundle(bucket, userName, userPin, bundle, nowIso);
+            if (isImport) {
+                // The import is only reported as done once every table holds
+                // the imported rows for (username, CASE #).
+                await decomposeBundleToTables(userName, STORE_BUNDLE_KEY, bundle);
+                // A retried row batch from before the import must not be
+                // mistaken for one already applied to the new copy.
+                recentBatchIds.delete(bucket);
+                return {status: 200, body: {success: true, imported: true, lastModified: nowIso}};
+            }
             decomposeBundleToTables(userName, STORE_BUNDLE_KEY, bundle)
                 .catch((decomposeErr) => console.error('[DB] decompose error:', decomposeErr.message));
 
