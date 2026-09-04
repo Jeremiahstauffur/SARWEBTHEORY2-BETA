@@ -3,9 +3,13 @@
 //   - the hidden unwanted list and the automatic-check toggle survive a save,
 //   - an import started from Fetch Shapes marks everything left out as unwanted,
 //   - "Import Selected" below the map imports the checked shapes and marks the
-//     unchecked ones unwanted,
+//     unchecked ones unwanted (with nothing checked it marks everything),
 //   - the check re-fetches the map, notifies about unaccounted segments by name
 //     and the notification opens the Maps page,
+//   - every unimported CalTopo Assignment gets its own "New Assignment"
+//     notification with Import / Decline-for-now buttons,
+//   - the feature-type toggles below the map hide (mark unwanted) whole types
+//     and restore them when switched back on,
 //   - the Settings toggle stops the automatic check.
 //
 // Run with: node test_map_unaccounted_app.js
@@ -50,9 +54,14 @@ function makeElement(depth = 0) {
         after() {},
         focus() {},
         scrollIntoView() {},
-        textContent: '',
-        innerHTML: ''
+        textContent: ''
     };
+    // Like the real DOM, assigning innerHTML throws away the appended children.
+    let html = '';
+    Object.defineProperty(el, 'innerHTML', {
+        get: () => html,
+        set: (value) => { html = String(value); el.children = []; }
+    });
     Object.defineProperty(el, 'parentElement', {
         get: () => (depth >= 3 ? null : (el._parent = el._parent || makeElement(depth + 1)))
     });
@@ -169,8 +178,26 @@ const storedFeature = (name, id) => ({
     geometry: {type: 'Polygon', coordinates: [[[-93.1, 44.9], [-93.0, 44.95], [-93.05, 45.0], [-93.1, 44.9]]]},
     attributes: {name, id, class: 'Assignment', ObjectID: 1}
 });
+const storedShape = (name, id) => ({
+    geometry: {type: 'Polygon', coordinates: [[[-93.1, 44.9], [-93.0, 44.95], [-93.05, 45.0], [-93.1, 44.9]]]},
+    attributes: {name, id, class: 'Shape', ObjectID: 1}
+});
+const storedMarker = (name, id) => ({
+    geometry: {type: 'Point', coordinates: [-93.1, 44.9]},
+    attributes: {name, id, class: 'Marker', ObjectID: 1}
+});
+const storedRoute = (name, id) => ({
+    geometry: {type: 'LineString', coordinates: [[-93.1, 44.9], [-93.0, 44.95]]},
+    attributes: {name, id, class: 'Shape', ObjectID: 1}
+});
+const calTopoMarker = (name, id) => ({
+    type: 'Feature',
+    id,
+    geometry: {type: 'Point', coordinates: [-93.1, 44.9]},
+    properties: {title: name, class: 'Marker'}
+});
 
-function seedStore({features = [], segments = [], unwanted = [], autoCheck} = {}) {
+function seedStore({features = [], segments = [], unwanted = [], autoCheck, typeFilters} = {}) {
     const store = {};
     store[SETTINGS_CACHE_KEY] = JSON.stringify({'sar-sync-bucket-v1': CASE});
     const scratch = createSandbox({store, fetch: async () => { throw new Error('offline'); }});
@@ -180,6 +207,7 @@ function seedStore({features = [], segments = [], unwanted = [], autoCheck} = {}
     bundle.maps = [{id: 'MAP1', name: 'Test map', domain: 'caltopo.com', features}];
     bundle.unwantedMapFeatures = unwanted;
     if (autoCheck !== undefined) bundle.mapUnaccountedAutoCheck = autoCheck;
+    if (typeFilters) bundle.mapFeatureTypeFilters = typeFilters;
     store[BUNDLE_KEY] = JSON.stringify(scratch.sanitizeBundle(bundle));
     return store;
 }
@@ -187,10 +215,29 @@ function seedStore({features = [], segments = [], unwanted = [], autoCheck} = {}
 const plain = (value) => JSON.parse(JSON.stringify(value));
 const segmentNames = (app) => plain(app.loadBundle().pages.page2.map(r => r[1]).filter(Boolean));
 const unwantedNames = (app) => plain(app.loadBundle().unwantedMapFeatures.map(e => e.name));
-const toasts = (app) => app.__body.children.filter(el => /notif-toast/.test(el.className || '')).map(el => el.innerHTML);
+// A toast's title / text live in a child element, so the markup of the whole
+// subtree is joined.
+const deepHtml = (el) => (el.innerHTML || '') + (el.children || []).map(deepHtml).join('');
+const toasts = (app) => app.__body.children.filter(el => /notif-toast/.test(el.className || '')).map(deepHtml);
 // Only the toasts raised by the unaccounted-feature check (the sidebar also
 // toasts unrelated reminders such as "Fill Incident Profile").
 const unaccountedToasts = (app) => toasts(app).filter(html => /Unaccounted Map Features/.test(html));
+const assignmentToasts = (app) => toasts(app).filter(html => /New Assignment/.test(html));
+// Sidebar entries (the notification list is rebuilt by updateNotifications).
+const sidebarItems = (app) => app.__byId['notif-list'].children.filter(el => /notification-item/.test(el.className || ''));
+const assignmentItems = (app) => sidebarItems(app).filter(el => /map-assignment-new/.test(el.className || ''));
+// The action buttons rendered into a notification entry / toast.
+const actionButtons = (el) => {
+    const found = [];
+    const walk = node => {
+        (node.children || []).forEach(child => {
+            if (/notification-action-btn/.test(child.className || '')) found.push(child);
+            walk(child);
+        });
+    };
+    walk(el);
+    return found;
+};
 
 const checks = [];
 const check = (name, fn) => checks.push({name, fn});
@@ -245,21 +292,118 @@ check('Import Selected below the map imports the checked shapes and marks the un
 
     // Nothing is selected by default.
     assert.strictEqual(app.getUnaccountedSelection().size, 0);
-    app.importSelectedUnaccountedFeatures();
-    assert.ok(app.__alerts.some(a => /Check at least one/.test(a)), 'refuses to import with nothing checked');
-    assert.deepStrictEqual(segmentNames(app), []);
-    assert.deepStrictEqual(unwantedNames(app), [], 'nothing is marked unwanted when nothing was imported');
 
     app.getUnaccountedSelection().add(app.getMapFeatureIdentityKey(features[1]));
     app.getUnaccountedSelection().add(app.getMapFeatureIdentityKey(features[2]));
     app.importSelectedUnaccountedFeatures();
 
+    assert.deepStrictEqual(app.__alerts, [], 'no alert when shapes are checked');
     assert.deepStrictEqual(segmentNames(app).sort(), ['Alpha', 'Bravo']);
     const rows = app.loadBundle().pages.page2.filter(r => r[1]);
     assert.deepStrictEqual(plain(rows.map(r => r[9])).sort(), ['a', 'b'], 'the CalTopo id is kept on the imported rows');
     assert.deepStrictEqual(unwantedNames(app), ['charlie']);
     assert.strictEqual(app.getUnaccountedSelection().size, 0, 'the selection is cleared after the import');
     assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures()), []);
+});
+
+check('Import Selected with nothing checked marks every unaccounted shape unwanted', () => {
+    const features = [storedFeature('Charlie', 'c'), storedFeature('Alpha', 'a'), storedFeature('Bravo', 'b'), storedFeature('Existing', 'e')];
+    const store = seedStore({features, segments: [['R1', 'Existing', '', '', '', '', '', '', '', 'e']]});
+    const app = createSandbox({store, fetch: createServer([]).fetch});
+
+    assert.strictEqual(app.getUnaccountedSelection().size, 0);
+    app.importSelectedUnaccountedFeatures();
+
+    assert.deepStrictEqual(app.__alerts, [], 'the button runs without complaining');
+    assert.deepStrictEqual(segmentNames(app), ['Existing'], 'nothing is imported');
+    assert.deepStrictEqual(unwantedNames(app).sort(), ['alpha', 'bravo', 'charlie'], 'every unaccounted shape is marked unwanted; the segment is left alone');
+    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures()), []);
+    assert.ok(toasts(app).some(html => /Nothing was checked: 3 shapes were marked unwanted/.test(html)), 'the user is told what happened');
+    assert.ok(plain(app.loadBundle().activityLog).some(e => /Marked 3 CalTopo shapes as unwanted \(not imported\)/.test(e.action)), 'the activity log records it');
+
+    // With nothing left to mark the button only reports.
+    app.importSelectedUnaccountedFeatures();
+    assert.ok(app.__alerts.some(a => /no unaccounted map features/.test(a)));
+});
+
+check('every unimported CalTopo Assignment gets its own New Assignment notification with Import / Decline buttons', () => {
+    const features = [storedFeature('Zulu', 'z'), storedMarker('PLS', 'p'), storedShape('Hazard', 'h'), storedFeature('Mike', 'm')];
+    const store = seedStore({features});
+    const app = createSandbox({store, fetch: createServer([]).fetch, page: 'page2'});
+
+    app.refreshUnaccountedMapFeatureNotifications();
+
+    assert.deepStrictEqual(plain(app.window._unaccountedMapFeatureNames), ['Hazard', 'Mike', 'PLS', 'Zulu'], 'the general notification still covers every unaccounted shape');
+    const items = assignmentItems(app);
+    assert.strictEqual(items.length, 2, 'one entry per assignment (the marker and the plain shape get none)');
+    assert.ok(/Assignment Mike is on the map but not imported as a segment/.test(items[0].innerHTML), items[0].innerHTML);
+    assert.ok(/Assignment Zulu is on the map/.test(items[1].innerHTML));
+    assert.deepStrictEqual(actionButtons(items[0]).map(b => b.textContent), ['Import', 'Decline for now']);
+    assert.strictEqual(assignmentToasts(app).length, 2, 'each assignment toasts once');
+    assert.deepStrictEqual(actionButtons(app.__body.children.find(el => /map-assignment-new/.test(el.className || ''))).map(b => b.textContent), ['Import', 'Decline for now'], 'the toast carries the same buttons');
+
+    // Decline for now: the entry disappears, nothing is imported or marked unwanted.
+    actionButtons(items[1])[1].onclick({stopPropagation() {}});
+    assert.deepStrictEqual(assignmentItems(app).map(el => /Zulu/.test(el.innerHTML)), [false], 'only Mike is left');
+    assert.deepStrictEqual(segmentNames(app), []);
+    assert.deepStrictEqual(unwantedNames(app), []);
+    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures().map(app.getMapFeatureDisplayName)), ['Hazard', 'Mike', 'PLS', 'Zulu'], 'Zulu still waits in the table below the map');
+    assert.ok(plain(app.loadBundle().dismissedNotifications).some(k => /New AssignmentAssignment Zulu/.test(k)), 'its toast stays quiet like a dismissed one');
+
+    // Import: only that assignment becomes a segment.
+    actionButtons(assignmentItems(app)[0])[0].onclick({stopPropagation() {}});
+    assert.deepStrictEqual(segmentNames(app), ['Mike']);
+    assert.deepStrictEqual(plain(app.loadBundle().pages.page2.filter(r => r[1]).map(r => r[9])), ['m'], 'the CalTopo id is kept');
+    assert.deepStrictEqual(unwantedNames(app), [], 'importing one assignment marks nothing else unwanted');
+    assert.strictEqual(assignmentItems(app).length, 0, 'Mike is imported and Zulu was declined');
+    assert.deepStrictEqual(plain(app.window._unaccountedMapFeatureNames), ['Hazard', 'PLS', 'Zulu']);
+    assert.ok(toasts(app).some(html => /Imported assignment Mike as a segment/.test(html)));
+
+    // Importing again is a no-op that just says so.
+    assert.strictEqual(app.importUnaccountedAssignmentFeature(features[3]), false);
+    assert.ok(toasts(app).some(html => /already imported/.test(html)));
+});
+
+check('the feature-type toggles mark switched-off types unwanted, keep doing so on later fetches, and restore them when switched back on', async () => {
+    const features = [storedFeature('Zulu', 'z'), storedMarker('PLS', 'p'), storedShape('Hazard', 'h'), storedRoute('Trail', 't'), storedMarker('IPP', 'i')];
+    const store = seedStore({features, unwanted: [{id: 'h', name: 'hazard'}]});
+    const server = createServer([calTopoFeature('Zulu', 'z'), calTopoMarker('PLS', 'p'), calTopoMarker('Camp', 'c')]);
+    const app = createSandbox({store, fetch: server.fetch});
+
+    assert.deepStrictEqual(plain(app.getMapFeatureTypeFilters()), {marker: true, shape: true, assignment: true, route: true, other: true}, 'everything is on by default');
+    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures().map(app.getMapFeatureDisplayName)), ['IPP', 'PLS', 'Trail', 'Zulu']);
+
+    // Markers off: both markers are marked unwanted (tagged with the toggle).
+    const off = plain(app.setMapFeatureTypeFilterEnabled('marker', false));
+    assert.deepStrictEqual(off, {marked: 2, restored: 0});
+    assert.strictEqual(app.getMapFeatureTypeFilters().marker, false);
+    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures().map(app.getMapFeatureDisplayName)), ['Trail', 'Zulu']);
+    const tagged = plain(app.loadBundle().unwantedMapFeatures);
+    assert.deepStrictEqual(tagged.filter(e => e.filteredType === 'marker').map(e => e.name).sort(), ['ipp', 'pls']);
+    assert.strictEqual(tagged.find(e => e.name === 'hazard').filteredType, undefined, 'the shape a person marked is untouched');
+    const log = plain(app.loadBundle().activityLog).map(e => e.action);
+    assert.ok(log.some(m => /Marked 2 CalTopo shapes as unwanted \(Markers are switched off on the Maps page\)/.test(m)), log.join(' | '));
+    assert.ok(log.some(m => /show new Markers.*ON.*OFF/.test(m)), 'the toggle change is logged as a setting change');
+
+    // The toggle survives a save / reload.
+    assert.strictEqual(createSandbox({store, fetch: server.fetch}).getMapFeatureTypeFilters().marker, false);
+
+    // A later fetch brings a new marker: it is marked unwanted straight away.
+    await app.checkUnaccountedMapFeaturesAndNotify();
+    assert.deepStrictEqual(plain(app.loadBundle().maps[0].features.map(f => f.attributes.name)), ['Zulu', 'PLS', 'Camp']);
+    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures().map(app.getMapFeatureDisplayName)), ['Zulu'], 'Camp never shows up as new');
+    assert.strictEqual(plain(app.loadBundle().unwantedMapFeatures).find(e => e.name === 'camp').filteredType, 'marker');
+    assert.deepStrictEqual(plain(app.window._unaccountedMapFeatureNames), ['Zulu']);
+
+    // Switching markers back on restores exactly the toggle-marked ones.
+    const on = plain(app.setMapFeatureTypeFilterEnabled('marker', true));
+    assert.deepStrictEqual(on, {marked: 0, restored: 3});
+    assert.deepStrictEqual(unwantedNames(app), ['hazard'], 'the person-marked shape stays unwanted');
+    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures().map(app.getMapFeatureDisplayName)), ['Camp', 'PLS', 'Zulu']);
+
+    // Unknown type keys are ignored.
+    assert.strictEqual(app.setMapFeatureTypeFilterEnabled('bogus', false), undefined);
+    assert.deepStrictEqual(plain(app.getMapFeatureTypeFilters()), {marker: true, shape: true, assignment: true, route: true, other: true});
 });
 
 check('the check re-fetches the map and notifies by segment name; the notification opens the Maps page', async () => {
@@ -387,9 +531,14 @@ check('the Maps page, its unaccounted table and the Fetch Shapes popup render wi
     assert.ok(/id="unaccounted-features-section"/.test(main.innerHTML), 'the unaccounted table is part of the map tab');
     assert.ok(/id="check-unaccounted-btn"/.test(main.innerHTML), 'the refresh-style check button is rendered');
     assert.ok(/id="import-selected-unaccounted-btn"/.test(main.innerHTML), 'the Import Selected button is rendered above the table');
+    assert.ok(/id="unaccounted-type-filters"/.test(main.innerHTML), 'the feature-type toggle row is rendered below the map');
     assert.strictEqual(app.__byId['unaccounted-features-count'].textContent, '1', 'only Charlie is unaccounted');
     assert.strictEqual(app.__byId['unaccounted-features-body'].children.length, 1, 'one row, no checkbox checked by default');
     assert.strictEqual(app.__byId['unaccounted-features-body'].children[0].children[0].children[0].checked, false);
+    assert.strictEqual(app.__byId['unaccounted-features-body'].children[0].children[2].children[0].textContent, 'Assignment', 'the Type column shows the CalTopo type');
+    const toggles = app.__byId['unaccounted-type-filters'].children.filter(el => el.dataset && el.dataset.typeKey);
+    assert.deepStrictEqual(toggles.map(el => el.dataset.typeKey), ['marker', 'shape', 'assignment', 'route', 'other'], 'one toggle switch per feature type');
+    assert.ok(toggles.every(el => el.children[1].children[0].checked === true), 'every toggle is on by default');
 
     app.showCalTopoShapesPopup(features);
     await new Promise(resolve => setImmediate(resolve));

@@ -48,6 +48,23 @@ const MAP_UNACCOUNTED_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const MAP_UNACCOUNTED_LAST_CHECK_STORAGE_KEY = 'sar-map-unaccounted-last-check-v1';
 const UNACCOUNTED_FEATURES_NOTIFICATION_TITLE = 'Unaccounted Map Features';
 const UNACCOUNTED_FEATURES_NOTIFICATION_CLASS = 'map-features-unaccounted';
+// One notification per CalTopo Assignment that is on the map but not imported
+// yet, with its own Import / Decline buttons.
+const NEW_ASSIGNMENT_NOTIFICATION_TITLE = 'New Assignment';
+const NEW_ASSIGNMENT_NOTIFICATION_CLASS = 'map-assignment-new';
+// At most this many "New Assignment" toasts pop up per refresh; the rest are
+// still listed in the notification sidebar.
+const NEW_ASSIGNMENT_TOAST_LIMIT = 5;
+// The feature-type toggles below the map (markers / shapes / assignments /
+// routes / other). Mirrors SARMapSegmentUtils.FEATURE_CATEGORIES for pages
+// that load app.js without map-segment-utils.js.
+const MAP_FEATURE_CATEGORIES_FALLBACK = [
+    {key: 'marker', label: 'Markers', singular: 'Marker'},
+    {key: 'shape', label: 'Shapes', singular: 'Shape'},
+    {key: 'assignment', label: 'Assignments', singular: 'Assignment'},
+    {key: 'route', label: 'Routes', singular: 'Route'},
+    {key: 'other', label: 'Other', singular: 'Other'}
+];
 
 function getMapSegmentUtils() {
     return (typeof window !== 'undefined' && window.SARMapSegmentUtils) ? window.SARMapSegmentUtils : {};
@@ -72,6 +89,62 @@ function getCalTopoFeatureTypeKey(feature) {
 function getCalTopoFeatureTypeLabel(feature) {
     const utils = getMapSegmentUtils();
     return typeof utils.getFeatureTypeLabel === 'function' ? utils.getFeatureTypeLabel(feature) : 'Graphic';
+}
+
+// ---------------------------------------------------------------------------
+// Feature categories (marker / shape / assignment / route / other) and the
+// per-case toggles that decide which of them the team wants to hear about.
+// ---------------------------------------------------------------------------
+
+function getMapFeatureCategories() {
+    const utils = getMapSegmentUtils();
+    return Array.isArray(utils.FEATURE_CATEGORIES) ? utils.FEATURE_CATEGORIES : MAP_FEATURE_CATEGORIES_FALLBACK;
+}
+
+function getMapFeatureCategoryKey(feature) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getFeatureCategoryKey === 'function') return utils.getFeatureCategoryKey(feature);
+    const attrs = feature?.attributes || feature?.properties || {};
+    const rawClass = String(attrs.class || '').trim().toLowerCase();
+    const rawType = String(attrs.type || '').trim().toLowerCase();
+    const geomType = String((feature?.geometry && feature.geometry.type) || '').trim().toLowerCase();
+    const classOrType = rawClass || (rawType !== 'feature' ? rawType : '');
+    if (classOrType === 'assignment' || attrs.assignment) return 'assignment';
+    if (classOrType === 'marker' || geomType === 'point' || geomType === 'multipoint') return 'marker';
+    if (['route', 'track', 'line', 'polyline'].includes(classOrType) || ['linestring', 'multilinestring', 'polyline', 'line'].includes(geomType)) return 'route';
+    if (['shape', 'polygon', 'area'].includes(classOrType) || ['polygon', 'multipolygon', 'geometrycollection'].includes(geomType)) return 'shape';
+    return 'other';
+}
+
+function getMapFeatureCategoryLabel(feature) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getFeatureCategoryLabel === 'function') return utils.getFeatureCategoryLabel(feature);
+    const key = getMapFeatureCategoryKey(feature);
+    const category = getMapFeatureCategories().find(entry => entry.key === key);
+    return category ? category.singular : 'Other';
+}
+
+function getMapFeatureCategoryPluralLabel(typeKey) {
+    const category = getMapFeatureCategories().find(entry => entry.key === typeKey);
+    return category ? category.label : 'Other';
+}
+
+// {marker: true, shape: true, assignment: true, route: true, other: true};
+// a type that was never toggled is ON.
+function getMapFeatureTypeFilters(bundle) {
+    const b = bundle || loadBundle();
+    const utils = getMapSegmentUtils();
+    if (typeof utils.normalizeFeatureTypeFilters === 'function') return utils.normalizeFeatureTypeFilters(b.mapFeatureTypeFilters);
+    const source = (b.mapFeatureTypeFilters && typeof b.mapFeatureTypeFilters === 'object' && !Array.isArray(b.mapFeatureTypeFilters)) ? b.mapFeatureTypeFilters : {};
+    const result = {};
+    getMapFeatureCategories().forEach(category => {
+        result[category.key] = source[category.key] !== false;
+    });
+    return result;
+}
+
+function isMapFeatureTypeEnabled(feature, bundle) {
+    return getMapFeatureTypeFilters(bundle)[getMapFeatureCategoryKey(feature)] !== false;
 }
 
 function getFilteredSegmentImports(items, typeKey) {
@@ -403,6 +476,7 @@ function getUnwantedMapFeatures(bundle) {
         if (!id && !name) return null;
         const normalized = {id: isSyntheticCalTopoFeatureId(id) ? '' : id, name};
         if (entry.markedAt) normalized.markedAt = entry.markedAt;
+        if (typeof entry.filteredType === 'string' && entry.filteredType) normalized.filteredType = entry.filteredType;
         return normalized;
     }).filter(Boolean);
 }
@@ -430,15 +504,28 @@ function isMapFeatureAccountedFor(feature, bundle) {
 }
 
 // Fetched features that are neither a segment yet nor marked unwanted, A-Z.
-function getUnaccountedMapFeatures(bundle) {
+// Pass {ignoreTypeFilters: true} to also include the feature types the team
+// switched off below the map (normally those are hidden from every list).
+function getUnaccountedMapFeatures(bundle, options = {}) {
     const b = bundle || loadBundle();
     const map = Array.isArray(b.maps) && b.maps[0] ? b.maps[0] : null;
     const features = map && Array.isArray(map.features) ? map.features : [];
     const utils = getMapSegmentUtils();
+    let unaccounted;
     if (typeof utils.getUnaccountedFeatures === 'function') {
-        return utils.getUnaccountedFeatures(features, ensureSegmentsPageRows(b), getUnwantedMapFeatures(b));
+        unaccounted = utils.getUnaccountedFeatures(features, ensureSegmentsPageRows(b), getUnwantedMapFeatures(b));
+    } else {
+        unaccounted = sortMapFeaturesByName(features.filter(feature => !isMapFeatureAccountedFor(feature, b) && !isMapFeatureUnwanted(feature, b)));
     }
-    return sortMapFeaturesByName(features.filter(feature => !isMapFeatureAccountedFor(feature, b) && !isMapFeatureUnwanted(feature, b)));
+    if (options && options.ignoreTypeFilters) return unaccounted;
+    const filters = getMapFeatureTypeFilters(b);
+    return unaccounted.filter(feature => filters[getMapFeatureCategoryKey(feature)] !== false);
+}
+
+// Unaccounted features whose CalTopo type is Assignment: each gets its own
+// "New Assignment" notification with Import / Decline buttons.
+function getUnaccountedAssignmentMapFeatures(bundle) {
+    return getUnaccountedMapFeatures(bundle).filter(feature => getMapFeatureCategoryKey(feature) === 'assignment');
 }
 
 // "A, B, C" for the activity log; long lists are cut off with "... (+N more)"
@@ -452,10 +539,14 @@ function summarizeNamesForLog(names, max = 15) {
 // Adds `features` to the hidden unwanted list (features that are already
 // segments are skipped: they are accounted for anyway) and records the shapes
 // that were newly marked in the activity log. Returns how many entries were
-// newly added.
-function markMapFeaturesUnwanted(features, bundle = null) {
+// newly added. `options.filteredType` tags the entries as hidden by that
+// feature-type toggle (so turning the type back on restores them) and
+// `options.reason` replaces the default "(not imported)" in the log entry.
+function markMapFeaturesUnwanted(features, bundle = null, options = {}) {
     const utils = getMapSegmentUtils();
     const b = bundle || loadBundle();
+    const filteredType = (options && typeof options.filteredType === 'string' && options.filteredType) ? options.filteredType : '';
+    const reason = (options && options.reason) ? String(options.reason) : 'not imported';
     const candidates = (Array.isArray(features) ? features : []).filter(feature => !isMapFeatureAccountedFor(feature, b));
     const before = getUnwantedMapFeatures(b);
     const wasUnwanted = feature => {
@@ -465,23 +556,107 @@ function markMapFeaturesUnwanted(features, bundle = null) {
     const newlyMarkedNames = candidates.filter(feature => !wasUnwanted(feature)).map(getMapFeatureDisplayName);
     let after;
     if (typeof utils.markFeaturesUnwanted === 'function') {
-        after = utils.markFeaturesUnwanted(before, candidates);
+        after = utils.markFeaturesUnwanted(before, candidates, undefined, filteredType || undefined);
     } else {
         after = before.slice();
         const markedAt = new Date().toISOString();
         candidates.forEach(feature => {
             const identity = getMapFeatureIdentity(feature);
             if (after.some(entry => unwantedEntryMatchesIdentity(entry, identity))) return;
-            after.push({id: identity.id, name: identity.name, markedAt});
+            const entry = {id: identity.id, name: identity.name, markedAt};
+            if (filteredType) entry.filteredType = filteredType;
+            after.push(entry);
         });
     }
     const added = after.length - before.length;
     if (added > 0) {
         b.unwantedMapFeatures = after;
-        addActivityLogEntry('System', `Marked ${added} CalTopo shape${added === 1 ? '' : 's'} as unwanted (not imported): ${summarizeNamesForLog(newlyMarkedNames)}`, b);
+        addActivityLogEntry('System', `Marked ${added} CalTopo shape${added === 1 ? '' : 's'} as unwanted (${reason}): ${summarizeNamesForLog(newlyMarkedNames)}`, b);
         if (!bundle) saveBundle(b);
     }
     return added;
+}
+
+// Marks every not-yet-imported feature whose type is switched off below the
+// map as unwanted (tagged with the type, so switching it back on restores
+// them). Runs after each fetch and whenever a toggle is turned off. Returns
+// how many entries were newly added.
+function applyMapFeatureTypeFilters(bundle = null) {
+    const b = bundle || loadBundle();
+    const filters = getMapFeatureTypeFilters(b);
+    const disabledKeys = Object.keys(filters).filter(key => filters[key] === false);
+    if (!disabledKeys.length) return 0;
+    const candidates = getUnaccountedMapFeatures(b, {ignoreTypeFilters: true});
+    let added = 0;
+    disabledKeys.forEach(typeKey => {
+        const ofType = candidates.filter(feature => getMapFeatureCategoryKey(feature) === typeKey);
+        if (!ofType.length) return;
+        added += markMapFeaturesUnwanted(ofType, b, {
+            filteredType: typeKey,
+            reason: `${getMapFeatureCategoryPluralLabel(typeKey)} are switched off on the Maps page`
+        });
+    });
+    if (added > 0 && !bundle) saveBundle(b);
+    return added;
+}
+
+// Takes the entries a feature-type toggle added for `typeKey` off the
+// unwanted list again (entries a person marked stay). Returns how many were
+// restored.
+function restoreMapFeaturesFilteredByType(typeKey, bundle = null) {
+    const utils = getMapSegmentUtils();
+    const b = bundle || loadBundle();
+    const before = getUnwantedMapFeatures(b);
+    const after = typeof utils.unmarkFeaturesUnwantedByFilteredType === 'function'
+        ? utils.unmarkFeaturesUnwantedByFilteredType(before, typeKey)
+        : before.filter(entry => entry.filteredType !== typeKey);
+    const removed = before.length - after.length;
+    if (removed > 0) {
+        const restoredNames = before.filter(entry => entry.filteredType === typeKey).map(entry => entry.name);
+        b.unwantedMapFeatures = after;
+        addActivityLogEntry('System', `Restored ${removed} CalTopo shape${removed === 1 ? '' : 's'} hidden by the ${getMapFeatureCategoryPluralLabel(typeKey)} toggle: ${summarizeNamesForLog(restoredNames)}`, b);
+        if (!bundle) saveBundle(b);
+    }
+    return removed;
+}
+
+// The toggle switches in the table below the map. Turning a type OFF marks
+// every not-yet-imported feature of that type unwanted (and does the same
+// for whatever later fetches bring in); turning it back ON restores the
+// features that toggle hid, so they show up as new again.
+function setMapFeatureTypeFilterEnabled(typeKey, enabled) {
+    const categories = getMapFeatureCategories();
+    if (!categories.some(category => category.key === typeKey)) return;
+    const bundle = loadBundle();
+    const filters = getMapFeatureTypeFilters(bundle);
+    const wasEnabled = filters[typeKey] !== false;
+    const nextEnabled = enabled !== false;
+    filters[typeKey] = nextEnabled;
+    bundle.mapFeatureTypeFilters = filters;
+    const label = getMapFeatureCategoryPluralLabel(typeKey);
+    if (wasEnabled !== nextEnabled) {
+        logSettingChange(`Maps page: show new ${label}`, wasEnabled ? 'ON' : 'OFF', nextEnabled ? 'ON' : 'OFF', bundle);
+    }
+    let marked = 0;
+    let restored = 0;
+    if (nextEnabled) {
+        restored = restoreMapFeaturesFilteredByType(typeKey, bundle);
+    } else {
+        marked = applyMapFeatureTypeFilters(bundle);
+    }
+    saveBundle(bundle);
+
+    if (marked > 0) {
+        showToast(`${label} are switched off: ${marked} shape${marked === 1 ? ' was' : 's were'} marked unwanted.`, 'Map Feature Types');
+    } else if (restored > 0) {
+        showToast(`${label} are switched on again: ${restored} shape${restored === 1 ? ' was' : 's were'} restored.`, 'Map Feature Types');
+    }
+    if (isMapsPage()) {
+        renderUnaccountedFeaturesPanel();
+        if (typeof renderFeaturesList === 'function') renderFeaturesList();
+    }
+    refreshUnaccountedMapFeatureNotifications();
+    return {marked, restored};
 }
 
 // Takes `features` off the unwanted list again (the "Restore" button) and
@@ -3092,6 +3267,10 @@ function defaultBundle() {
     // and unaccounted views) and whether the 5-minute unaccounted check runs.
     unwantedMapFeatures: [],
     mapUnaccountedAutoCheck: true,
+    // Which feature types (markers / shapes / assignments / routes / other)
+    // the team wants to hear about; a type switched off is marked unwanted
+    // automatically. Missing = on.
+    mapFeatureTypeFilters: {marker: true, shape: true, assignment: true, route: true, other: true},
     permanentPersonnel: {},
     accounts: [
       { username: 'Super Admin', pin: '1976', color: 'none', handle: 'Super-Admin', isFileManager: true, theme: 'dark', visiblePages: ['index', 'page2', 'page3', 'page4', 'page5', 'page6', 'page7', 'settings', 'home', 'page8', 'page9', 'page10'] }
@@ -3281,6 +3460,7 @@ function sanitizeBundle(bundle) {
   const maps = Array.isArray(bundle.maps) ? bundle.maps : [];
   const unwantedMapFeatures = getUnwantedMapFeatures(bundle);
   const mapUnaccountedAutoCheck = bundle.mapUnaccountedAutoCheck !== false;
+  const mapFeatureTypeFilters = getMapFeatureTypeFilters(bundle);
 
   let accounts = Array.isArray(bundle.accounts) ? bundle.accounts : fallback.accounts;
 
@@ -3403,6 +3583,7 @@ function sanitizeBundle(bundle) {
     maps,
     unwantedMapFeatures,
     mapUnaccountedAutoCheck,
+    mapFeatureTypeFilters,
     permanentPersonnel,
     accounts: syncedAccounts 
   };
@@ -13893,7 +14074,34 @@ function checkParChecksAndNotify(skipTableRefresh = false) {
   }
 }
 
-function showToastNotification(title, text, action, extraClass = '') {
+// Renders the optional action buttons of a notification ("Import" / "Decline
+// for now" on a New Assignment) into `container`. Each button runs its own
+// onClick without triggering the surrounding notification's click action;
+// `afterClick` is called afterwards (to dismiss the toast / rebuild the list).
+function renderNotificationActionButtons(container, buttons, afterClick) {
+    const list = Array.isArray(buttons) ? buttons.filter(button => button && button.label) : [];
+    if (!list.length || !container) return;
+    container.innerHTML = '';
+    list.forEach(button => {
+        const el = document.createElement('button');
+        el.type = 'button';
+        el.className = 'notification-action-btn' + (button.primary ? ' primary' : '');
+        el.textContent = button.label;
+        if (button.title) el.title = button.title;
+        el.onclick = (e) => {
+            if (e && typeof e.stopPropagation === 'function') e.stopPropagation();
+            try {
+                if (typeof button.onClick === 'function') button.onClick();
+            } catch (err) {
+                console.error('Notification action failed:', err);
+            }
+            if (typeof afterClick === 'function') afterClick(button);
+        };
+        container.appendChild(el);
+    });
+}
+
+function showToastNotification(title, text, action, extraClass = '', buttons = null) {
     const toast = document.createElement('div');
     toast.className = 'notif-toast ' + extraClass;
     
@@ -13906,15 +14114,21 @@ function showToastNotification(title, text, action, extraClass = '') {
     toast.style.top = offset + 'px';
 
     const toastKey = title + text;
+    const hasButtons = Array.isArray(buttons) && buttons.length > 0;
+    if (hasButtons) toast.classList.add('has-actions');
 
     toast.innerHTML = `
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="color:var(--accent); flex-shrink:0;"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
-        <div style="flex-grow:1; margin-right:10px;">
+    `;
+
+    const body = document.createElement('div');
+    body.style.flexGrow = '1';
+    body.style.marginRight = '10px';
+    body.innerHTML = `
             <div style="font-weight:700; font-size:0.9rem;">${title}</div>
             <div style="font-size:0.8rem; opacity:0.8;">${text}</div>
-        </div>
-        <button class="toast-close-btn" title="Dismiss" style="background:none; border:none; color:inherit; cursor:pointer; padding:5px; margin:-5px; opacity:0.6;">✕</button>
     `;
+    toast.appendChild(body);
 
     const dismiss = () => {
         if (toast.classList.contains('dismissing')) return;
@@ -13925,7 +14139,20 @@ function showToastNotification(title, text, action, extraClass = '') {
         }, 400);
     };
 
-    const closeBtn = toast.querySelector('.toast-close-btn');
+    if (hasButtons) {
+        const actions = document.createElement('div');
+        actions.className = 'notification-actions';
+        body.appendChild(actions);
+        renderNotificationActionButtons(actions, buttons, dismiss);
+    }
+
+    const closeBtn = document.createElement('button');
+    closeBtn.type = 'button';
+    closeBtn.className = 'toast-close-btn';
+    closeBtn.title = 'Dismiss';
+    closeBtn.style.cssText = 'background:none; border:none; color:inherit; cursor:pointer; padding:5px; margin:-5px; opacity:0.6;';
+    closeBtn.textContent = '✕';
+    toast.appendChild(closeBtn);
     closeBtn.onclick = (e) => {
         e.stopPropagation();
         const bundle = loadBundle();
@@ -13941,11 +14168,12 @@ function showToastNotification(title, text, action, extraClass = '') {
         dismiss();
     };
     document.body.appendChild(toast);
+    // A toast with buttons stays up longer so there is time to click one.
     setTimeout(() => {
         if (toast.parentElement) {
             dismiss();
         }
-    }, 5000);
+    }, hasButtons ? 12000 : 5000);
 }
 
 // Plain informational toast (no title, nothing to do on click).
@@ -13995,10 +14223,14 @@ function updateNotifications() {
 
   if (!window._shownToasts) window._shownToasts = new Set();
 
-  const add = (title, text, action, extraClass = '') => {
+  // options.buttons: [{label, onClick, primary}] rendered inside the entry
+  // (and its toast); options.toast === false lists the entry without popping
+  // a toast for it.
+  const add = (title, text, action, extraClass = '', options = {}) => {
     count++;
+    const buttons = Array.isArray(options.buttons) ? options.buttons : null;
     const item = document.createElement('div');
-    item.className = 'notification-item ' + extraClass;
+    item.className = 'notification-item ' + extraClass + (buttons ? ' has-actions' : '');
     item.innerHTML = `
       <div style="display:flex; gap:10px; align-items:flex-start; width:100%;">
         <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="flex-shrink:0;"><path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"></path><path d="M13.73 21a2 2 0 0 1-3.46 0"></path></svg>
@@ -14012,13 +14244,23 @@ function updateNotifications() {
       action();
       document.getElementById('notif-sidebar').classList.remove('open');
     };
+    if (buttons) {
+      // Lines up with the text (icon width + gap) below the entry.
+      const actions = document.createElement('div');
+      actions.className = 'notification-actions';
+      actions.style.marginLeft = '30px';
+      item.appendChild(actions);
+      renderNotificationActionButtons(actions, buttons);
+    }
     list.appendChild(item);
 
     const toastKey = title + text;
-    if (!window._shownToasts.has(toastKey) && !bundle.dismissedNotifications.includes(toastKey)) {
+    if (options.toast !== false && !window._shownToasts.has(toastKey) && !bundle.dismissedNotifications.includes(toastKey)) {
         window._shownToasts.add(toastKey);
-        showToastNotification(title, text, action, extraClass);
+        showToastNotification(title, text, action, extraClass, buttons);
+        return true;
     }
+    return false;
   };
 
   const sweeps = getLogSweepsDue();
@@ -14070,6 +14312,28 @@ function updateNotifications() {
   if (unaccountedNames.length > 0) {
     add(UNACCOUNTED_FEATURES_NOTIFICATION_TITLE, getUnaccountedFeatureNotificationText(unaccountedNames),
       openUnaccountedMapFeatures, UNACCOUNTED_FEATURES_NOTIFICATION_CLASS);
+  }
+
+  // One entry per CalTopo Assignment that is not imported yet, with Import /
+  // Decline-for-now buttons. "Decline for now" only hides the entry on this
+  // device until the page is reloaded; the assignment stays in the table
+  // below the map.
+  if (unaccountedNames.length > 0) {
+    const declined = getDeclinedAssignmentFeatureKeys();
+    let assignmentToasts = 0;
+    getUnaccountedAssignmentMapFeatures(bundle).forEach(feature => {
+      const key = getMapFeatureIdentityKey(feature);
+      if (declined.has(key)) return;
+      const shown = add(NEW_ASSIGNMENT_NOTIFICATION_TITLE, getNewAssignmentNotificationText(feature), openUnaccountedMapFeatures,
+        NEW_ASSIGNMENT_NOTIFICATION_CLASS, {
+          toast: assignmentToasts < NEW_ASSIGNMENT_TOAST_LIMIT,
+          buttons: [
+            {label: 'Import', primary: true, title: 'Import this assignment as a segment', onClick: () => importUnaccountedAssignmentFeature(feature)},
+            {label: 'Decline for now', title: 'Hide this notification for now (the assignment stays in the table on the Maps page)', onClick: () => declineAssignmentFeatureForNow(feature)}
+          ]
+        });
+      if (shown) assignmentToasts++;
+    });
   }
 
   if (dot) {
@@ -15857,6 +16121,9 @@ async function caltopo_request(btn = null, options = {}) {
           if (!silent) {
             addActivityLogEntry('System', `Fetched ${features.length} shape${features.length === 1 ? '' : 's'} from CalTopo map ${b.maps[0].name ? `"${b.maps[0].name}" ` : ''}(${activeMapId})`, b);
           }
+          // Feature types switched off below the map are marked unwanted
+          // straight away, so they never show up as new.
+          applyMapFeatureTypeFilters(b);
           saveBundle(b);
         }
         
@@ -16526,7 +16793,7 @@ function buildMapsPage() {
               <span>Unaccounted Map Features</span>
               <span id="unaccounted-features-count" class="mini-pill" style="padding: 3px 10px; font-size: 0.75rem;">0</span>
             </h2>
-            <p style="margin: 8px 0 0; color: var(--muted); font-size: 0.9rem;">Shapes on the CalTopo map that are not imported as segments and not marked unwanted. Check the ones to import, then click <strong>Import Selected</strong>; everything left unchecked is marked unwanted so it stops showing up here.</p>
+            <p style="margin: 8px 0 0; color: var(--muted); font-size: 0.9rem;">Shapes on the CalTopo map that are not imported as segments and not marked unwanted. Check the ones to import, then click <strong>Import Selected</strong>; everything left unchecked is marked unwanted so it stops showing up here. Clicking <strong>Import Selected</strong> with nothing checked marks every listed shape unwanted.</p>
           </div>
           <div class="tool-actions" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
             <button id="check-unaccounted-btn" class="clear-btn" title="Check CalTopo for unaccounted segments" aria-label="Check for unaccounted segments" style="display: inline-flex; align-items: center; gap: 8px;">
@@ -16535,6 +16802,9 @@ function buildMapsPage() {
             </button>
             <button id="import-selected-unaccounted-btn" class="clear-btn" style="background: rgba(64, 192, 87, 0.12); border-color: rgba(64, 192, 87, 0.35);">Import Selected</button>
           </div>
+        </div>
+        <div id="unaccounted-type-filters" class="unaccounted-type-filters" style="display: flex; align-items: center; gap: 18px; flex-wrap: wrap; padding: 12px 0 4px; border-top: 1px solid var(--line); margin-top: 12px;">
+          <span style="color: var(--muted); font-size: 0.9rem;" title="Feature types switched off are marked unwanted automatically (now and on every later fetch) and are not listed here. Switching a type back on restores the shapes that toggle hid.">Notify me about:</span>
         </div>
         <div style="overflow-x: auto; padding-top: 10px;">
           <table class="grid-table" style="width: 100%;">
@@ -16832,13 +17102,20 @@ function renderUnaccountedFeaturesPanel() {
     if (importBtn) {
         importBtn.textContent = selection.size > 0 ? `Import Selected (${selection.size})` : 'Import Selected';
         importBtn.disabled = unaccounted.length === 0;
+        importBtn.title = selection.size > 0
+            ? 'Import the checked shapes as segments; unchecked shapes are marked unwanted'
+            : 'Nothing is checked: mark every listed shape as unwanted';
     }
+    renderUnaccountedTypeFilterToggles(bundle);
     const statusEl = document.getElementById('unaccounted-features-status');
     if (statusEl) {
         const unwantedCount = getUnwantedMapFeatures(bundle).length;
         const lastCheck = parseInt(getStorageItem(MAP_UNACCOUNTED_LAST_CHECK_STORAGE_KEY) || '0', 10);
         const parts = [];
         if (unwantedCount > 0) parts.push(`${unwantedCount} shape${unwantedCount === 1 ? '' : 's'} hidden as unwanted (restore them from Fetch Shapes).`);
+        const filters = getMapFeatureTypeFilters(bundle);
+        const offLabels = getMapFeatureCategories().filter(category => filters[category.key] === false).map(category => category.label);
+        if (offLabels.length) parts.push(`${offLabels.join(', ')} switched off: new ones are marked unwanted automatically.`);
         if (lastCheck > 0) parts.push(`Last check ${new Date(lastCheck).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}.`);
         parts.push(isMapUnaccountedAutoCheckEnabled(bundle)
             ? 'Automatic check runs every 5 minutes.'
@@ -16862,6 +17139,7 @@ function renderUnaccountedFeaturesPanel() {
         const lengthVal = parseFloat(item.length) || 0;
         const timeVal = lengthVal / 0.5;
         const tr = document.createElement('tr');
+        tr.dataset.featureType = getMapFeatureCategoryKey(feature);
 
         const tdCheck = document.createElement('td');
         tdCheck.style.textAlign = 'center';
@@ -16883,7 +17161,7 @@ function renderUnaccountedFeaturesPanel() {
 
         [
             item.segment,
-            item.typeLabel,
+            getMapFeatureCategoryLabel(feature),
             item.area ? `${item.area} ac` : '',
             item.length ? `${item.length} mi` : '',
             `${item.sweep || 20} ft`,
@@ -16906,8 +17184,60 @@ function renderUnaccountedFeaturesPanel() {
     });
 }
 
+// The toggle switches (Markers / Shapes / Assignments / Routes / Other) in the
+// table below the map. Rebuilt on every render so the switches always show
+// the stored state, even after another device changed it.
+function renderUnaccountedTypeFilterToggles(bundle = null) {
+    const container = document.getElementById('unaccounted-type-filters');
+    if (!container) return;
+    const b = bundle || loadBundle();
+    const filters = getMapFeatureTypeFilters(b);
+    Array.from(container.children || []).forEach(child => {
+        if (child && child.classList && child.classList.contains('unaccounted-type-filter')) child.remove();
+    });
+    getMapFeatureCategories().forEach(category => {
+        const enabled = filters[category.key] !== false;
+        const label = document.createElement('label');
+        label.className = 'unaccounted-type-filter';
+        label.dataset.typeKey = category.key;
+        label.style.display = 'inline-flex';
+        label.style.alignItems = 'center';
+        label.style.gap = '8px';
+        label.style.cursor = 'pointer';
+        label.style.fontSize = '0.9rem';
+        label.title = enabled
+            ? `New ${category.label.toLowerCase()} are listed here and raise notifications. Switch off to mark them unwanted automatically.`
+            : `${category.label} are switched off: new ones are marked unwanted automatically and not listed. Switch on to restore the ones this toggle hid.`;
+
+        const text = document.createElement('span');
+        text.textContent = category.label;
+        text.style.color = enabled ? '' : 'var(--muted)';
+        label.appendChild(text);
+
+        const toggle = document.createElement('span');
+        toggle.className = 'toggle-switch';
+        toggle.style.transform = 'scale(0.8)';
+        const input = document.createElement('input');
+        input.type = 'checkbox';
+        input.className = 'unaccounted-type-filter-toggle';
+        input.id = `unaccounted-type-filter-${category.key}`;
+        input.dataset.typeKey = category.key;
+        input.checked = enabled;
+        input.onchange = () => setMapFeatureTypeFilterEnabled(category.key, input.checked);
+        const slider = document.createElement('span');
+        slider.className = 'slider';
+        toggle.appendChild(input);
+        toggle.appendChild(slider);
+        label.appendChild(toggle);
+
+        container.appendChild(label);
+    });
+}
+
 // "Import Selected" below the map: the checked shapes become segments and every
 // unchecked unaccounted shape is marked unwanted so the table empties out.
+// With nothing checked the button still runs: that means "I want none of
+// these", so every listed shape is marked unwanted.
 function importSelectedUnaccountedFeatures() {
     const bundle = loadBundle();
     const unaccounted = getUnaccountedMapFeatures(bundle);
@@ -16917,28 +17247,91 @@ function importSelectedUnaccountedFeatures() {
     }
     const selection = getUnaccountedSelection();
     const selected = unaccounted.filter(feature => selection.has(getMapFeatureIdentityKey(feature)));
-    if (!selected.length) {
-        alert('Check at least one map feature to import.');
-        return;
-    }
     const leftOut = unaccounted.filter(feature => !selection.has(getMapFeatureIdentityKey(feature)));
 
     // Both steps write their own activity log entries ("Imported segments" /
     // "Marked ... as unwanted").
-    importSegmentsAction(selected.map(buildCalTopoSegmentImportItem));
+    if (selected.length) {
+        importSegmentsAction(selected.map(buildCalTopoSegmentImportItem));
+    }
     const marked = markMapFeaturesUnwanted(leftOut);
     selection.clear();
 
-    const importedNames = selected.map(getMapFeatureDisplayName);
-    let summary = `Imported ${selected.length} segment${selected.length === 1 ? '' : 's'}: ${importedNames.join(', ')}.`;
-    if (marked > 0) {
-        summary += ` ${marked} unchecked shape${marked === 1 ? ' was' : 's were'} marked unwanted.`;
+    let summary;
+    if (selected.length) {
+        const importedNames = selected.map(getMapFeatureDisplayName);
+        summary = `Imported ${selected.length} segment${selected.length === 1 ? '' : 's'}: ${importedNames.join(', ')}.`;
+        if (marked > 0) {
+            summary += ` ${marked} unchecked shape${marked === 1 ? ' was' : 's were'} marked unwanted.`;
+        }
+        showToast(summary, 'Import Complete');
+    } else {
+        summary = marked > 0
+            ? `Nothing was checked: ${marked} shape${marked === 1 ? ' was' : 's were'} marked unwanted.`
+            : 'Nothing was checked and nothing needed marking.';
+        showToast(summary, 'Marked Unwanted');
     }
-    showToast(summary, 'Import Complete');
 
     renderUnaccountedFeaturesPanel();
     if (typeof renderFeaturesList === 'function') renderFeaturesList();
     refreshUnaccountedMapFeatureNotifications();
+}
+
+// ---------------------------------------------------------------------------
+// "New Assignment" notifications: one per CalTopo Assignment that is on the
+// map but not imported, each with an Import and a Decline-for-now button.
+// ---------------------------------------------------------------------------
+
+function getNewAssignmentNotificationText(feature) {
+    return `Assignment ${getMapFeatureDisplayName(feature)} is on the map but not imported as a segment.`;
+}
+
+// Identity keys of the assignments whose notification was declined on this
+// device. Lives in memory only, so "for now" ends with the next page load.
+function getDeclinedAssignmentFeatureKeys() {
+    if (!(window._declinedAssignmentFeatureKeys instanceof Set)) {
+        window._declinedAssignmentFeatureKeys = new Set();
+    }
+    return window._declinedAssignmentFeatureKeys;
+}
+
+// The Import button on a New Assignment notification: the assignment becomes
+// a segment (nothing else is marked unwanted) and every list is refreshed.
+function importUnaccountedAssignmentFeature(feature) {
+    if (!feature) return false;
+    const bundle = loadBundle();
+    const name = getMapFeatureDisplayName(feature);
+    if (isMapFeatureAccountedFor(feature, bundle)) {
+        showToast(`${name} is already imported as a segment.`, 'Already Imported');
+        refreshUnaccountedMapFeatureNotifications();
+        return false;
+    }
+    // importSegmentsAction writes the "Imported segments" activity log entry.
+    importSegmentsAction([buildCalTopoSegmentImportItem(feature)]);
+    getUnaccountedSelection().delete(getMapFeatureIdentityKey(feature));
+    showToast(`Imported assignment ${name} as a segment.`, 'Import Complete');
+    if (isMapsPage()) {
+        renderUnaccountedFeaturesPanel();
+        if (typeof renderFeaturesList === 'function') renderFeaturesList();
+    }
+    refreshUnaccountedMapFeatureNotifications();
+    return true;
+}
+
+// The Decline-for-now button: hides this assignment's notification on this
+// device (its toast stays quiet like a dismissed one) without importing it or
+// marking it unwanted, so it is still listed in the table below the map.
+function declineAssignmentFeatureForNow(feature) {
+    if (!feature) return;
+    getDeclinedAssignmentFeatureKeys().add(getMapFeatureIdentityKey(feature));
+    const toastKey = NEW_ASSIGNMENT_NOTIFICATION_TITLE + getNewAssignmentNotificationText(feature);
+    const bundle = loadBundle();
+    if (!Array.isArray(bundle.dismissedNotifications)) bundle.dismissedNotifications = [];
+    if (!bundle.dismissedNotifications.includes(toastKey)) {
+        bundle.dismissedNotifications.push(toastKey);
+        saveBundle(bundle);
+    }
+    updateNotifications();
 }
 
 function getUnaccountedFeatureNotificationText(names) {

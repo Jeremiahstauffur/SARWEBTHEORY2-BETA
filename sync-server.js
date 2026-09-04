@@ -486,7 +486,8 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
                 segmentActiveSearchBorderColor: bundle.segmentActiveSearchBorderColor,
                 segmentActiveSearchBorderWidth: bundle.segmentActiveSearchBorderWidth,
                 parCheckFrequency: bundle.parCheckFrequency,
-                mapUnaccountedAutoCheck: bundle.mapUnaccountedAutoCheck
+                mapUnaccountedAutoCheck: bundle.mapUnaccountedAutoCheck,
+                mapFeatureTypeFilters: bundle.mapFeatureTypeFilters
             }
         }
     };

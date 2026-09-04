@@ -124,6 +124,63 @@
         return 'Graphic';
     }
 
+    // ------------------------------------------------------------------
+    // Feature categories for the "which map features do I want to know
+    // about" toggles below the map. Unlike getFeatureTypeKey (which lumps
+    // every polygon in with assignments for import purposes) this tells a
+    // CalTopo Assignment apart from a plain Shape, so each can be switched
+    // on or off separately.
+    // ------------------------------------------------------------------
+
+    const FEATURE_CATEGORIES = [
+        {key: 'marker', label: 'Markers', singular: 'Marker'},
+        {key: 'shape', label: 'Shapes', singular: 'Shape'},
+        {key: 'assignment', label: 'Assignments', singular: 'Assignment'},
+        {key: 'route', label: 'Routes', singular: 'Route'},
+        {key: 'other', label: 'Other', singular: 'Other'}
+    ];
+
+    function getFeatureCategoryKey(feature) {
+        const attrs = feature?.attributes || feature?.properties || {};
+        const rawClass = String(attrs.class || '').trim().toLowerCase();
+        const rawType = String(attrs.type || '').trim().toLowerCase();
+        const geomType = String((feature?.geometry && feature.geometry.type) || '').trim().toLowerCase();
+        const classOrType = rawClass || (rawType !== 'feature' ? rawType : '');
+
+        if (classOrType === 'assignment' || attrs.assignment) return 'assignment';
+        if (classOrType === 'marker' || geomType === 'point' || geomType === 'multipoint') return 'marker';
+        if (classOrType === 'route' || classOrType === 'track' || classOrType === 'line' || classOrType === 'polyline'
+            || geomType === 'linestring' || geomType === 'multilinestring' || geomType === 'polyline' || geomType === 'line') {
+            return 'route';
+        }
+        if (classOrType === 'shape' || classOrType === 'polygon' || classOrType === 'area'
+            || geomType === 'polygon' || geomType === 'multipolygon' || geomType === 'geometrycollection') {
+            return 'shape';
+        }
+        return 'other';
+    }
+
+    function getFeatureCategoryLabel(feature) {
+        const key = getFeatureCategoryKey(feature);
+        const category = FEATURE_CATEGORIES.find(entry => entry.key === key);
+        return category ? category.singular : 'Other';
+    }
+
+    // {marker: true, shape: true, ...}: a category that is missing (or not a
+    // boolean) is ON, so a file saved before the toggles existed shows everything.
+    function normalizeFeatureTypeFilters(value) {
+        const source = (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
+        const result = {};
+        FEATURE_CATEGORIES.forEach(category => {
+            result[category.key] = source[category.key] !== false;
+        });
+        return result;
+    }
+
+    function isFeatureCategoryEnabled(feature, filters) {
+        return normalizeFeatureTypeFilters(filters)[getFeatureCategoryKey(feature)] !== false;
+    }
+
     function normalizeSegmentName(value) {
         return String(value || '').trim().toLowerCase();
     }
@@ -385,6 +442,9 @@
         if (!id && !name) return null;
         const normalized = {id: isSyntheticFeatureId(id) ? '' : id, name};
         if (entry.markedAt) normalized.markedAt = entry.markedAt;
+        // Set when a feature-type toggle (not a person) hid the feature, so
+        // turning that type back on can restore exactly those entries.
+        if (typeof entry.filteredType === 'string' && entry.filteredType) normalized.filteredType = entry.filteredType;
         return normalized;
     }
 
@@ -392,10 +452,11 @@
         return (Array.isArray(list) ? list : []).map(normalizeUnwantedEntry).filter(Boolean);
     }
 
-    function buildUnwantedFeatureEntry(feature, markedAt) {
+    function buildUnwantedFeatureEntry(feature, markedAt, filteredType) {
         const identity = getFeatureIdentity(feature);
         const entry = {id: identity.id, name: identity.name};
         entry.markedAt = markedAt || new Date().toISOString();
+        if (typeof filteredType === 'string' && filteredType) entry.filteredType = filteredType;
         return entry;
     }
 
@@ -429,14 +490,21 @@
     }
 
     // Returns a new list with `features` added (no duplicates); the input list
-    // is not mutated.
-    function markFeaturesUnwanted(unwantedList, features, markedAt) {
+    // is not mutated. `filteredType` tags the entries as hidden by that
+    // feature-type toggle.
+    function markFeaturesUnwanted(unwantedList, features, markedAt, filteredType) {
         const result = normalizeUnwantedFeatureList(unwantedList);
         (Array.isArray(features) ? features : []).forEach(feature => {
             if (isFeatureUnwanted(feature, result)) return;
-            result.push(buildUnwantedFeatureEntry(feature, markedAt));
+            result.push(buildUnwantedFeatureEntry(feature, markedAt, filteredType));
         });
         return result;
+    }
+
+    // Returns a new list without the entries a feature-type toggle added for
+    // `typeKey` (entries a person marked are kept).
+    function unmarkFeaturesUnwantedByFilteredType(unwantedList, typeKey) {
+        return normalizeUnwantedFeatureList(unwantedList).filter(entry => entry.filteredType !== typeKey);
     }
 
     // Returns a new list without the entries that match `features`.
@@ -471,6 +539,11 @@
         applyCapturedCalTopoFeatureStyle,
         buildCalTopoFeatureUpdatePayload,
         getFeatureTypeLabel,
+        FEATURE_CATEGORIES,
+        getFeatureCategoryKey,
+        getFeatureCategoryLabel,
+        normalizeFeatureTypeFilters,
+        isFeatureCategoryEnabled,
         normalizeSegmentName,
         formatSegmentAssignmentLabel,
         buildSegmentPsrcLookup,
@@ -493,6 +566,7 @@
         getUnaccountedFeatures,
         markFeaturesUnwanted,
         unmarkFeaturesUnwanted,
+        unmarkFeaturesUnwantedByFilteredType,
         formatUnaccountedFeatureNotification
     };
 });

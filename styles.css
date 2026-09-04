@@ -1611,6 +1611,62 @@ footer {
   color: #4dabf7 !important;
 }
 
+/* "New Assignment" notifications (one per unimported CalTopo Assignment) */
+.notif-toast.map-assignment-new {
+  border: 2px solid #40c057;
+  color: #40c057;
+}
+
+.notif-toast.map-assignment-new svg {
+  color: #40c057 !important;
+}
+
+/* Notifications with their own action buttons (Import / Decline for now) get
+   a softer corner so the button row fits; the buttons never trigger the
+   surrounding notification's click. */
+.notif-toast.has-actions,
+.notification-item.has-actions {
+  border-radius: 24px;
+}
+
+.notif-toast.has-actions {
+  max-width: 360px;
+}
+
+.notification-actions {
+  display: flex;
+  gap: 8px;
+  flex-wrap: wrap;
+  margin-top: 8px;
+}
+
+.notification-action-btn {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--pill-border);
+  color: inherit;
+  border-radius: 999px;
+  padding: 5px 14px;
+  font-size: 0.8rem;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.notification-action-btn:hover {
+  background: var(--pill-focus);
+  border-color: var(--accent);
+}
+
+.notification-action-btn.primary {
+  background: rgba(64, 192, 87, 0.15);
+  border-color: rgba(64, 192, 87, 0.5);
+  color: #40c057;
+}
+
+.notification-action-btn.primary:hover {
+  background: rgba(64, 192, 87, 0.3);
+}
+
 .notification-sidebar {
   position: fixed;
   top: 0;

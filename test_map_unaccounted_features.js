@@ -110,4 +110,52 @@ const noId = feature('Foxtrot', 'gfx-4');
     console.log('  ok - formatUnaccountedFeatureNotification lists segment names with an overflow count');
 }
 
+// 8. Feature categories: Assignment vs Shape vs Marker vs Route vs Other
+{
+    const polygon = {type: 'Polygon', coordinates: [[[0, 0], [0, 1], [1, 1], [0, 0]]]};
+    const line = {type: 'LineString', coordinates: [[0, 0], [1, 1]]};
+    const point = {type: 'Point', coordinates: [0, 0]};
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: polygon, attributes: {class: 'Assignment'}}), 'assignment');
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: line, attributes: {class: 'Assignment'}}), 'assignment', 'a line assignment is still an assignment');
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: polygon, attributes: {assignment: {number: '1'}}}), 'assignment');
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: polygon, attributes: {class: 'Shape'}}), 'shape');
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: polygon, attributes: {}}), 'shape', 'a plain polygon is a shape');
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: line, attributes: {class: 'Shape'}}), 'route', 'a line shape is a route');
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: point, attributes: {class: 'Marker'}}), 'marker');
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: point, attributes: {type: 'Feature'}}), 'marker', 'the GeoJSON "Feature" type is ignored');
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: null, attributes: {class: 'Folder'}}), 'other');
+    assert.strictEqual(utils.getFeatureCategoryKey(null), 'other');
+    assert.strictEqual(utils.getFeatureCategoryLabel({geometry: polygon, attributes: {class: 'Assignment'}}), 'Assignment');
+    assert.strictEqual(utils.getFeatureCategoryLabel({geometry: line, attributes: {class: 'Shape'}}), 'Route');
+    assert.deepStrictEqual(utils.FEATURE_CATEGORIES.map(c => c.key), ['marker', 'shape', 'assignment', 'route', 'other']);
+    console.log('  ok - getFeatureCategoryKey tells assignments, shapes, markers, routes and other apart');
+}
+
+// 9. Feature-type filters: missing = on, only false switches a type off
+{
+    assert.deepStrictEqual(utils.normalizeFeatureTypeFilters(undefined), {marker: true, shape: true, assignment: true, route: true, other: true});
+    assert.deepStrictEqual(utils.normalizeFeatureTypeFilters({marker: false, bogus: false, route: 'no'}), {marker: false, shape: true, assignment: true, route: true, other: true});
+    assert.deepStrictEqual(utils.normalizeFeatureTypeFilters([false]), {marker: true, shape: true, assignment: true, route: true, other: true});
+    const marker = {geometry: {type: 'Point', coordinates: [0, 0]}, attributes: {class: 'Marker', name: 'PLS', id: 'm1'}};
+    assert.strictEqual(utils.isFeatureCategoryEnabled(marker, {marker: false}), false);
+    assert.strictEqual(utils.isFeatureCategoryEnabled(marker, {}), true);
+    assert.strictEqual(utils.isFeatureCategoryEnabled(alpha, {marker: false}), true);
+    console.log('  ok - normalizeFeatureTypeFilters / isFeatureCategoryEnabled default every type to on');
+}
+
+// 10. Unwanted entries a type toggle added are tagged and can be restored as a group
+{
+    let unwanted = utils.markFeaturesUnwanted([], [charlie], '2026-01-01T00:00:00.000Z');
+    unwanted = utils.markFeaturesUnwanted(unwanted, [alpha, bravo], '2026-01-01T00:00:00.000Z', 'marker');
+    assert.deepStrictEqual(unwanted.map(e => e.filteredType), [undefined, 'marker', 'marker']);
+    assert.deepStrictEqual(utils.normalizeUnwantedFeatureList(unwanted).map(e => e.filteredType), [undefined, 'marker', 'marker'], 'the tag survives normalization');
+    assert.deepStrictEqual(utils.normalizeUnwantedFeatureList([{id: 'x', filteredType: 7}]), [{id: 'x', name: ''}], 'a bogus tag is dropped');
+
+    const restored = utils.unmarkFeaturesUnwantedByFilteredType(unwanted, 'marker');
+    assert.deepStrictEqual(restored.map(e => e.name), ['charlie'], 'only the toggle-marked entries are removed');
+    assert.strictEqual(unwanted.length, 3, 'input list is not mutated');
+    assert.deepStrictEqual(utils.unmarkFeaturesUnwantedByFilteredType(unwanted, 'route').map(e => e.name), ['charlie', 'alpha', 'bravo']);
+    console.log('  ok - markFeaturesUnwanted tags toggle-marked entries and unmarkFeaturesUnwantedByFilteredType restores them');
+}
+
 console.log('All map unaccounted feature tests passed.');
