@@ -1,7 +1,7 @@
 // Drives the real app.js in a sandbox (fake localStorage / DOM / fetch) to check
 // the Start/End range of the PSRc and POS cumulative charts (Home / Search Log):
-//   - by default Start is the earliest task assignment BY DATE (a backdated task
-//     with a higher number still wins) and End is now,
+//   - by default Start is one hour before the earliest task assignment BY DATE
+//     (a backdated task with a higher number still wins) and End is now,
 //   - an edited Start/End is stored per user + case and survives a reload while
 //     the other field keeps following its default,
 //   - the tiny reset button only shows while a custom range is stored and
@@ -153,7 +153,8 @@ const SEARCH_LOG = [
     ['#2', '03-10-2026', '11:00', 'R1', 'B', '', '', 'Team 2 (2)', '50', '1'],
     ['#3', '03-09-2026', '22:15', 'R1', 'C', '', '', 'Team 3 (4)', '50', '1']
 ];
-const EARLIEST_LOCAL = '2026-03-09T22:15';
+// Default Start: one hour before the earliest task assignment (#3 at 22:15).
+const EARLIEST_LOCAL = '2026-03-09T21:15';
 
 function seedStore({searchLog = SEARCH_LOG, bucket = CASE, settings = {}} = {}) {
     const store = {};
@@ -180,12 +181,12 @@ const nowLocal = (app) => app.getLocalISOString(new Date());
 const checks = [];
 const check = (name, fn) => checks.push({name, fn});
 
-check('the default range runs from the earliest task assignment (by date, not task number) to now', async () => {
+check('the default range runs from one hour before the earliest task assignment (by date, not task number) to now', async () => {
     const app = await boot(seedStore());
     assert.strictEqual(app.getEarliestTaskAssignmentTs(), new Date(2026, 2, 9, 22, 15).getTime(), 'backdated #3 is the earliest');
 
     app.initCharts();
-    assert.strictEqual(app.__byId['chart-start-datetime'].value, EARLIEST_LOCAL);
+    assert.strictEqual(app.__byId['chart-start-datetime'].value, EARLIEST_LOCAL, 'Start defaults to one hour before the earliest task');
     assert.ok(minutesApart(app.__byId['chart-end-datetime'].value, nowLocal(app)) <= 1, 'End defaults to now');
     assert.strictEqual(app.__byId['chart-range-reset-btn'].style.display, 'none', 'no reset button while the defaults apply');
     assert.strictEqual(app.isChartRangeCustomized(), false);

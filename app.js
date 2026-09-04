@@ -37,8 +37,8 @@ const SEGMENTS_PSRC_SORT_STORAGE_KEY = 'sar-segments-psrc-sort-v1';
 // Start/End of the PSRc and POS cumulative charts (Home and Search Log pages).
 // Only values the user typed are stored, in the per-user server settings as a
 // map keyed by sync bucket; a field that was never edited keeps following its
-// default (earliest task assignment -> now) and the tiny reset button clears
-// the stored values again.
+// default (one hour before the earliest task assignment -> now) and the tiny
+// reset button clears the stored values again.
 const CHART_RANGE_STORAGE_KEY = 'sar-chart-range-v1';
 // How often the app re-fetches the CalTopo map to look for shapes that are
 // neither imported as segments nor marked unwanted ("unaccounted" features).
@@ -441,14 +441,28 @@ function getUnaccountedMapFeatures(bundle) {
     return sortMapFeaturesByName(features.filter(feature => !isMapFeatureAccountedFor(feature, b) && !isMapFeatureUnwanted(feature, b)));
 }
 
+// "A, B, C" for the activity log; long lists are cut off with "... (+N more)"
+// so one entry never balloons because a whole map was imported at once.
+function summarizeNamesForLog(names, max = 15) {
+    const list = (Array.isArray(names) ? names : []).map(n => String(n || '').trim()).filter(Boolean);
+    if (list.length <= max) return list.join(', ');
+    return `${list.slice(0, max).join(', ')} (+${list.length - max} more)`;
+}
+
 // Adds `features` to the hidden unwanted list (features that are already
-// segments are skipped: they are accounted for anyway). Returns how many
-// entries were newly added.
+// segments are skipped: they are accounted for anyway) and records the shapes
+// that were newly marked in the activity log. Returns how many entries were
+// newly added.
 function markMapFeaturesUnwanted(features, bundle = null) {
     const utils = getMapSegmentUtils();
     const b = bundle || loadBundle();
     const candidates = (Array.isArray(features) ? features : []).filter(feature => !isMapFeatureAccountedFor(feature, b));
     const before = getUnwantedMapFeatures(b);
+    const wasUnwanted = feature => {
+        const identity = getMapFeatureIdentity(feature);
+        return before.some(entry => unwantedEntryMatchesIdentity(entry, identity));
+    };
+    const newlyMarkedNames = candidates.filter(feature => !wasUnwanted(feature)).map(getMapFeatureDisplayName);
     let after;
     if (typeof utils.markFeaturesUnwanted === 'function') {
         after = utils.markFeaturesUnwanted(before, candidates);
@@ -464,25 +478,35 @@ function markMapFeaturesUnwanted(features, bundle = null) {
     const added = after.length - before.length;
     if (added > 0) {
         b.unwantedMapFeatures = after;
+        addActivityLogEntry('System', `Marked ${added} CalTopo shape${added === 1 ? '' : 's'} as unwanted (not imported): ${summarizeNamesForLog(newlyMarkedNames)}`, b);
         if (!bundle) saveBundle(b);
     }
     return added;
 }
 
+// Takes `features` off the unwanted list again (the "Restore" button) and
+// records the restored shapes in the activity log. Returns how many entries
+// were removed.
 function unmarkMapFeaturesUnwanted(features, bundle = null) {
     const utils = getMapSegmentUtils();
     const b = bundle || loadBundle();
     const before = getUnwantedMapFeatures(b);
+    const list = Array.isArray(features) ? features : [];
+    const restoredNames = list.filter(feature => {
+        const identity = getMapFeatureIdentity(feature);
+        return before.some(entry => unwantedEntryMatchesIdentity(entry, identity));
+    }).map(getMapFeatureDisplayName);
     let after;
     if (typeof utils.unmarkFeaturesUnwanted === 'function') {
-        after = utils.unmarkFeaturesUnwanted(before, features);
+        after = utils.unmarkFeaturesUnwanted(before, list);
     } else {
-        const identities = (Array.isArray(features) ? features : []).map(getMapFeatureIdentity);
+        const identities = list.map(getMapFeatureIdentity);
         after = before.filter(entry => !identities.some(identity => unwantedEntryMatchesIdentity(entry, identity)));
     }
     const removed = before.length - after.length;
     if (removed > 0) {
         b.unwantedMapFeatures = after;
+        addActivityLogEntry('System', `Restored ${removed} CalTopo shape${removed === 1 ? '' : 's'} from the unwanted list: ${summarizeNamesForLog(restoredNames)}`, b);
         if (!bundle) saveBundle(b);
     }
     return removed;
@@ -706,18 +730,37 @@ function buildCalTopoFeatureUpdatePayload(feature, styleOverrides = {}) {
     return payload;
 }
 
+// Border thickness CalTopo draws a shape with when the object carries no
+// stroke-width of its own.
+const CALTOPO_DEFAULT_STROKE_WIDTH = 2;
+
+// The border thickness a segment goes back to once it is no longer actively
+// searched: the stroke-width it had in CalTopo before the overlay first touched
+// it, or CalTopo's standard thickness when it never had one.
+function resolveCalTopoRestingStrokeWidth(originalStyle) {
+    const parsed = parseFloat(originalStyle ? originalStyle['stroke-width'] : NaN);
+    return Number.isFinite(parsed) && parsed > 0 ? parsed : CALTOPO_DEFAULT_STROKE_WIDTH;
+}
+
 // Builds the CalTopo style overlay for an assignment shape.
 // Segments that are NOT actively being searched keep the PSRc gradient color, a base
 // fill opacity, and a fully opaque border. Actively-searched segments override the
 // fill color/opacity, border color/opacity, and border thickness with the values
 // configured on the Settings page.
-function buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings) {
+//
+// `restingBorderWidth` is the thickness a resting segment must be drawn with (see
+// resolveCalTopoRestingStrokeWidth). It is what puts the border back to standard
+// after a search finishes: the active-search thickness was written into the
+// CalTopo object, so leaving stroke-width out would keep the thick border. When
+// the caller does not know the resting width (null) no stroke-width is sent.
+function buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings, restingBorderWidth = null) {
     const STROKE_OVERLAY_OPACITY = 1;
     const fillOpacity = Number(resolveDisplayedSegmentOpacity(isActiveSearch, segmentDisplaySettings, 0.42).toFixed(4));
     const strokeOpacity = Number(resolveDisplayedSegmentBorderOpacity(isActiveSearch, segmentDisplaySettings, STROKE_OVERLAY_OPACITY).toFixed(4));
     const fillColor = resolveDisplayedSegmentFillColor(isActiveSearch, segmentDisplaySettings, overlayColor);
     const borderColor = resolveDisplayedSegmentBorderColor(isActiveSearch, segmentDisplaySettings, overlayColor);
-    const borderWidth = resolveDisplayedSegmentBorderWidth(isActiveSearch, segmentDisplaySettings, null);
+    const baseBorderWidth = Number.isFinite(restingBorderWidth) ? restingBorderWidth : null;
+    const borderWidth = resolveDisplayedSegmentBorderWidth(isActiveSearch, segmentDisplaySettings, baseBorderWidth);
     const style = {
         color: borderColor,
         stroke: borderColor,
@@ -726,12 +769,217 @@ function buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySe
         opacity: strokeOpacity,
         'stroke-opacity': strokeOpacity
     };
-    // Only send a stroke-width when the user's active-search thickness applies, so
-    // resting segments keep whatever border thickness they already had in CalTopo.
     if (Number.isFinite(borderWidth)) {
         style['stroke-width'] = borderWidth;
     }
     return style;
+}
+
+// ---------------------------------------------------------------------------
+// Finished-task summaries in CalTopo assignment descriptions.
+//
+// Once a search of a segment is finished, a one-line summary of that task is
+// appended to the CalTopo description of the matching assignment shape:
+//
+//   [Task #3] Finished 09-04-2026 14:05 - Team Alpha: Jane Doe (lead), John Roe - Tracks: 4 - Sweep width: 40 ft
+//
+// The line is keyed by its "[Task #N]" prefix, so when the task's data changes
+// later (the sweep count is logged, the form's personnel is edited) the line is
+// replaced in place instead of being appended a second time. Whatever the
+// description already contained is kept in front of the summaries.
+// ---------------------------------------------------------------------------
+
+function normalizeSearchTaskTag(taskNum) {
+    const num = String(taskNum === undefined || taskNum === null ? '' : taskNum).trim().replace(/^#/, '');
+    return num ? `#${num}` : '';
+}
+
+function isPreFinishTeamStatus(status) {
+    const s = String(status || '').trim().toLowerCase();
+    if (!s) return false;
+    return !s.includes('finished segment') && !s.startsWith('returning') && !s.startsWith('at base');
+}
+
+// A task is finished when the team on it has reported "Finished Assignment" (or
+// is already returning / back at base), when no team is on it any more, or -
+// for a custom search - when its Task Assignment form is marked completed.
+function isSearchTaskFinished(bundle, taskNum) {
+    const tag = normalizeSearchTaskTag(taskNum);
+    if (!tag) return false;
+    const form = getCustomSearchTaskForm(bundle, tag);
+    if (form) return !!form.completed;
+    const assignments = bundle?.currentAssignments || {};
+    const statuses = bundle?.teamStatuses || {};
+    return !Object.keys(assignments).some(team => {
+        const match = String(assignments[team] || '').match(/#(\d+)/);
+        return !!match && `#${match[1]}` === tag && isPreFinishTeamStatus(statuses[team]);
+    });
+}
+
+function findFinishedAssignmentLogEntry(bundle, taskNum) {
+    const tag = normalizeSearchTaskTag(taskNum);
+    if (!tag) return null;
+    // The activity log is newest-first, so the first hit is the latest report.
+    return (bundle?.activityLog || []).find(entry => {
+        const entryTag = String(entry?.tag || '');
+        if (entryTag !== tag && !entryTag.startsWith(`${tag} - `)) return false;
+        return String(entry?.action || '').toLowerCase().includes('finished assignment');
+    }) || null;
+}
+
+// "MM-DD-YYYY HH:mm" the task was finished at: the team's "Finished assignment"
+// report, else the search-complete time typed into the Task Assignment form.
+function getSearchTaskFinishStamp(bundle, taskNum, logRow) {
+    const entry = findFinishedAssignmentLogEntry(bundle, taskNum);
+    if (entry) {
+        return [entry.date, entry.time].filter(Boolean).join(' ').trim();
+    }
+    const form = bundle?.forms?.[String(normalizeSearchTaskTag(taskNum)).replace('#', '')];
+    const completeTime = String(form?.completeSearch || '').trim();
+    if (completeTime) {
+        const date = String(form?.dateTime || logRow?.[1] || '').trim();
+        return [date, completeTime].filter(Boolean).join(' ').trim();
+    }
+    return '';
+}
+
+// Team name and members ({name, leader}) that searched the task. The Task
+// Assignment form is authoritative when it exists (its personnel list is what
+// the user sees and edits); otherwise the members recorded with the team's
+// "Finished assignment" report, then the current roster of the team.
+function getSearchTaskTeamSummary(bundle, taskNum, logRow) {
+    const tag = normalizeSearchTaskTag(taskNum);
+    const form = bundle?.forms?.[tag.replace('#', '')];
+    const teamCell = String(logRow?.[7] || '').trim();
+    const cellTeamName = teamCell.replace(/\s*\(\d+\)\s*$/, '').trim();
+    const teamName = String(form?.teamName || '').trim() || cellTeamName;
+
+    let members = (Array.isArray(form?.teamMembers) ? form.teamMembers : [])
+        .filter(m => m && String(m.name || '').trim())
+        .map(m => ({name: String(m.name).trim(), leader: m.leader === true}));
+
+    if (!members.length) {
+        const entry = findFinishedAssignmentLogEntry(bundle, tag);
+        members = String(entry?.members || '')
+            .split(',')
+            .map(part => part.trim())
+            .filter(Boolean)
+            .map(part => ({name: part.replace(/\*$/, '').trim(), leader: part.endsWith('*')}));
+    }
+
+    if (!members.length && teamName) {
+        members = (bundle?.pages?.page3 || [])
+            .filter(row => Array.isArray(row) && row[1] === teamName && String(row[0] || '').trim())
+            .map(row => ({name: String(row[0]).trim(), leader: row[2] === row[0]}));
+    }
+
+    return {teamName, members};
+}
+
+function formatSearchTaskSweepWidth(value) {
+    const raw = String(value === undefined || value === null ? '' : value).trim();
+    if (!raw) return 'n/a';
+    return /^[\d.]+$/.test(raw) ? `${raw} ft` : raw;
+}
+
+function formatSearchTaskTrackCount(value) {
+    const raw = String(value === undefined || value === null ? '' : value).trim();
+    return raw || 'not logged';
+}
+
+// The description line for one Search Log row (see the section comment above).
+function buildSearchTaskSummaryLine(bundle, logRow) {
+    const tag = normalizeSearchTaskTag(logRow?.[0]);
+    if (!tag) return '';
+    const parts = [];
+    const finishedAt = getSearchTaskFinishStamp(bundle, tag, logRow);
+    parts.push(finishedAt ? `Finished ${finishedAt}` : 'Finished');
+
+    const {teamName, members} = getSearchTaskTeamSummary(bundle, tag, logRow);
+    const memberText = members.map(m => (m.leader ? `${m.name} (lead)` : m.name)).join(', ');
+    if (teamName && memberText) {
+        parts.push(`Team ${teamName}: ${memberText}`);
+    } else if (teamName) {
+        parts.push(`Team ${teamName}`);
+    } else if (memberText) {
+        parts.push(memberText);
+    }
+
+    parts.push(`Tracks: ${formatSearchTaskTrackCount(logRow?.[9])}`);
+    parts.push(`Sweep width: ${formatSearchTaskSweepWidth(logRow?.[8])}`);
+    return `[Task ${tag}] ${parts.join(' - ')}`;
+}
+
+// Appends `line` to `description`, replacing any earlier summary of the same task.
+function appendSearchTaskSummaryToDescription(description, taskNum, line) {
+    const tag = normalizeSearchTaskTag(taskNum);
+    const existing = String(description === undefined || description === null ? '' : description);
+    if (!tag || !line) return existing;
+    const escaped = `[Task ${tag}]`.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const withoutOld = existing
+        .split('\n')
+        .filter(part => !new RegExp(`^\\s*${escaped}`).test(part))
+        .join('\n')
+        .replace(/\s+$/, '');
+    return withoutOld ? `${withoutOld}\n${line}` : line;
+}
+
+// Map of segment lookup key ("id:<caltopo id>", "region - segment", "segment")
+// -> summary lines of every finished task on that segment, in task order.
+function buildFinishedTaskSummaryLookup(bundle) {
+    const lookup = new Map();
+    const rows = ensureSegmentsPageRows(bundle);
+    const searchLog = (bundle?.pages?.page4 || []).filter(row => Array.isArray(row) && normalizeSearchTaskTag(row[0]));
+    searchLog.sort((a, b) => parseInt(String(a[0]).replace('#', ''), 10) - parseInt(String(b[0]).replace('#', ''), 10));
+
+    searchLog.forEach(row => {
+        const tag = normalizeSearchTaskTag(row[0]);
+        if (!isSearchTaskFinished(bundle, tag)) return;
+        const line = buildSearchTaskSummaryLine(bundle, row);
+        if (!line) return;
+        const region = row[3];
+        const segment = row[4];
+        const segmentRow = rows.find(r => Array.isArray(r) && r[0] === region && r[1] === segment)
+            || rows.find(r => Array.isArray(r) && normalizeSegmentNameForMatch(r[1]) === normalizeSegmentNameForMatch(segment));
+        const keys = new Set();
+        const caltopoId = String(segmentRow?.[9] || '').trim();
+        if (caltopoId && !isSyntheticCalTopoFeatureId(caltopoId)) keys.add(`id:${caltopoId}`);
+        const fullName = normalizeSegmentNameForMatch(formatSegmentAssignmentLabel(region, segment));
+        const shortName = normalizeSegmentNameForMatch(segment);
+        if (fullName) keys.add(fullName);
+        if (shortName) keys.add(shortName);
+        keys.forEach(key => {
+            if (!lookup.has(key)) lookup.set(key, []);
+            lookup.get(key).push({tag, line});
+        });
+    });
+    return lookup;
+}
+
+function getFinishedTaskSummariesForFeature(feature, lookup) {
+    if (!(lookup instanceof Map) || !lookup.size) return [];
+    const attrs = feature?.attributes || feature?.properties || {};
+    const id = getCalTopoWritableFeatureId(feature);
+    if (id && lookup.has(`id:${id}`)) return lookup.get(`id:${id}`);
+    const nameKeys = [attrs.name, attrs.label, attrs.title].map(normalizeSegmentNameForMatch).filter(Boolean);
+    for (const key of nameKeys) {
+        if (lookup.has(key)) return lookup.get(key);
+    }
+    return [];
+}
+
+// The description an assignment shape should carry once the summaries of its
+// finished tasks are appended, or null when nothing needs to change.
+function buildCalTopoAssignmentDescription(feature, lookup) {
+    const summaries = getFinishedTaskSummariesForFeature(feature, lookup);
+    if (!summaries.length) return null;
+    const attrs = feature?.attributes || feature?.properties || {};
+    const current = String(attrs.description === undefined || attrs.description === null ? '' : attrs.description);
+    let next = current;
+    summaries.forEach(({tag, line}) => {
+        next = appendSearchTaskSummaryToDescription(next, tag, line);
+    });
+    return next === current ? null : next;
 }
 
 async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
@@ -766,6 +1014,9 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
     const segmentDisplaySettings = getSegmentDisplaySettings(bundle);
     const psrcLookup = buildSegmentPsrcLookup(segmentRows, segmentDisplaySettings);
     const activeSearchNames = buildActiveSearchSegmentNameSet(bundle, segmentRows);
+    // Summaries of finished tasks, appended to the description of each segment's
+    // assignment shape along with the style push (the same POST carries both).
+    const finishedTaskSummaries = enabled ? buildFinishedTaskSummaryLookup(bundle) : new Map();
     const matchingAssignments = features.filter(feature => {
         const styleKey = getCalTopoOverlayOriginalStyleKey(feature);
         if (!styleKey || getCalTopoFeatureTypeKey(feature) !== 'assignment') {
@@ -808,11 +1059,18 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
 
         const isActiveSearch = enabled && isFeatureActivelyBeingSearched(feature, activeSearchNames);
         const overlayColor = style.stroke || style.fill || (style.color ? style.color.css : null) || '#40c057';
+        // Resting segments are pushed with the border thickness they had before the
+        // overlay (or CalTopo's standard one), so a segment whose search just
+        // finished loses the thick active-search border again.
         const overlayStyle = enabled
-            ? buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings)
+            ? buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings, resolveCalTopoRestingStrokeWidth(originals[styleKey]))
             : style;
+        const nextDescription = enabled ? buildCalTopoAssignmentDescription(feature, finishedTaskSummaries) : null;
 
         const payload = buildCalTopoFeatureUpdatePayload(feature, overlayStyle);
+        if (nextDescription !== null) {
+            payload.properties.description = nextDescription;
+        }
         if (featureId) {
             payload.id = featureId;
         }
@@ -845,6 +1103,9 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
         }
 
         applyCapturedCalTopoFeatureStyle(feature.attributes, overlayStyle);
+        if (nextDescription !== null) {
+            feature.attributes.description = nextDescription;
+        }
         updatedCount++;
     }
 
@@ -862,10 +1123,11 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
     return {updatedCount, errors};
 }
 
-// Re-push the CalTopo/SARTopo assignment overlay (PSRc colors + active-search
-// fill opacity) whenever the underlying data changes - e.g. a search log edit
-// that recomputes a segment's PSRc, or that flips a segment between actively
-// searched and idle.
+// Re-push the CalTopo/SARTopo assignment overlay (PSRc colors, active-search
+// style incl. border thickness, finished-task description summaries) whenever
+// the underlying data changes - e.g. a search log edit that recomputes a
+// segment's PSRc, a team finishing its assignment (which flips the segment
+// from actively searched back to resting), or a sweep count being logged.
 //
 // This is a best-effort, debounced, SILENT refresh: it does nothing unless the
 // assignment overlay is currently enabled and a CalTopo map with already
@@ -3347,9 +3609,46 @@ function fetchInitWithKeepalive(body, init = {}) {
 // any more and only takes up storage.
 removeStorageItem(LEGACY_SYNC_SNAPSHOT_STORAGE_KEY);
 
+// The parts of the search file that decide how the CalTopo assignment overlay
+// draws a segment (active-search vs resting style) and what the finished-task
+// summary in its description says: team statuses/assignments, the Task
+// Assignment forms' completion, team name and personnel, and the activity-log
+// "Finished assignment" reports that stamp the finish time.
+function buildSearchActivitySignature(bundle) {
+  const forms = bundle?.forms || {};
+  return JSON.stringify({
+    statuses: bundle?.teamStatuses || {},
+    assignments: bundle?.currentAssignments || {},
+    forms: Object.keys(forms).map(num => {
+      const form = forms[num] || {};
+      const members = Array.isArray(form.teamMembers) ? form.teamMembers : [];
+      return [num, !!form.completed, form.teamName || '', form.completeSearch || '',
+        members.map(m => `${m?.name || ''}${m?.leader ? '*' : ''}`).join('|')];
+    }),
+    finished: (bundle?.activityLog || [])
+      .filter(entry => String(entry?.action || '').toLowerCase().includes('finished assignment'))
+      .map(entry => `${entry.tag}|${entry.date}|${entry.time}`)
+  });
+}
+
+function didSearchActivityChange(previous, next) {
+  if (!previous || !next) return false;
+  try {
+    return buildSearchActivitySignature(previous) !== buildSearchActivitySignature(next);
+  } catch (e) {
+    return false;
+  }
+}
+
 // Store the search file locally, queue the rows that changed and (unless the
 // caller flushes later itself) send them. Returns the flush promise so callers
 // that reload or wait can await the write.
+//
+// A team reporting "Finished Assignment" (or any other status / assignment /
+// task-form change, see buildSearchActivitySignature) must reach CalTopo too:
+// the segment goes back to its resting style and border thickness and its
+// description gets the task's summary. That refresh is debounced and silent,
+// and a no-op unless the assignment overlay is enabled.
 function saveBundle(bundle, deferFlush = false) {
   bundle.lastModified = new Date().toISOString();
   const sanitized = sanitizeBundle(bundle);
@@ -3360,8 +3659,9 @@ function saveBundle(bundle, deferFlush = false) {
   // Ensure the current file is always in the saved files list
   saveFileToList(sanitized.fileName, sanitized);
   updateFileNameDisplay();
-  if (deferFlush) return Promise.resolve(false);
-  return pushBundleDelta(sanitized);
+  const flush = deferFlush ? Promise.resolve(false) : pushBundleDelta(sanitized);
+  if (didSearchActivityChange(previous, sanitized)) refreshCalTopoAssignmentOverlayIfEnabled();
+  return flush;
 }
 
 function getSavedFiles() {
@@ -3724,9 +4024,127 @@ function loadData() {
   return defaultData();
 }
 
+// Which cells of each table page are described in the activity log when they
+// are edited, and how a row is named there. Derived cells (PSR values, the
+// Regions consensus) are left out, as are cells whose change is already logged
+// by a dedicated handler (personnel team / team lead / status), so nothing is
+// recorded twice.
+const PAGE_DATA_LOG_INFO = {
+  index: {
+    type: 'Region',
+    keyCols: [0],
+    rowName: row => String(row?.[0] || '').trim() || 'unnamed region'
+  },
+  page2: {
+    type: 'Segment',
+    keyCols: [0, 1],
+    columns: {0: 'Region', 1: 'Segment', 2: 'Area', 3: 'Length', 4: 'Sweep Width', 5: 'Time per Sweep', 8: 'Time per Sweep (manual override)', 9: 'CalTopo link'},
+    rowName: row => formatSegmentAssignmentLabel(row?.[0], row?.[1]) || String(row?.[0] || '').trim() || 'unnamed segment'
+  },
+  page3: {
+    type: 'Personnel',
+    keyCols: [0],
+    columns: {0: 'Name', 3: 'GPS', 4: 'Radio', 5: 'Medic'},
+    rowName: row => String(row?.[0] || '').trim() || 'unnamed person'
+  },
+  page4: {
+    type: 'Search Log Entry',
+    keyCols: [0],
+    columns: {1: 'Date', 2: 'Time', 3: 'Region', 4: 'Segment', 7: 'Team', 8: 'Sweep Width', 9: 'Num of Sweeps'},
+    rowName: row => String(row?.[0] || '').trim() || 'unnumbered task'
+  }
+};
+
+function describeCellChangeForLog(label, oldValue, newValue) {
+  const isToggle = v => v === 'true' || v === 'false';
+  if (isToggle(newValue) && (isToggle(oldValue) || oldValue === '')) {
+    return `${label} turned ${newValue === 'true' ? 'on' : 'off'}`;
+  }
+  const show = v => (v === '' ? '(blank)' : `"${v}"`);
+  if (oldValue === '') return `${label} set to ${show(newValue)}`;
+  if (newValue === '') return `${label} cleared (was ${show(oldValue)})`;
+  return `${label} changed from ${show(oldValue)} to ${show(newValue)}`;
+}
+
+// Records every edited cell of a table page in the activity log by comparing
+// the rows about to be saved with the rows that were stored before. Rows are
+// matched by position when the table kept its size (a plain cell edit, which
+// also covers renames) and by their name/key otherwise (a row was added or
+// removed - which the caller logs itself). Cells that are not user-editable
+// text are skipped; see PAGE_DATA_LOG_INFO.
+function logPageDataChanges(key, before, after, bundle) {
+  const info = PAGE_DATA_LOG_INFO[key];
+  if (!info) return 0;
+
+  const cell = v => (v === undefined || v === null) ? '' : String(v).trim();
+  let beforeRows;
+  let afterRows;
+  let columnLabel;
+  const messages = [];
+
+  if (key === 'index') {
+    const beforeHeaders = Array.isArray(before?.headers) ? before.headers : [];
+    const afterHeaders = Array.isArray(after?.headers) ? after.headers : [];
+    // A voter column was added or removed (logged by the caller): every cell
+    // shifted position, so a cell-by-cell comparison would be meaningless.
+    if (beforeHeaders.length !== afterHeaders.length && beforeHeaders.length > 0) return 0;
+    afterHeaders.forEach((h, c) => {
+      const oldName = cell(beforeHeaders[c]);
+      const newName = cell(h);
+      if (beforeHeaders.length && oldName !== newName) messages.push(`Regions: ${describeCellChangeForLog('voter column name', oldName, newName)}`);
+    });
+    beforeRows = Array.isArray(before?.rows) ? before.rows : [];
+    afterRows = Array.isArray(after?.rows) ? after.rows : [];
+    // Only the region name and the voter columns are typed in; the last column
+    // (Consensus) is computed from them.
+    columnLabel = c => (c === afterHeaders.length - 1 ? null : (cell(afterHeaders[c]) || `Column ${c + 1}`));
+  } else {
+    beforeRows = Array.isArray(before) ? before : [];
+    afterRows = Array.isArray(after) ? after : [];
+    columnLabel = c => (info.columns && Object.prototype.hasOwnProperty.call(info.columns, c) ? info.columns[c] : null);
+  }
+
+  const diffRows = (oldRow, newRow) => {
+    if (!Array.isArray(oldRow) || !Array.isArray(newRow)) return;
+    const name = info.rowName(newRow);
+    const width = Math.max(oldRow.length, newRow.length);
+    for (let c = 0; c < width; c++) {
+      const label = columnLabel(c);
+      if (!label) continue;
+      const oldValue = cell(oldRow[c]);
+      const newValue = cell(newRow[c]);
+      if (oldValue === newValue) continue;
+      messages.push(`${info.type} "${name}": ${describeCellChangeForLog(label, oldValue, newValue)}`);
+    }
+  };
+
+  if (beforeRows.length === afterRows.length) {
+    afterRows.forEach((row, r) => diffRows(beforeRows[r], row));
+  } else {
+    const rowKey = row => (Array.isArray(row) ? info.keyCols.map(c => cell(row[c]).toLowerCase()).join('|') : '');
+    const byKey = new Map();
+    beforeRows.forEach(row => {
+      const k = rowKey(row);
+      if (k.replace(/\|/g, '') && !byKey.has(k)) byKey.set(k, row);
+    });
+    afterRows.forEach(row => {
+      const k = rowKey(row);
+      if (byKey.has(k)) diffRows(byKey.get(k), row);
+    });
+  }
+
+  messages.forEach(message => addActivityLogEntry('System', message, bundle));
+  return messages.length;
+}
+
 function saveCurrentPageData(data) {
   const bundle = loadBundle();
   const key = pageKey();
+  try {
+    logPageDataChanges(key, bundle.pages[key], data, bundle);
+  } catch (err) {
+    console.error('Could not record the table edit in the activity log:', err);
+  }
   if (key === 'page3') {
     bundle.pages[key] = splitPersonnelData(data, bundle);
   } else {
@@ -4232,11 +4650,13 @@ function buildRegionsTable() {
       delBtn.title = 'Delete Voter Column';
       delBtn.onclick = () => {
         if (data.headers.length <= 3) return; // Keep at least one voter
+        const removedHeaderName = data.headers[c];
         data.headers.splice(c, 1);
         data.rows.forEach(row => row.splice(c, 1));
         if (data.voterVisibility) {
           data.voterVisibility.splice(c - 1, 1);
         }
+        logDeletion('Voter Column', removedHeaderName);
         saveCurrentPageData(data);
         buildRegionsTable();
       };
@@ -4756,21 +5176,12 @@ function buildSegmentsTable() {
             actionBtn.textContent = 'search';
             actionBtn.onclick = () => {
               showTeamSelectionPopup((teamName) => {
+                // Same assignment process as the Personnel page's "Assign New
+                // Task" (Search Log row, team status, activity log entry).
                 showMissingStepsPopup(teamName, null, (currentStamp) => {
                   const region = sortedData[r][0] || '';
                   const segment = sortedData[r][1] || '';
-                  const taskNumber = addAutoSearchLogEntry(teamName, region, segment);
-                  const assignmentStr = `#${taskNumber} ${region} - ${segment}`;
-                  
-                  const bundle2 = loadBundle();
-                  bundle2.currentAssignments[teamName] = assignmentStr;
-                  bundle2.teamAssignmentTimes[teamName] = currentStamp.timestampMs;
-                  bundle2.teamStatuses[teamName] = 'assigned';
-                  if (!bundle2.parChecks) bundle2.parChecks = {};
-                  bundle2.parChecks[teamName] = { lastTime: currentStamp.timestampMs };
-                  saveBundle(bundle2);
-                  addActivityLogEntry(teamName, `Started search on ${assignmentStr}`, null, null, currentStamp.date, currentStamp.time);
-                  
+                  assignSearchTaskToTeam(teamName, region, segment, currentStamp);
                   navigateToPage('page4.html?scroll=latest');
                 });
               }, {
@@ -5778,6 +6189,45 @@ function addAutoSearchLogEntry(teamName, region, segment) {
   return taskNumber;
 }
 
+// Date/time stamp ({date: 'MM-DD-YYYY', time: 'hh:mm', timestampMs}) for "now",
+// the same shape showMissingStepsPopup hands to its onComplete callback.
+function buildCurrentTimeStamp() {
+  const now = new Date();
+  return {
+    date: `${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}-${now.getFullYear()}`,
+    time: `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`,
+    timestampMs: now.getTime()
+  };
+}
+
+// Assigns a new task to a roster team. This is the ONE process behind both the
+// Personnel page ("Assign New Task") and the Segments page ("search" button),
+// so a search shows up identically in the Search Log and the activity log no
+// matter where it was started from: a Search Log row is created, the team is
+// put on the assignment with status "assigned" and a fresh par-check timer, and
+// a single "Assigned to segment: #N Region - Segment" activity log entry is
+// written with the timestamp the user confirmed. Returns the task number and
+// the full assignment label.
+function assignSearchTaskToTeam(teamName, region, segment, currentStamp = null) {
+  const stamp = currentStamp || buildCurrentTimeStamp();
+  const taskNumber = addAutoSearchLogEntry(teamName, region, segment);
+  const fullAssignment = `#${taskNumber} ${formatSegmentAssignmentLabel(region, segment)}`;
+
+  const b = loadBundle();
+  if (!b.currentAssignments) b.currentAssignments = {};
+  if (!b.teamAssignmentTimes) b.teamAssignmentTimes = {};
+  if (!b.teamStatuses) b.teamStatuses = {};
+  if (!b.parChecks) b.parChecks = {};
+  b.currentAssignments[teamName] = fullAssignment;
+  b.teamAssignmentTimes[teamName] = stamp.timestampMs;
+  b.teamStatuses[teamName] = 'assigned';
+  b.parChecks[teamName] = { lastTime: stamp.timestampMs };
+  saveBundle(b);
+  markTaskUpdated(teamName);
+  addActivityLogEntry(teamName, 'Assigned to segment: ' + fullAssignment, null, null, stamp.date, stamp.time);
+  return { taskNumber, fullAssignment };
+}
+
 // ---------------------------------------------------------------------------
 // Custom (manually entered) searches
 //
@@ -6581,21 +7031,10 @@ function showNewSegmentPopup(teamName, parentPopup) {
     assignBtn.onclick = () => {
       if (!select.value) return;
       
-      const {region, segment, val} = JSON.parse(select.value);
+      const {region, segment} = JSON.parse(select.value);
       
       showMissingStepsPopup(teamName, null, (currentStamp) => {
-        const taskNumber = addAutoSearchLogEntry(teamName, region, segment);
-        const fullAssignment = `#${taskNumber} ${val}`;
-        
-        const b2 = loadBundle();
-        b2.currentAssignments[teamName] = fullAssignment;
-        b2.teamAssignmentTimes[teamName] = currentStamp.timestampMs;
-        b2.teamStatuses[teamName] = 'assigned';
-        if (!b2.parChecks) b2.parChecks = {};
-        b2.parChecks[teamName] = { lastTime: currentStamp.timestampMs };
-        saveBundle(b2);
-        markTaskUpdated(teamName);
-        addActivityLogEntry(teamName, 'Assigned to segment: ' + fullAssignment, null, null, currentStamp.date, currentStamp.time);
+        assignSearchTaskToTeam(teamName, region, segment, currentStamp);
         closePopup(popup);
         refreshCurrentPageTable();
       });
@@ -7083,6 +7522,15 @@ function logDeletion(type, name, bundle = null) {
 
 function logCreation(type, name, bundle = null) {
   addActivityLogEntry('System', `Created ${type}: ${name || 'unknown'}`, bundle);
+}
+
+// Records a Settings page change ("Setting "Theme" changed from dark to
+// light"). Nothing is written when the value did not actually change.
+function logSettingChange(label, oldValue, newValue, bundle = null) {
+  const show = v => ((v === '' || v === undefined || v === null) ? '(blank)' : String(v));
+  if (show(oldValue) === show(newValue)) return false;
+  addActivityLogEntry('System', `Setting "${label}" changed from ${show(oldValue)} to ${show(newValue)}`, bundle);
+  return true;
 }
 
 function showUserSelectionPopup() {
@@ -7744,6 +8192,7 @@ function showEditLogTimePopup(entry) {
                     entry.originalTime = entry.time;
                 }
                 const oldTimestamp = entry.timestamp;
+                const previousStamp = `${entry.date} ${entry.time}`;
                 entry.date = dateInput.value;
                 entry.time = timeInput.value;
                 
@@ -7756,6 +8205,10 @@ function showEditLogTimePopup(entry) {
                 if (idx > -1) {
                     entry.timestamp = newTimestamp;
                     bundle.activityLog[idx] = entry;
+                    const newStamp = `${entry.date} ${entry.time}`;
+                    if (newStamp !== previousStamp) {
+                        addActivityLogEntry('System', `Log entry time changed from ${previousStamp} to ${newStamp}: ${entry.team && entry.team !== 'System' ? `Team ${entry.team} - ` : ''}${entry.action || ''}`, bundle);
+                    }
                     bundle.activityLog.sort((a, b) => (b.timestamp || 0) - (a.timestamp || 0));
                     saveBundle(bundle);
                     refreshCurrentPageTable();
@@ -8805,12 +9258,13 @@ function getEarliestTaskAssignmentTs(bundle) {
     return earliest;
 }
 
-// Defaults: start at the earliest task assignment (24 hours ago when nothing
-// has been assigned yet) and end now.
+// Defaults: start one hour before the earliest task assignment (24 hours ago
+// when nothing has been assigned yet) and end now.
+const CHART_RANGE_START_LEAD_MS = 3600000;
 function getDefaultChartRange(bundle) {
     const now = Date.now();
     const earliest = getEarliestTaskAssignmentTs(bundle);
-    const startTs = earliest && earliest < now ? earliest : now - 24 * 3600000;
+    const startTs = earliest && earliest < now ? earliest - CHART_RANGE_START_LEAD_MS : now - 24 * 3600000;
     return {
         start: getLocalISOString(new Date(startTs)),
         end: getLocalISOString(new Date(now))
@@ -10112,18 +10566,36 @@ function buildSettingsPage() {
 
     // Applies one active-search display input to the bundle, normalizing the value so
     // the input always reflects what was actually stored.
+    // Color pickers save on every `oninput` while the user drags; the activity
+    // log entry is written once, from `onchange`, comparing against the value
+    // that was last recorded.
     const bindSegmentSearchInput = (input, bundleKey, settingsKey, message, eventName = 'onchange') => {
         if (!input) return;
         input.value = segmentDisplaySettings[settingsKey];
+        const settingLabel = message.replace(/ updated\.$/, '');
+        let lastLoggedValue = segmentDisplaySettings[settingsKey];
+        const logIfChanged = nextBundle => {
+            const stored = getSegmentDisplaySettings(nextBundle)[settingsKey];
+            const logged = logSettingChange(settingLabel, lastLoggedValue, stored, nextBundle);
+            lastLoggedValue = stored;
+            return logged;
+        };
         input[eventName] = () => {
             const nextBundle = loadBundle();
             const nextSettings = getSegmentDisplaySettings({...nextBundle, [bundleKey]: input.value});
             nextBundle[bundleKey] = nextSettings[settingsKey];
             input.value = nextSettings[settingsKey];
+            if (eventName === 'onchange') logIfChanged(nextBundle);
             saveBundle(nextBundle);
             updateSegmentSearchOpacityLabel(nextSettings);
             status.textContent = message;
         };
+        if (eventName !== 'onchange') {
+            input.onchange = () => {
+                const nextBundle = loadBundle();
+                if (logIfChanged(nextBundle)) saveBundle(nextBundle);
+            };
+        }
     };
 
     if (segmentScaleMaxToggle) {
@@ -10131,7 +10603,10 @@ function buildSettingsPage() {
         updateSegmentScaleLabel(segmentDisplaySettings);
         segmentScaleMaxToggle.onchange = () => {
             const nextBundle = loadBundle();
+            const wasPsriMax = nextBundle.segmentColorScaleUsePsriMax === true;
             nextBundle.segmentColorScaleUsePsriMax = segmentScaleMaxToggle.checked;
+            logSettingChange('Segment color scale maximum', wasPsriMax ? 'highest PSRi' : 'highest PSRc',
+                segmentScaleMaxToggle.checked ? 'highest PSRi' : 'highest PSRc', nextBundle);
             saveBundle(nextBundle);
             updateSegmentScaleLabel(getSegmentDisplaySettings(nextBundle));
             status.textContent = 'Segment color scale maximum source updated.';
@@ -10144,12 +10619,23 @@ function buildSettingsPage() {
         [segmentScaleHighColorInput, 'segmentColorScaleHighColor', 'High color updated.']
     ].forEach(([input, key, message]) => {
         if (!input) return;
-        input.value = segmentDisplaySettings[key === 'segmentColorScaleLowColor' ? 'lowColor' : key === 'segmentColorScaleMidColor' ? 'midColor' : 'highColor'];
+        const settingsKey = key === 'segmentColorScaleLowColor' ? 'lowColor' : key === 'segmentColorScaleMidColor' ? 'midColor' : 'highColor';
+        input.value = segmentDisplaySettings[settingsKey];
+        let lastLoggedValue = segmentDisplaySettings[settingsKey];
         input.oninput = () => {
             const nextBundle = loadBundle();
             nextBundle[key] = input.value;
             saveBundle(nextBundle);
             status.textContent = message;
+        };
+        // One log entry per picker session (see bindSegmentSearchInput).
+        input.onchange = () => {
+            const nextBundle = loadBundle();
+            const stored = getSegmentDisplaySettings(nextBundle)[settingsKey];
+            if (logSettingChange(`Segment color scale ${message.replace(/ updated\.$/, '').toLowerCase()}`, lastLoggedValue, stored, nextBundle)) {
+                saveBundle(nextBundle);
+            }
+            lastLoggedValue = stored;
         };
     });
 
@@ -10173,7 +10659,9 @@ function buildSettingsPage() {
     themeLabel.textContent = bundle.theme === 'light' ? 'Light Mode' : 'Dark Mode';
     themeToggle.onchange = () => {
       const nextBundle = loadBundle();
+      const previousTheme = nextBundle.theme === 'light' ? 'light' : 'dark';
       nextBundle.theme = themeToggle.checked ? 'light' : 'dark';
+      logSettingChange('Theme', previousTheme, nextBundle.theme, nextBundle);
       saveBundle(nextBundle);
       applyTheme(nextBundle);
       applyBackground(nextBundle);
@@ -10202,7 +10690,9 @@ function buildSettingsPage() {
         highlightAccentToggle.checked = false;
         return;
       }
+      const wasOn = !!account.useHighlightColor;
       account.useHighlightColor = highlightAccentToggle.checked;
+      logSettingChange('Use My Highlight Color', wasOn ? 'ON' : 'OFF', highlightAccentToggle.checked ? 'ON' : 'OFF', nextBundle);
       saveBundle(nextBundle);
       applyAccentColor(nextBundle);
       highlightAccentLabel.textContent = `Use My Highlight Color is ${highlightAccentToggle.checked ? 'ON' : 'OFF'}`;
@@ -10215,7 +10705,9 @@ function buildSettingsPage() {
     tipsLabel.textContent = `Tips are ${tipsToggle.checked ? 'ON' : 'OFF'}`;
     tipsToggle.onchange = () => {
       const nextBundle = loadBundle();
+      const wereOn = nextBundle.showTips !== false;
       nextBundle.showTips = tipsToggle.checked;
+      logSettingChange('Tips', wereOn ? 'ON' : 'OFF', tipsToggle.checked ? 'ON' : 'OFF', nextBundle);
       saveBundle(nextBundle);
       applyTipsVisibility(nextBundle);
       tipsLabel.textContent = `Tips are ${tipsToggle.checked ? 'ON' : 'OFF'}`;
@@ -10232,7 +10724,9 @@ function buildSettingsPage() {
         return;
       }
       const nextBundle = loadBundle();
+      const previousFrequency = nextBundle.parCheckFrequency || 20;
       nextBundle.parCheckFrequency = val;
+      logSettingChange('Par check frequency (minutes)', previousFrequency, val, nextBundle);
       saveBundle(nextBundle);
       status.textContent = `Par check frequency updated to ${val} minutes.`;
     };
@@ -10246,7 +10740,9 @@ function buildSettingsPage() {
     if (mapAutoCheckLabel) mapAutoCheckLabel.textContent = describe(mapAutoCheckToggle.checked);
     mapAutoCheckToggle.onchange = () => {
       const nextBundle = loadBundle();
+      const wasOn = isMapUnaccountedAutoCheckEnabled(nextBundle);
       nextBundle.mapUnaccountedAutoCheck = mapAutoCheckToggle.checked;
+      logSettingChange('Automatic unaccounted map feature check', wasOn ? 'ON' : 'OFF', mapAutoCheckToggle.checked ? 'ON' : 'OFF', nextBundle);
       saveBundle(nextBundle);
       if (mapAutoCheckLabel) mapAutoCheckLabel.textContent = describe(mapAutoCheckToggle.checked);
       status.textContent = mapAutoCheckToggle.checked
@@ -10257,7 +10753,9 @@ function buildSettingsPage() {
 
   toggle.onchange = () => {
     const nextBundle = loadBundle();
+    const wasOn = !!nextBundle.deleteMode;
     nextBundle.deleteMode = toggle.checked;
+    logSettingChange('Delete Mode', wasOn ? 'ON' : 'OFF', toggle.checked ? 'ON' : 'OFF', nextBundle);
     saveBundle(nextBundle);
     label.textContent = `Delete Mode is ${toggle.checked ? 'ON' : 'OFF'}`;
     status.textContent = `Settings saved automatically.`;
@@ -10273,6 +10771,7 @@ function buildSettingsPage() {
         reader.onload = (e) => {
           const nextBundle = loadBundle();
           nextBundle.background = e.target.result;
+          addActivityLogEntry('System', `Setting "Background image" changed to uploaded image "${file.name}"`, nextBundle);
           saveBundle(nextBundle);
           applyBackground(nextBundle);
           status.textContent = 'Background updated and saved.';
@@ -10288,7 +10787,9 @@ function buildSettingsPage() {
   if (resetBgBtn) {
     resetBgBtn.onclick = () => {
       const nextBundle = loadBundle();
+      const wasDefault = nextBundle.background === 'assets/us-night.jpg';
       nextBundle.background = 'assets/us-night.jpg';
+      if (!wasDefault) addActivityLogEntry('System', 'Setting "Background image" reverted to the default image', nextBundle);
       saveBundle(nextBundle);
       applyBackground(nextBundle);
         status.textContent = 'Background reverted to default us-night satellite image.';
@@ -10308,6 +10809,7 @@ function buildSettingsPage() {
         reader.onload = (e) => {
           const nextBundle = loadBundle();
           nextBundle.logo = e.target.result;
+          addActivityLogEntry('System', `Setting "Logo" changed to uploaded image "${file.name}"`, nextBundle);
           saveBundle(nextBundle);
           applyLogo(nextBundle);
           status.textContent = 'Logo updated and saved.';
@@ -10323,7 +10825,9 @@ function buildSettingsPage() {
   if (resetLogoBtn) {
     resetLogoBtn.onclick = () => {
       const nextBundle = loadBundle();
+      const hadLogo = !!(typeof nextBundle.logo === 'string' && nextBundle.logo.trim());
       nextBundle.logo = '';
+      if (hadLogo) addActivityLogEntry('System', 'Setting "Logo" removed', nextBundle);
       saveBundle(nextBundle);
       applyLogo(nextBundle);
       status.textContent = 'Logo removed.';
@@ -10516,7 +11020,11 @@ function buildProfilePage() {
       cb.onchange = () => {
         const b = loadBundle();
         if (!b.profile) b.profile = {};
+        const wasCompleted = !!b.profile.completed;
         b.profile.completed = cb.checked;
+        if (wasCompleted !== cb.checked) {
+          addActivityLogEntry('System', cb.checked ? 'Profile marked as completed' : 'Profile marked as not completed', b);
+        }
         saveBundle(b);
         checkParChecksAndNotify(); // Trigger header refresh
       };
@@ -10554,6 +11062,15 @@ function buildProfilePage() {
     input.oninput = () => {
       profile[key] = input.value;
       save();
+    };
+    // Typing saves on every keystroke; the activity log gets one entry per
+    // field once the user leaves it, with the value the field started from.
+    let lastLoggedValue = String(profile[key] || '');
+    input.onchange = () => {
+      const newValue = String(input.value || '').trim();
+      if (newValue === lastLoggedValue.trim()) return;
+      addActivityLogEntry('System', `Profile: ${describeCellChangeForLog(label, lastLoggedValue.trim(), newValue)}`);
+      lastLoggedValue = newValue;
     };
     
     grp.appendChild(input);
@@ -11573,6 +12090,14 @@ function renderTaskForm(container, taskNum, formData) {
     saveBundle(b);
   };
 
+  // Every edit made on the form is recorded in the activity log (one entry per
+  // field, written when the user leaves it). The entries are filed under
+  // "System" on purpose: the form fills its Leave Base / Begin Search / par
+  // check times from the TEAM's log entries by keyword, so a "Leave Base
+  // changed ..." note must never carry the team's task tag and be mistaken
+  // for the real timestamp.
+  const logFormChange = text => addActivityLogEntry('System', `Form #${taskNum}: ${text}`);
+
   // 1. Auto-fill from Profile if blank
   let changed = false;
   if (!formData.incidentNumber && profile.incidentNumber) { formData.incidentNumber = profile.incidentNumber; changed = true; }
@@ -11732,8 +12257,10 @@ function renderTaskForm(container, taskNum, formData) {
         resetBtn.title = 'Reset to activity log value';
         resetBtn.onclick = (e) => {
             e.preventDefault();
+            const overrideValue = formData.overrides[key];
             delete formData.overrides[key];
             save();
+            logFormChange(`${label} manual override ${overrideValue ? `"${overrideValue}" ` : ''}reset to the activity log value`);
             buildTaskAssignmentForm();
         };
         labelContainer.appendChild(resetBtn);
@@ -11758,6 +12285,15 @@ function renderTaskForm(container, taskNum, formData) {
       }
       save();
     };
+    if (!readonly) {
+      let lastLoggedValue = String(formData[key] || '').trim();
+      inp.onchange = () => {
+        const newValue = String(inp.value || '').trim();
+        if (newValue === lastLoggedValue) return;
+        logFormChange(describeCellChangeForLog(label, lastLoggedValue, newValue));
+        lastLoggedValue = newValue;
+      };
+    }
     grp.appendChild(labelContainer);
     grp.appendChild(inp);
     (currentCard || form).appendChild(grp);
@@ -11804,6 +12340,7 @@ function renderTaskForm(container, taskNum, formData) {
     cb.onchange = () => {
       formData[key] = cb.checked;
       save();
+      logFormChange(`${label} ${cb.checked ? 'checked' : 'unchecked'}`);
     };
     
     const lbl = document.createElement('label');
@@ -11862,6 +12399,7 @@ function renderTaskForm(container, taskNum, formData) {
       if (!formData.teamTypes) formData.teamTypes = {};
       formData.teamTypes[type] = chk.checked;
       save();
+      logFormChange(`Team type "${labels[type] || type}" ${chk.checked ? 'checked' : 'unchecked'}`);
     };
     
     const lbl = document.createElement('label');
@@ -11929,6 +12467,13 @@ function renderTaskForm(container, taskNum, formData) {
       timeInp.style.flex = '0 0 auto';
       timeInp.value = check.time || '';
       timeInp.oninput = () => { check.time = timeInp.value; save(); };
+      let lastLoggedTime = String(check.time || '').trim();
+      timeInp.onchange = () => {
+        const newValue = String(timeInp.value || '').trim();
+        if (newValue === lastLoggedTime) return;
+        logFormChange(`Manual status check ${describeCellChangeForLog('time', lastLoggedTime, newValue)}`);
+        lastLoggedTime = newValue;
+      };
       row.appendChild(timeInp);
 
       const noteInp = document.createElement('input');
@@ -11938,6 +12483,13 @@ function renderTaskForm(container, taskNum, formData) {
       noteInp.style.flex = '1';
       noteInp.value = check.action || '';
       noteInp.oninput = () => { check.action = noteInp.value; save(); };
+      let lastLoggedNote = String(check.action || '').trim();
+      noteInp.onchange = () => {
+        const newValue = String(noteInp.value || '').trim();
+        if (newValue === lastLoggedNote) return;
+        logFormChange(`Manual status check ${describeCellChangeForLog('note', lastLoggedNote, newValue)}`);
+        lastLoggedNote = newValue;
+      };
       row.appendChild(noteInp);
 
       const trashIcon = document.createElement('div');
@@ -11946,8 +12498,10 @@ function renderTaskForm(container, taskNum, formData) {
       trashIcon.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>';
       trashIcon.onclick = (e) => {
         e.stopPropagation();
+        const removed = formData.manualParChecks[idx] || {};
         formData.manualParChecks.splice(idx, 1);
         save();
+        logFormChange(`Removed manual status check ${removed.time || ''} ${removed.action || ''}`.trim());
         renderTaskForm(container, taskNum, formData);
       };
       row.appendChild(trashIcon);
@@ -11970,6 +12524,7 @@ function renderTaskForm(container, taskNum, formData) {
       const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
       formData.manualParChecks.push({time: timeStr, action: 'Par check'});
       save();
+      logFormChange(`Added manual status check at ${timeStr}`);
       renderTaskForm(container, taskNum, formData);
     };
     addParContainer.appendChild(addParBtn);
@@ -12099,6 +12654,7 @@ function renderTaskForm(container, taskNum, formData) {
       m.name = nameSpan.textContent.trim();
       if (m.name !== oldName) {
         save();
+        logFormChange(`Member ${describeCellChangeForLog('name', String(oldName || ''), m.name)}`);
         renderTaskForm(container, taskNum, formData);
       }
     };
@@ -12120,6 +12676,7 @@ function renderTaskForm(container, taskNum, formData) {
        if (confirm(`Remove ${m.name || 'this member'}?`)) {
          formData.teamMembers.splice(idx, 1);
          save();
+         logFormChange(`Removed member ${m.name || '(unnamed)'}`);
          renderTaskForm(container, taskNum, formData);
        }
     };
@@ -12144,6 +12701,7 @@ function renderTaskForm(container, taskNum, formData) {
       cb.onchange = () => { 
         m[key] = cb.checked; 
         save(); 
+        logFormChange(`${m.name || 'Member'}: ${label} ${cb.checked ? 'checked' : 'unchecked'}`);
         if (key === 'leader') renderTaskForm(container, taskNum, formData);
       };
       
@@ -12211,6 +12769,7 @@ function renderTaskForm(container, taskNum, formData) {
        mBtn.onclick = () => {
          formData.teamMembers.push(buildTaskFormMemberFromRoster(m));
          save();
+         logFormChange(`Added member ${m[0]} from the roster`);
          popup.remove();
          renderTaskForm(container, taskNum, formData);
        };
@@ -12241,6 +12800,7 @@ function renderTaskForm(container, taskNum, formData) {
         if (!name) return;
         formData.teamMembers.push({name, leader: false, gps: false, radio: false, medic: false, rolesLoaded: true});
         save();
+        logFormChange(`Added member ${name} (not on the roster)`);
         popup.remove();
         renderTaskForm(container, taskNum, formData);
       };
@@ -12324,9 +12884,13 @@ function renderTaskForm(container, taskNum, formData) {
         buildTaskAssignmentForm();
       }
     } else {
+      const previouslyBy = formData.completedBy || '';
+      const user = getCurrentUser();
+      const userName = user ? getAccountName(user) : 'Unknown User';
       formData.completed = false;
       formData.completedBy = '';
       save();
+      addActivityLogEntry(formData.teamName || 'N/A', `Form #${taskNum} reopened (marked not completed) by ${userName}${previouslyBy ? ` - was completed by ${previouslyBy}` : ''}`);
       compLabel.textContent = 'Mark Form as Completed';
       checkParChecksAndNotify();
       
@@ -13132,7 +13696,10 @@ function showLogSweepsPopup(taskNumWithHash) {
     const log = b.pages.page4 || [];
     const target = log.find(r => r[0] === taskNumWithHash);
     if (target) {
+      const previousSweeps = String(target[9] || '').trim();
       target[9] = val; // Num of Sweeps is at index 9
+      const teamName = String(target[7] || '').replace(/\s*\(\d+\)\s*$/, '').trim() || 'System';
+      addActivityLogEntry(teamName, `Logged ${val} sweep${val === '1' ? '' : 's'} for ${taskNumWithHash} ${formatSegmentAssignmentLabel(target[3], target[4])}${previousSweeps ? ` (was ${previousSweeps})` : ''}`, b);
       saveBundle(b);
       
       // Update local sortedData if we are on the segments page to avoid waiting for full rebuild if needed
@@ -14348,11 +14915,13 @@ async function showCalTopoLinkPopup(originalIdx) {
             const bundleToUpdate = loadBundle();
             const data = bundleToUpdate.pages.page2;
             if (data && data[originalIdx]) {
+                const previousId = String(data[originalIdx][9] || '').trim();
+                const segmentLabel = formatSegmentAssignmentLabel(data[originalIdx][0], data[originalIdx][1]) || 'unnamed segment';
                 data[originalIdx][9] = id;
+                addActivityLogEntry('System', `Linked segment "${segmentLabel}" to CalTopo feature "${name}" (${id})${previousId && previousId !== String(id) ? ` - was linked to ${previousId}` : ''}`, bundleToUpdate);
                 saveBundle(bundleToUpdate);
                 popup.remove();
                 buildSegmentsTable();
-                addActivityLogEntry('System', `Linked segment to CalTopo feature "${name}" (${id})`);
             }
         };
         
@@ -14938,9 +15507,9 @@ function finishCalTopoFeatureImport(features, importedItems) {
         .map(item => item && item.feature ? getMapFeatureIdentityKey(item.feature) : '')
         .filter(Boolean));
     const leftOut = (Array.isArray(features) ? features : []).filter(feature => !importedKeys.has(getMapFeatureIdentityKey(feature)));
+    // markMapFeaturesUnwanted records the marked shapes in the activity log.
     const marked = markMapFeaturesUnwanted(leftOut);
     if (marked > 0) {
-        addActivityLogEntry('System', `Marked ${marked} CalTopo shape${marked === 1 ? '' : 's'} as unwanted (not imported)`);
         showToast(`${marked} shape${marked === 1 ? '' : 's'} not imported ${marked === 1 ? 'was' : 'were'} marked unwanted.`, 'Import Complete');
     }
     if (isMapsPage()) {
@@ -15111,6 +15680,7 @@ async function handleCreateMap() {
           domain: domain,
           teamId: teamId
         });
+        addActivityLogEntry('System', `Created CalTopo map "${title}" (${domain}/m/${result.id}) for team ${teamId}`, bundle);
         saveBundle(bundle);
     }
     
@@ -15281,6 +15851,12 @@ async function caltopo_request(btn = null, options = {}) {
         const b = loadBundle();
         if (b.maps && b.maps[0]) {
           b.maps[0].features = features;
+          // A fetch the user asked for is recorded; silent fetches (the 5-minute
+          // background check, the overlay loading missing shapes) are not, so
+          // they cannot flood the log.
+          if (!silent) {
+            addActivityLogEntry('System', `Fetched ${features.length} shape${features.length === 1 ? '' : 's'} from CalTopo map ${b.maps[0].name ? `"${b.maps[0].name}" ` : ''}(${activeMapId})`, b);
+          }
           saveBundle(b);
         }
         
@@ -15930,7 +16506,7 @@ function buildMapsPage() {
         <div class="table-tools" style="padding: 15px; background: var(--header-bg); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center;">
           <h2 id="current-map-title" style="margin: 0; font-size: 1.2rem;">Map View</h2>
           <div class="tool-actions" style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
-            <label style="display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; cursor: pointer;">
+            <label style="display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; cursor: pointer;" title="Colors the CalTopo assignment shapes by PSRc, draws segments being searched in the active-search style, and appends a summary of each finished task (date/time, team and members, tracks, sweep width) to the shape's description.">
               <span>PSRc Assignment Colors</span>
               <span class="toggle-switch" style="transform: scale(0.9);">
                 <input type="checkbox" id="caltopo-assignment-overlay-toggle" ${isCalTopoAssignmentOverlayEnabled() ? 'checked' : ''}>
@@ -16174,7 +16750,14 @@ function buildMapsPage() {
       id = parts[parts.length - 1] || parts[parts.length - 2];
     }
 
+    const previousMap = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
     bundle.maps = [{ id, name, domain, teamId }];
+    const mapLabel = `${name ? `"${name}" ` : ''}${domain}/m/${id}`;
+    if (previousMap && previousMap.id && previousMap.id !== id) {
+      addActivityLogEntry('System', `Replaced CalTopo map ${previousMap.name ? `"${previousMap.name}" ` : ''}(${previousMap.id}) with ${mapLabel}`, bundle);
+    } else {
+      addActivityLogEntry('System', `Added CalTopo map ${mapLabel}`, bundle);
+    }
     saveBundle(bundle);
     mapIdInput.value = '';
     teamIdInput.value = '';
@@ -16340,6 +16923,8 @@ function importSelectedUnaccountedFeatures() {
     }
     const leftOut = unaccounted.filter(feature => !selection.has(getMapFeatureIdentityKey(feature)));
 
+    // Both steps write their own activity log entries ("Imported segments" /
+    // "Marked ... as unwanted").
     importSegmentsAction(selected.map(buildCalTopoSegmentImportItem));
     const marked = markMapFeaturesUnwanted(leftOut);
     selection.clear();
@@ -16347,7 +16932,6 @@ function importSelectedUnaccountedFeatures() {
     const importedNames = selected.map(getMapFeatureDisplayName);
     let summary = `Imported ${selected.length} segment${selected.length === 1 ? '' : 's'}: ${importedNames.join(', ')}.`;
     if (marked > 0) {
-        addActivityLogEntry('System', `Marked ${marked} CalTopo shape${marked === 1 ? '' : 's'} as unwanted (not imported)`);
         summary += ` ${marked} unchecked shape${marked === 1 ? ' was' : 's were'} marked unwanted.`;
     }
     showToast(summary, 'Import Complete');

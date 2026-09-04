@@ -39,13 +39,15 @@ const sources = [
     'function resolveDisplayedSegmentBorderColor(isActiveSearch, settings, baseColor)',
     'function resolveDisplayedSegmentBorderWidth(isActiveSearch, settings, baseWidth)',
     'function resolveDisplayedSegmentRgb(isActiveSearch, settings, baseRgb, kind)',
-    'function buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings)'
+    'function resolveCalTopoRestingStrokeWidth(originalStyle)',
+    'function buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySettings, restingBorderWidth = null)'
 ].map(signature => extractFunctionSource(appSource, signature));
 
 const sandbox = {
     console,
     // Force the built-in app.js fallbacks (no external map-segment-utils overrides).
-    getMapSegmentUtils: () => ({})
+    getMapSegmentUtils: () => ({}),
+    CALTOPO_DEFAULT_STROKE_WIDTH: 2
 };
 
 vm.createContext(sandbox);
@@ -163,7 +165,27 @@ assert.strictEqual(activeStyle.fill, '#228be6', 'Active fill uses the configured
 assert.strictEqual(activeStyle.stroke, '#228be6', 'Active stroke uses the configured (default blue) border color');
 assert.strictEqual(activeStyle.color, '#228be6', 'Active color uses the configured (default blue) border color');
 assert.strictEqual(activeStyle['stroke-width'], 3, 'Active border thickness is sent as stroke-width');
-assert.ok(!Object.prototype.hasOwnProperty.call(restingStyle, 'stroke-width'), 'Resting segments must not have their border thickness overridden');
+assert.ok(!Object.prototype.hasOwnProperty.call(restingStyle, 'stroke-width'), 'Without a known resting width, resting segments are not sent a stroke-width');
 console.log('  ok - overlay applies the configured active-search fill/border colors and thickness');
+
+// --- Finished searches go back to the standard border thickness ---
+// The resting width is the stroke-width the shape had before the overlay first
+// touched it, or CalTopo's default (2) when it never carried one.
+assert.strictEqual(sandbox.resolveCalTopoRestingStrokeWidth({ 'stroke-width': 4 }), 4, 'Original stroke-width is the resting width');
+assert.strictEqual(sandbox.resolveCalTopoRestingStrokeWidth({ 'stroke-width': '1.5' }), 1.5, 'String stroke-widths are parsed');
+assert.strictEqual(sandbox.resolveCalTopoRestingStrokeWidth({ 'stroke-width': null }), 2, 'No original stroke-width falls back to the CalTopo default');
+assert.strictEqual(sandbox.resolveCalTopoRestingStrokeWidth(undefined), 2, 'No captured original falls back to the CalTopo default');
+
+const finishedStyle = sandbox.buildCalTopoOverlayStyle('#123456', false, overlaySettings, 4);
+assert.strictEqual(finishedStyle['stroke-width'], 4, 'A finished (resting) segment is pushed with its original border thickness');
+assert.strictEqual(finishedStyle.stroke, '#123456', 'Finished segment keeps the PSRc border color');
+assert.strictEqual(finishedStyle['fill-opacity'], 0.42, 'Finished segment keeps the resting fill opacity');
+
+const finishedDefaultStyle = sandbox.buildCalTopoOverlayStyle('#123456', false, overlaySettings, sandbox.resolveCalTopoRestingStrokeWidth(undefined));
+assert.strictEqual(finishedDefaultStyle['stroke-width'], 2, 'A finished segment with no original width goes back to the CalTopo default');
+
+const stillActiveStyle = sandbox.buildCalTopoOverlayStyle('#123456', true, overlaySettings, 4);
+assert.strictEqual(stillActiveStyle['stroke-width'], 3, 'The resting width never overrides the active-search thickness');
+console.log('  ok - finished segments are pushed back to their standard border thickness');
 
 console.log('All CalTopo overlay opacity checks passed.');
