@@ -1131,15 +1131,88 @@ function getAuthServerUrlCandidates() {
     return candidates.filter((url, index) => !!url && candidates.indexOf(url) === index);
 }
 
+// The public backend is hosted on a platform that idles the container when it
+// is not in use. The first request from a cold device has to wait for that
+// container to boot, which can take longer than a mobile browser is willing to
+// hold an idle connection open, so the very first login attempt on a new device
+// is the one most likely to fail. Every auth request is therefore given a
+// generous timeout and is retried a couple of times before the address is
+// declared unreachable.
+const AUTH_REQUEST_TIMEOUT_MS = 20000;
+const AUTH_REQUEST_ATTEMPTS = 3;
+const AUTH_RETRY_DELAY_MS = 1500;
+
+function delayMs(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+// fetch() with an explicit timeout. Without one a request aimed at a host that
+// silently drops packets (a captive portal, a firewalled network, a sleeping
+// backend) can hang for minutes and simply look like "nothing happens".
+async function fetchWithTimeout(url, options = {}, timeoutMs = AUTH_REQUEST_TIMEOUT_MS) {
+    if (typeof AbortController === 'undefined') {
+        return fetch(url, options);
+    }
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), timeoutMs);
+    try {
+        return await fetch(url, {...options, signal: controller.signal});
+    } catch (e) {
+        if (e && (e.name === 'AbortError' || /aborted/i.test(String(e.message || '')))) {
+            const timeoutError = new Error(`timed out after ${Math.round(timeoutMs / 1000)}s`);
+            timeoutError.isTimeout = true;
+            throw timeoutError;
+        }
+        throw e;
+    } finally {
+        clearTimeout(timer);
+    }
+}
+
+// True for the failures that justify trying again / trying the next address:
+// the request never produced an HTTP response.
+function isRetriableConnectionError(error) {
+    return !!(error && (error.isTimeout || isNetworkFetchError(error)));
+}
+
+// Human-readable reason for a connection failure, so the login popup can say
+// what actually went wrong instead of the browser's opaque "Failed to fetch".
+function describeConnectionError(error) {
+    if (!error) return 'unreachable';
+    if (error.isTimeout) return `no answer (${error.message})`;
+    if (isNetworkFetchError(error)) return 'could not connect (blocked, offline, or the address is wrong)';
+    return error.message || 'unreachable';
+}
+
+// GET /api/health on a candidate server. Used by the "Test" button on the Set
+// Server popup so a device can be diagnosed without guessing at a login.
+async function checkSyncServerReachable(serverUrl, timeoutMs = AUTH_REQUEST_TIMEOUT_MS) {
+    const base = String(serverUrl || '').trim().replace(/\/$/, '');
+    if (!base) return {ok: false, url: '', detail: 'no server address set'};
+    if (isBlockedMixedContentUrl(base)) {
+        return {ok: false, url: base, detail: 'blocked: this page is served over HTTPS and cannot call an http:// server'};
+    }
+    try {
+        const resp = await fetchWithTimeout(`${base}/api/health`, {method: 'GET'}, timeoutMs);
+        return {ok: resp.ok, url: base, status: resp.status, detail: `answered HTTP ${resp.status}`};
+    } catch (e) {
+        return {ok: false, url: base, detail: describeConnectionError(e)};
+    }
+}
+
 // POST to a pre-login auth endpoint (/api/auth/login, /api/auth/register),
-// moving on to the next candidate server whenever the request never reached a
-// server at all. Resolves with the first response received, whatever its HTTP
-// status, and remembers the server that answered so every later data request
-// goes to the same place. When no candidate can be reached it throws an error
-// naming the addresses tried and what to do about it, instead of the opaque
+// retrying each address (a cold backend often misses the first attempt) and
+// moving on to the next candidate whenever the request never reached a server
+// at all. Resolves with the first response received, whatever its HTTP status,
+// and remembers the server that answered so every later data request goes to
+// the same place. When no candidate can be reached it throws an error naming
+// the addresses tried and what to do about it, instead of the opaque
 // "Failed to fetch" the browser produces.
-async function postAuthRequest(endpointPath, payload) {
+async function postAuthRequest(endpointPath, payload, options = {}) {
     const candidates = getAuthServerUrlCandidates();
+    const attempts = Math.max(1, options.attempts || AUTH_REQUEST_ATTEMPTS);
+    const timeoutMs = options.timeoutMs || AUTH_REQUEST_TIMEOUT_MS;
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
     const failures = [];
 
     for (const serverUrl of candidates) {
@@ -1147,26 +1220,39 @@ async function postAuthRequest(endpointPath, payload) {
             failures.push(`${serverUrl} (blocked: this page is served over HTTPS and cannot call an http:// server)`);
             continue;
         }
-        try {
-            const resp = await fetch(`${serverUrl}${endpointPath}`, {
-                method: 'POST',
-                headers: {'Content-Type': 'application/json'},
-                body: JSON.stringify(payload)
-            });
-            if (serverUrl !== getLocalSyncServerUrl().replace(/\/$/, '')) {
-                setLocalSyncServerUrl(serverUrl);
+        let lastError = null;
+        for (let attempt = 1; attempt <= attempts; attempt++) {
+            if (onProgress) {
+                onProgress({serverUrl, attempt, attempts});
             }
-            return {resp, serverUrl};
-        } catch (e) {
-            if (!isNetworkFetchError(e)) throw e;
-            failures.push(`${serverUrl} (${e.message || 'unreachable'})`);
+            try {
+                const resp = await fetchWithTimeout(`${serverUrl}${endpointPath}`, {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/json'},
+                    body: JSON.stringify(payload)
+                }, timeoutMs);
+                if (serverUrl !== getLocalSyncServerUrl().replace(/\/$/, '')) {
+                    setLocalSyncServerUrl(serverUrl);
+                }
+                return {resp, serverUrl};
+            } catch (e) {
+                if (!isRetriableConnectionError(e)) throw e;
+                lastError = e;
+                if (attempt < attempts) {
+                    await delayMs(AUTH_RETRY_DELAY_MS * attempt);
+                }
+            }
         }
+        failures.push(`${serverUrl} (${describeConnectionError(lastError)}, ${attempts} attempts)`);
     }
 
+    const isOffline = typeof navigator !== 'undefined' && navigator && navigator.onLine === false;
     throw new Error([
         'Cannot reach the sync server.',
         failures.length ? `Tried: ${failures.join('; ')}.` : '',
-        'Check this device\u2019s internet connection, then use "Set Server" on the login popup to enter the correct server address.'
+        isOffline
+            ? 'This device reports that it is offline \u2014 connect it to Wi\u2011Fi or mobile data and try again.'
+            : 'This device can load the app but cannot open a connection to the server. Common causes: a network that blocks the server (guest/agency Wi\u2011Fi, a VPN, or content filtering \u2014 try mobile data instead), or a wrong address. Use "Set Server" on the login popup, then press "Test" to check the address.'
     ].filter(Boolean).join(' '));
 }
 
@@ -1221,8 +1307,20 @@ function showLoginPopup() {
         const pin = pinInput.value.trim();
         if (!username || !pin) return alert('Username and PIN required');
 
+        // The first attempt from a new device may have to wait for the backend
+        // to wake up, so the button reports what it is doing instead of looking
+        // frozen while the retries run.
+        const originalLabel = loginBtn.textContent;
+        loginBtn.disabled = true;
+        loginBtn.textContent = 'Connecting\u2026';
         try {
-            const {resp} = await postAuthRequest('/api/auth/login', { username, pin });
+            const {resp} = await postAuthRequest('/api/auth/login', { username, pin }, {
+                onProgress: ({attempt, attempts}) => {
+                    loginBtn.textContent = attempt > 1
+                        ? `Connecting\u2026 (try ${attempt} of ${attempts})`
+                        : 'Connecting\u2026';
+                }
+            });
             const data = await readJsonResponse(resp);
             if (resp.ok && data.success) {
                 setCookie(USER_NAME_STORAGE_KEY, data.user.username);
@@ -1230,12 +1328,15 @@ function showLoginPopup() {
                 setCurrentUser(data.user);
                 closePopup(popup);
                 window.location.reload();
-            } else {
-                alert(data.error || 'no matching login found');
+                return;
             }
+            alert(data.error || 'no matching login found');
         } catch (e) {
             console.error("Login connection error:", e);
             alert(`Login failed. ${e.message || 'Unable to reach the sync server.'}`);
+        } finally {
+            loginBtn.disabled = false;
+            loginBtn.textContent = originalLabel;
         }
     };
     btnContainer.appendChild(loginBtn);
@@ -1400,25 +1501,94 @@ function showSetServerPopup() {
 
     content.insertBefore(inputs, btnContainer);
 
-    const setBtn = document.createElement('button');
-    setBtn.className = 'popup-btn primary';
-    setBtn.textContent = 'Set';
-    setBtn.onclick = () => {
+    // Live result of the "Test" button, so a device that cannot log in can be
+    // diagnosed here rather than through the login error alert.
+    const statusLine = document.createElement('div');
+    statusLine.style.textAlign = 'center';
+    statusLine.style.fontSize = '0.85em';
+    statusLine.style.opacity = '0.85';
+    statusLine.style.minHeight = '1.2em';
+    statusLine.style.whiteSpace = 'pre-wrap';
+    inputs.appendChild(statusLine);
+
+    // Normalizes what the user typed into a usable base URL, or returns '' and
+    // explains why it cannot be used.
+    const readServerInput = () => {
         let url = serverInput.value.trim();
-        if (!url) return alert('Please enter a server address.');
+        if (!url) {
+            alert('Please enter a server address.');
+            return '';
+        }
         // Be forgiving about a missing scheme so pasting a bare host still works.
         if (!/^https?:\/\//i.test(url)) {
             url = 'https://' + url;
         }
         try {
-            // Validate the address before persisting it.
+            // Validate the address before using it.
             // eslint-disable-next-line no-new
             new URL(url);
         } catch (e) {
-            return alert('That does not look like a valid server address.');
+            alert('That does not look like a valid server address.');
+            return '';
         }
-        // Strip a trailing slash for a consistent base URL.
-        url = url.replace(/\/$/, '');
+        return url.replace(/\/$/, '');
+    };
+
+    // Checks the typed address (and, when it fails, the built-in public backend)
+    // so the user learns whether the problem is the address or the network.
+    const testBtn = document.createElement('button');
+    testBtn.className = 'popup-btn';
+    testBtn.textContent = 'Test';
+    testBtn.onclick = async () => {
+        const url = readServerInput();
+        if (!url) return;
+        testBtn.disabled = true;
+        const originalLabel = testBtn.textContent;
+        testBtn.textContent = 'Testing\u2026';
+        statusLine.textContent = `Testing ${url}\u2026`;
+        try {
+            const result = await checkSyncServerReachable(url);
+            if (result.ok) {
+                statusLine.textContent = `\u2713 ${url} is reachable (${result.detail}).`;
+                return;
+            }
+            let message = `\u2717 ${url}: ${result.detail}.`;
+            const fallback = DEFAULT_SYNC_SERVER_URL.replace(/\/$/, '');
+            if (url !== fallback) {
+                statusLine.textContent = `${message}\nTesting the built-in server ${fallback}\u2026`;
+                const fallbackResult = await checkSyncServerReachable(fallback);
+                message += fallbackResult.ok
+                    ? `\nThe built-in server ${fallback} IS reachable \u2014 use that address instead.`
+                    : `\nThe built-in server ${fallback} also failed: ${fallbackResult.detail}. This device\u2019s network is blocking the connection \u2014 try mobile data or another Wi\u2011Fi.`;
+            } else {
+                message += '\nThis device\u2019s network is blocking the connection \u2014 try mobile data or another Wi\u2011Fi.';
+            }
+            statusLine.textContent = message;
+        } finally {
+            testBtn.disabled = false;
+            testBtn.textContent = originalLabel;
+        }
+    };
+    btnContainer.appendChild(testBtn);
+
+    // Restores the built-in public backend, undoing a wrong/stale address that
+    // was saved on this device.
+    const resetBtn = document.createElement('button');
+    resetBtn.className = 'popup-btn';
+    resetBtn.textContent = 'Use Default';
+    resetBtn.onclick = () => {
+        serverInput.value = DEFAULT_SYNC_SERVER_URL;
+        setLocalSyncServerUrl('');
+        statusLine.textContent = `Reset to the built-in server ${DEFAULT_SYNC_SERVER_URL}. Press "Test" to check it.`;
+    };
+    btnContainer.appendChild(resetBtn);
+
+    const setBtn = document.createElement('button');
+    setBtn.className = 'popup-btn primary';
+    setBtn.textContent = 'Set';
+    setBtn.onclick = () => {
+        const url = readServerInput();
+        if (!url) return;
         // Refuse an address the browser would silently block anyway: an http://
         // server cannot be called from a page served over https:// (mixed
         // content), and every request would fail with "Failed to fetch".

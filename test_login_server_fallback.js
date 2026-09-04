@@ -93,10 +93,13 @@ function createSandbox(options = {}) {
         clearTimeout,
         setInterval: () => 0,
         clearInterval,
+        // The auth requests abort themselves on a timeout, so the sandbox needs
+        // the same primitive a browser provides.
+        AbortController,
         localStorage,
         sessionStorage: localStorage,
         document,
-        navigator: {userAgent: 'node'},
+        navigator: {userAgent: 'node', onLine: options.onLine !== false},
         addEventListener() {},
         removeEventListener() {},
         matchMedia: () => ({matches: false, addListener() {}, addEventListener() {}}),
@@ -114,14 +117,39 @@ function createSandbox(options = {}) {
     vm.createContext(sandbox);
     vm.runInContext(source, sandbox, {filename: 'app.js'});
 
+    // app.js schedules a background sync that opens the login popup when no
+    // credentials are stored. There is no real DOM here, so neutralize it; the
+    // popup itself is not what this test exercises.
+    sandbox.showLoginPopup = () => {};
+
     if (options.deviceServerUrl) {
         sandbox.setLocalSyncServerUrl(options.deviceServerUrl);
     }
     return sandbox;
 }
 
+// If the assertions below never finish (a request that is awaited forever) the
+// process would otherwise end quietly with a success code; start out failing so
+// only the explicit PASS at the bottom can clear it.
+process.exitCode = 1;
+
 // A browser reports an unreachable/blocked address exactly like this.
 const failedToFetch = () => Promise.reject(new TypeError('Failed to fetch'));
+
+// A server that accepts the connection and then never answers - a sleeping
+// container, or a network that silently drops the packets. Like a real fetch,
+// it only gives up when the abort signal fires.
+const neverAnswers = (url, options = {}) => new Promise((resolve, reject) => {
+    const signal = options.signal;
+    if (!signal) return;
+    const abort = () => {
+        const error = new Error('The operation was aborted.');
+        error.name = 'AbortError';
+        reject(error);
+    };
+    if (signal.aborted) return abort();
+    signal.addEventListener('abort', abort);
+});
 const okResponse = (url) => Promise.resolve({
     ok: true,
     status: 200,
@@ -143,7 +171,7 @@ const DEFAULT_URL = 'https://sarwebtheory2-production.up.railway.app';
             return failedToFetch();
         };
 
-        const {resp, serverUrl} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'});
+        const {resp, serverUrl} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1});
         assert.deepStrictEqual(tried, [
             'https://old-server.example.com/api/auth/login',
             `${DEFAULT_URL}/api/auth/login`
@@ -167,7 +195,7 @@ const DEFAULT_URL = 'https://sarwebtheory2-production.up.railway.app';
         assert.strictEqual(app.isBlockedMixedContentUrl('http://localhost:3000'), false,
             'loopback is a secure context and must stay usable');
 
-        const {serverUrl} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'});
+        const {serverUrl} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1});
         assert.deepStrictEqual(tried, [`${DEFAULT_URL}/api/auth/login`],
             'the mixed-content address must be skipped instead of failing with "Failed to fetch"');
         assert.strictEqual(serverUrl, DEFAULT_URL);
@@ -179,7 +207,7 @@ const DEFAULT_URL = 'https://sarwebtheory2-production.up.railway.app';
         app.fetch = failedToFetch;
 
         await assert.rejects(
-            () => app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}),
+            () => app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1}),
             (error) => {
                 const message = String(error.message);
                 assert.ok(/Cannot reach the sync server/i.test(message), message);
@@ -217,10 +245,73 @@ const DEFAULT_URL = 'https://sarwebtheory2-production.up.railway.app';
         assert.strictEqual(calls, 1, 'a non-network error must surface immediately, not retry');
     }
 
-    console.log('Login sync-server fallback / "Failed to fetch" diagnostics: PASS');
+    // --- 6. A cold backend that misses the first attempt still logs in -----
+    //        (the reported "it is trying but failing to reach the server")
+    {
+        const app = createSandbox();
+        let calls = 0;
+        app.fetch = (url, options) => {
+            calls += 1;
+            // First attempt hangs long enough for the request to time out; the
+            // retry succeeds, exactly like a container waking from idle.
+            if (calls === 1) return neverAnswers(url, options);
+            return okResponse(url);
+        };
+
+        const {resp} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {
+            attempts: 3,
+            timeoutMs: 150
+        });
+        assert.ok(resp.ok, 'the retry must recover a login the first attempt lost');
+        assert.strictEqual(calls, 2, 'exactly one retry was needed');
+    }
+
+    // --- 7. A request that never answers is reported as a timeout, not as a
+    //        silent hang ---------------------------------------------------
+    {
+        const app = createSandbox();
+        app.fetch = neverAnswers;
+
+        const result = await app.checkSyncServerReachable(DEFAULT_URL, 150);
+        assert.strictEqual(result.ok, false);
+        assert.ok(/timed out/i.test(result.detail), `expected a timeout detail, got: ${result.detail}`);
+    }
+
+    // --- 8. The health probe reports a reachable server --------------------
+    {
+        const app = createSandbox();
+        const tried = [];
+        app.fetch = (url) => {
+            tried.push(url);
+            return Promise.resolve({ok: true, status: 200, url});
+        };
+
+        const result = await app.checkSyncServerReachable(DEFAULT_URL);
+        assert.strictEqual(result.ok, true);
+        assert.deepStrictEqual(tried, [`${DEFAULT_URL}/api/health`],
+            'the reachability probe must hit the unauthenticated health endpoint');
+    }
+
+    // --- 9. An offline device is told so, instead of being blamed on the
+    //        server address ------------------------------------------------
+    {
+        const app = createSandbox({onLine: false});
+        app.fetch = failedToFetch;
+
+        await assert.rejects(
+            () => app.postAuthRequest('/api/auth/login', {}, {attempts: 1}),
+            (error) => {
+                assert.ok(/offline/i.test(error.message), error.message);
+                return true;
+            }
+        );
+    }
+
     // app.js schedules its own background sync timers on load; exit before they
-    // fire so they cannot poke the fake DOM after the assertions are done.
-    process.exit(0);
+    // fire so they cannot poke the fake DOM after the assertions are done. The
+    // exit waits for the result line to be flushed, which process.exit() alone
+    // does not guarantee on a piped stdout.
+    process.stdout.write('Login sync-server fallback / "Failed to fetch" diagnostics: PASS\n', () => process.exit(0));
 })().catch((error) => {
     console.error(error);
     process.exit(1);
