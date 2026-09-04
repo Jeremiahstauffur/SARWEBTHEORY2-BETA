@@ -34,6 +34,12 @@ const CALTOPO_ASSIGNMENT_OVERLAY_STORAGE_KEY = 'sar-caltopo-assignment-overlay-v
 // as a map keyed by sync bucket (CASE # + username), so each user keeps a
 // separate toggle state for each case.
 const SEGMENTS_PSRC_SORT_STORAGE_KEY = 'sar-segments-psrc-sort-v1';
+// Start/End of the PSRc and POS cumulative charts (Home and Search Log pages).
+// Only values the user typed are stored, in the per-user server settings as a
+// map keyed by sync bucket; a field that was never edited keeps following its
+// default (earliest task assignment -> now) and the tiny reset button clears
+// the stored values again.
+const CHART_RANGE_STORAGE_KEY = 'sar-chart-range-v1';
 // How often the app re-fetches the CalTopo map to look for shapes that are
 // neither imported as segments nor marked unwanted ("unaccounted" features).
 const MAP_UNACCOUNTED_CHECK_INTERVAL_MS = 5 * 60 * 1000;
@@ -8774,8 +8780,133 @@ function getLocalISOString(date) {
     return (new Date(date - tzoffset)).toISOString().slice(0, 16);
 }
 
+// The range the charts are currently drawn with ("YYYY-MM-DDTHH:MM" local
+// time, the datetime-local input format). Refreshed by refreshChartRange().
 let selectedChartStart = getLocalISOString(new Date());
-let selectedChartEnd = getLocalISOString(new Date(Date.now() + 24 * 3600000));
+let selectedChartEnd = getLocalISOString(new Date());
+
+function isValidChartDateTime(value) {
+    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}/.test(value) && !isNaN(new Date(value).getTime());
+}
+
+// Timestamp of the earliest task assignment in the Search Log, by date/time
+// rather than task number: backdated tasks can carry a higher number than
+// tasks that were logged earlier. 0 when there is no dated task yet.
+function getEarliestTaskAssignmentTs(bundle) {
+    const b = bundle || loadBundle();
+    const searchLog = Array.isArray(b?.pages?.page4) ? b.pages.page4 : [];
+    let earliest = 0;
+    searchLog.forEach(row => {
+        if (!Array.isArray(row) || !String(row[0] || '').trim() || !row[1]) return;
+        const ts = getTs(row[1], row[2]);
+        if (!Number.isFinite(ts) || ts <= 0) return;
+        if (!earliest || ts < earliest) earliest = ts;
+    });
+    return earliest;
+}
+
+// Defaults: start at the earliest task assignment (24 hours ago when nothing
+// has been assigned yet) and end now.
+function getDefaultChartRange(bundle) {
+    const now = Date.now();
+    const earliest = getEarliestTaskAssignmentTs(bundle);
+    const startTs = earliest && earliest < now ? earliest : now - 24 * 3600000;
+    return {
+        start: getLocalISOString(new Date(startTs)),
+        end: getLocalISOString(new Date(now))
+    };
+}
+
+// The user-edited Start/End for the current case; either field may be ''
+// (never edited / reset), in which case the default applies to it.
+function getStoredChartRange() {
+    const empty = {start: '', end: ''};
+    let settings = _serverSettings;
+    if (!settings) {
+        // Same fallback as getSyncBucket(): the cached copy of the settings.
+        try {
+            const cached = getStorageItem(SERVER_SETTINGS_CACHE_KEY);
+            settings = cached ? JSON.parse(cached) : null;
+        } catch (e) { settings = null; }
+    }
+    if (!settings) return empty;
+    const states = settings[CHART_RANGE_STORAGE_KEY];
+    if (!states || typeof states !== 'object') return empty;
+    const bucket = getSyncBucket();
+    const stored = bucket ? states[bucket] : null;
+    if (!stored || typeof stored !== 'object') return empty;
+    return {
+        start: isValidChartDateTime(stored.start) ? stored.start : '',
+        end: isValidChartDateTime(stored.end) ? stored.end : ''
+    };
+}
+
+function setStoredChartRange(range) {
+    if (!_serverSettings) {
+        // Never start from an empty object: that would push the other settings
+        // (CASE # included) off the server. Seed from the cached copy instead.
+        let cachedSettings = null;
+        try {
+            const cached = getStorageItem(SERVER_SETTINGS_CACHE_KEY);
+            cachedSettings = cached ? JSON.parse(cached) : null;
+        } catch (e) { cachedSettings = null; }
+        _serverSettings = (cachedSettings && typeof cachedSettings === 'object') ? cachedSettings : {};
+    }
+    const bucket = getSyncBucket();
+    if (!bucket) return;
+    const existing = _serverSettings[CHART_RANGE_STORAGE_KEY];
+    const states = (existing && typeof existing === 'object') ? existing : {};
+    const start = isValidChartDateTime(range?.start) ? range.start : '';
+    const end = isValidChartDateTime(range?.end) ? range.end : '';
+    if (start || end) {
+        states[bucket] = {start, end};
+    } else {
+        delete states[bucket];
+    }
+    _serverSettings[CHART_RANGE_STORAGE_KEY] = states;
+    saveServerSettings(_serverSettings);
+}
+
+function isChartRangeCustomized() {
+    const stored = getStoredChartRange();
+    return !!(stored.start || stored.end);
+}
+
+// Resolves the range to draw: a stored (edited) value wins for its field,
+// every other field follows the live default.
+function resolveChartRange(bundle) {
+    const defaults = getDefaultChartRange(bundle);
+    const stored = getStoredChartRange();
+    return {
+        start: stored.start || defaults.start,
+        end: stored.end || defaults.end
+    };
+}
+
+function refreshChartRange(bundle) {
+    const range = resolveChartRange(bundle);
+    selectedChartStart = range.start;
+    selectedChartEnd = range.end;
+    return range;
+}
+
+function resetChartRange() {
+    setStoredChartRange({start: '', end: ''});
+    return refreshChartRange();
+}
+
+// `force` also rewrites a focused picker (used right after the user changed
+// it, e.g. to show the default again when the field was cleared); otherwise a
+// background re-render (sync poll) must not overwrite a picker being edited.
+function syncChartRangeInputs(force = false) {
+    const startInput = document.getElementById('chart-start-datetime');
+    const endInput = document.getElementById('chart-end-datetime');
+    const resetBtn = document.getElementById('chart-range-reset-btn');
+    const active = force ? null : document.activeElement;
+    if (startInput && active !== startInput) startInput.value = selectedChartStart;
+    if (endInput && active !== endInput) endInput.value = selectedChartEnd;
+    if (resetBtn) resetBtn.style.display = isChartRangeCustomized() ? '' : 'none';
+}
 
 // Helper to format hour offset
 function formatHourOffset(ts) {
@@ -8966,17 +9097,33 @@ let chartsResizeAttached = false;
 function initCharts() {
     const startInput = document.getElementById('chart-start-datetime');
     const endInput = document.getElementById('chart-end-datetime');
-    
+    const resetBtn = document.getElementById('chart-range-reset-btn');
+
+    refreshChartRange();
+    syncChartRangeInputs();
+
     if (startInput && endInput) {
-        startInput.value = selectedChartStart;
-        endInput.value = selectedChartEnd;
-        
+        // An edited field is stored and kept until reset; clearing a field
+        // hands it back to its default.
         startInput.onchange = () => {
-            selectedChartStart = startInput.value;
+            const stored = getStoredChartRange();
+            setStoredChartRange({start: startInput.value, end: stored.end});
+            refreshChartRange();
+            syncChartRangeInputs(true);
             renderCharts();
         };
         endInput.onchange = () => {
-            selectedChartEnd = endInput.value;
+            const stored = getStoredChartRange();
+            setStoredChartRange({start: stored.start, end: endInput.value});
+            refreshChartRange();
+            syncChartRangeInputs(true);
+            renderCharts();
+        };
+    }
+    if (resetBtn) {
+        resetBtn.onclick = () => {
+            resetChartRange();
+            syncChartRangeInputs(true);
             renderCharts();
         };
     }
@@ -12426,8 +12573,9 @@ function printSearchFile() {
     const bundle = loadBundle();
     const fileName = (bundle.fileName || "Search_File").replace('.json', '');
     
-    const startTs = new Date(selectedChartStart).getTime();
-    const endTs = new Date(selectedChartEnd).getTime();
+    const chartRange = refreshChartRange(bundle);
+    const startTs = new Date(chartRange.start).getTime();
+    const endTs = new Date(chartRange.end).getTime();
 
     // Calculate metrics for charts using current chart settings
     const metrics = calculateHourlyMetrics(startTs, endTs);

@@ -5,7 +5,7 @@
   "main": "sync-server.js",
   "scripts": {
     "start": "node sync-server.js",
-    "test": "node test_structured_tables.js && node test_sync_bucket_decoupling.js && node test_row_level_sync.js && node test_row_sync_endpoint.js && node test_user_isolation.js && node test_case_delete.js && node test_personnel_role_toggles.js && node test_login_server_fallback.js && node test_sync_outbox.js && node test_case_import.js && node test_map_unaccounted_features.js && node test_map_unaccounted_app.js"
+    "test": "node test_structured_tables.js && node test_sync_bucket_decoupling.js && node test_row_level_sync.js && node test_row_sync_endpoint.js && node test_user_isolation.js && node test_case_delete.js && node test_personnel_role_toggles.js && node test_login_server_fallback.js && node test_sync_outbox.js && node test_case_import.js && node test_map_unaccounted_features.js && node test_map_unaccounted_app.js && node test_chart_range.js"
   },
   "dependencies": {
     "axios": "^1.14.0",

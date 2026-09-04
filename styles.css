@@ -1056,6 +1056,36 @@ footer {
   color: var(--accent) !important;
 }
 
+/* Tiny reset button next to the chart Start/End pickers; only shown while a
+   custom range is stored. */
+.chart-range-reset {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 999px;
+  background: rgba(0, 0, 0, 0.2);
+  border: 1px solid var(--line);
+  color: var(--muted);
+  cursor: pointer;
+  transition: background 0.2s ease, color 0.2s ease, border-color 0.2s ease;
+}
+
+.chart-range-reset:hover {
+  background: var(--pill-focus);
+  color: var(--accent);
+  border-color: rgba(var(--accent-rgb), 0.65);
+}
+
+.chart-range-reset svg {
+  width: 12px;
+  height: 12px;
+  fill: none;
+  stroke: currentColor;
+}
+
 .update-pill {
   background: var(--pill-bg);
   border: 1px solid var(--pill-border);
