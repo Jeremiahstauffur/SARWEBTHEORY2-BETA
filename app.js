@@ -30,6 +30,10 @@ const SAVE_BUTTON_MIN_LOADING_MS = 1000;
 const SAVE_BUTTON_SUCCESS_MS = 3000;
 const MAP_PSRC_OVERLAY_STORAGE_KEY = 'sar-map-psrc-overlay-v1';
 const CALTOPO_ASSIGNMENT_OVERLAY_STORAGE_KEY = 'sar-caltopo-assignment-overlay-v1';
+// Segments page "Sort by PSRc" toggle. Stored in the per-user server settings
+// as a map keyed by sync bucket (CASE # + username), so each user keeps a
+// separate toggle state for each case.
+const SEGMENTS_PSRC_SORT_STORAGE_KEY = 'sar-segments-psrc-sort-v1';
 
 function getMapSegmentUtils() {
     return (typeof window !== 'undefined' && window.SARMapSegmentUtils) ? window.SARMapSegmentUtils : {};
@@ -325,6 +329,26 @@ function setMapPsrcOverlayEnabled(enabled) {
         _serverSettings[MAP_PSRC_OVERLAY_STORAGE_KEY] = enabled ? 'true' : 'false';
         saveServerSettings(_serverSettings);
     }
+}
+
+function isSegmentsPsrcSortEnabled() {
+    if (!_serverSettings) return false;
+    const states = _serverSettings[SEGMENTS_PSRC_SORT_STORAGE_KEY];
+    if (!states || typeof states !== 'object') return false;
+    const bucket = getSyncBucket();
+    if (!bucket) return false;
+    return states[bucket] === 'true';
+}
+
+function setSegmentsPsrcSortEnabled(enabled) {
+    if (!_serverSettings) { _serverSettings = {}; }
+    const bucket = getSyncBucket();
+    if (!bucket) return;
+    const existing = _serverSettings[SEGMENTS_PSRC_SORT_STORAGE_KEY];
+    const states = (existing && typeof existing === 'object') ? existing : {};
+    states[bucket] = enabled ? 'true' : 'false';
+    _serverSettings[SEGMENTS_PSRC_SORT_STORAGE_KEY] = states;
+    saveServerSettings(_serverSettings);
 }
 
 function isCalTopoAssignmentOverlayEnabled() {
@@ -4318,6 +4342,11 @@ function buildSegmentsTable() {
   let data = loadData();
   const bundle = loadBundle();
 
+  if (sortToggle && !sortToggle.dataset.bound) {
+    sortToggle.checked = isSegmentsPsrcSortEnabled();
+    sortToggle.dataset.bound = 'true';
+  }
+
   const isPSRDescending = sortToggle && sortToggle.checked;
   if (sortLabel) {
     sortLabel.textContent = isPSRDescending ? 'Sorted by PSRc (Descending)' : 'Sorted by Region then Segment';
@@ -4692,6 +4721,7 @@ function buildSegmentsTable() {
 
   if (sortToggle) {
     sortToggle.onchange = () => {
+      setSegmentsPsrcSortEnabled(sortToggle.checked);
       buildSegmentsTable();
     };
   }
