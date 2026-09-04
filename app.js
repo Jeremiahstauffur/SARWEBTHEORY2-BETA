@@ -1089,6 +1089,87 @@ async function readJsonResponse(resp) {
     throw new Error(`Unexpected server response (HTTP ${resp.status}): ${detail}. Make sure the Sync Server URL points to the SAR sync server that provides /api/auth/login.`);
 }
 
+// A fetch() that never reached a server rejects with a bare TypeError whose
+// message is the famously unhelpful "Failed to fetch" ("Load failed" on iOS
+// Safari). It always means the request was blocked or the address is
+// unreachable, never that the username/PIN were wrong, so it has to be handled
+// separately from an HTTP error response.
+function isNetworkFetchError(error) {
+    if (!error) return false;
+    const message = String(error.message || error).toLowerCase();
+    return message.includes('failed to fetch')
+        || message.includes('load failed')
+        || message.includes('networkerror')
+        || message.includes('network request failed')
+        || message.includes('fetch failed');
+}
+
+// A browser refuses to call an http:// address from a page served over https://
+// (mixed content) and reports that refusal as a generic "Failed to fetch".
+// Loopback is exempt because browsers treat it as a secure context.
+function isBlockedMixedContentUrl(url) {
+    const target = String(url || '');
+    if (!/^http:\/\//i.test(target)) return false;
+    if (/^http:\/\/(localhost|127\.0\.0\.1|\[::1\])(:|\/|$)/i.test(target)) return false;
+    return typeof window !== 'undefined' && !!window.location && window.location.protocol === 'https:';
+}
+
+// Base URLs to try for the pre-login auth calls, in priority order. The address
+// this device is configured to use comes first, then the public backend as a
+// fallback, so a device holding a stale or unreachable "Set Server" address (or
+// an http:// one that gets blocked as mixed content) can still log in instead
+// of dead-ending on "Failed to fetch". Local development is left alone: a page
+// opened from localhost must never silently talk to production.
+function getAuthServerUrlCandidates() {
+    const stripTrailingSlash = url => String(url || '').trim().replace(/\/$/, '');
+    const isLocalPage = typeof window !== 'undefined' && !!window.location
+        && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+    const candidates = [stripTrailingSlash(getSyncServerUrl())];
+    if (!isLocalPage) {
+        candidates.push(stripTrailingSlash(DEFAULT_SYNC_SERVER_URL));
+    }
+    return candidates.filter((url, index) => !!url && candidates.indexOf(url) === index);
+}
+
+// POST to a pre-login auth endpoint (/api/auth/login, /api/auth/register),
+// moving on to the next candidate server whenever the request never reached a
+// server at all. Resolves with the first response received, whatever its HTTP
+// status, and remembers the server that answered so every later data request
+// goes to the same place. When no candidate can be reached it throws an error
+// naming the addresses tried and what to do about it, instead of the opaque
+// "Failed to fetch" the browser produces.
+async function postAuthRequest(endpointPath, payload) {
+    const candidates = getAuthServerUrlCandidates();
+    const failures = [];
+
+    for (const serverUrl of candidates) {
+        if (isBlockedMixedContentUrl(serverUrl)) {
+            failures.push(`${serverUrl} (blocked: this page is served over HTTPS and cannot call an http:// server)`);
+            continue;
+        }
+        try {
+            const resp = await fetch(`${serverUrl}${endpointPath}`, {
+                method: 'POST',
+                headers: {'Content-Type': 'application/json'},
+                body: JSON.stringify(payload)
+            });
+            if (serverUrl !== getLocalSyncServerUrl().replace(/\/$/, '')) {
+                setLocalSyncServerUrl(serverUrl);
+            }
+            return {resp, serverUrl};
+        } catch (e) {
+            if (!isNetworkFetchError(e)) throw e;
+            failures.push(`${serverUrl} (${e.message || 'unreachable'})`);
+        }
+    }
+
+    throw new Error([
+        'Cannot reach the sync server.',
+        failures.length ? `Tried: ${failures.join('; ')}.` : '',
+        'Check this device\u2019s internet connection, then use "Set Server" on the login popup to enter the correct server address.'
+    ].filter(Boolean).join(' '));
+}
+
 function showLoginPopup() {
     if (document.querySelector('.popup-overlay.login-popup')) return;
     const onCancel = () => {
@@ -1140,13 +1221,8 @@ function showLoginPopup() {
         const pin = pinInput.value.trim();
         if (!username || !pin) return alert('Username and PIN required');
 
-        const serverUrl = getSyncServerUrl();
         try {
-            const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/auth/login`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username, pin })
-            });
+            const {resp} = await postAuthRequest('/api/auth/login', { username, pin });
             const data = await readJsonResponse(resp);
             if (resp.ok && data.success) {
                 setCookie(USER_NAME_STORAGE_KEY, data.user.username);
@@ -1159,7 +1235,7 @@ function showLoginPopup() {
             }
         } catch (e) {
             console.error("Login connection error:", e);
-            alert(`Login failed: ${e.message || 'Unable to reach the sync server.'}`);
+            alert(`Login failed. ${e.message || 'Unable to reach the sync server.'}`);
         }
     };
     btnContainer.appendChild(loginBtn);
@@ -1249,15 +1325,10 @@ function showAdminVerifyPopup(username, pin, loginPopup) {
         const adminPassword = adminInput.value.trim();
         if (!adminPassword) return alert('Enter the Super-Admin password.');
 
-        const serverUrl = getSyncServerUrl();
         registerBtn.disabled = true;
         registerBtn.textContent = 'Registering\u2026';
         try {
-            const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/auth/register`, {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ username, pin, adminPassword })
-            });
+            const {resp} = await postAuthRequest('/api/auth/register', { username, pin, adminPassword });
             const data = await readJsonResponse(resp);
             if (resp.ok && data.success) {
                 // Auto-login the new account: identical to the login-success path.
@@ -1275,7 +1346,7 @@ function showAdminVerifyPopup(username, pin, loginPopup) {
         } catch (e) {
             // Never log the admin password itself; only the error is reported.
             console.error("Registration connection error:", e);
-            alert(`Registration failed: ${e.message || 'Unable to reach the sync server.'}`);
+            alert(`Registration failed. ${e.message || 'Unable to reach the sync server.'}`);
             registerBtn.disabled = false;
             registerBtn.textContent = 'Register';
         }
@@ -1348,6 +1419,12 @@ function showSetServerPopup() {
         }
         // Strip a trailing slash for a consistent base URL.
         url = url.replace(/\/$/, '');
+        // Refuse an address the browser would silently block anyway: an http://
+        // server cannot be called from a page served over https:// (mixed
+        // content), and every request would fail with "Failed to fetch".
+        if (isBlockedMixedContentUrl(url)) {
+            return alert(`This page is served over HTTPS, so it cannot talk to an http:// server.\n\nUse https:// for:\n${url}`);
+        }
         setLocalSyncServerUrl(url);
         // Keep any loaded server-side settings in sync so it also persists for
         // the logged-in session, not just this device's cookie.
