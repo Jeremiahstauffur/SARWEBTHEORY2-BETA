@@ -2951,32 +2951,212 @@ function loadBundle() {
   }
 }
 
-let _inFlightPushPromise = null;
+// ----------------------------------------------------------------------------
+// Sync outbox
+//
+// Every save is diffed against the copy that was on this device just before it
+// (SARSyncDelta.computeBundleChanges) and only the rows that differ are queued
+// here, under "<CASE #>::<file name>", until the server confirms them. The
+// queue lives in localStorage so a reload, a closed tab or a dropped connection
+// never loses an edit; a batch keeps its id across retries so the server can
+// recognise one it already applied.
+// ----------------------------------------------------------------------------
 
-function saveBundle(bundle, skipSync = false) {
+function getSyncDeltaUtils() {
+    return (typeof window !== 'undefined' && window.SARSyncDelta) ? window.SARSyncDelta : null;
+}
+
+function outboxKeyFor(bundle) {
+    return `${getSyncBucket()}::${(bundle && bundle.fileName) || ''}`;
+}
+
+function readOutboxStore() {
+    try {
+        const raw = getStorageItem(SYNC_OUTBOX_STORAGE_KEY);
+        const parsed = raw ? JSON.parse(raw) : null;
+        return (parsed && typeof parsed === 'object' && !Array.isArray(parsed)) ? parsed : {};
+    } catch (e) {
+        return {};
+    }
+}
+
+function writeOutboxStore(store) {
+    try {
+        setStorageItem(SYNC_OUTBOX_STORAGE_KEY, JSON.stringify(store));
+    } catch (e) {}
+}
+
+function normalizeOutboxRecord(record) {
+    const raw = (record && typeof record === 'object') ? record : {};
+    const inFlight = (raw.inFlight && typeof raw.inFlight.batchId === 'string' && raw.inFlight.batchId)
+        ? {batchId: raw.inFlight.batchId, count: Math.max(0, Number(raw.inFlight.count) || 0)}
+        : null;
+    return {
+        // Server lastModified this device has caught up to (advanced by /state only).
+        cursor: typeof raw.cursor === 'string' ? raw.cursor : '',
+        // Row changes waiting for the server, oldest first.
+        changes: Array.isArray(raw.changes) ? raw.changes : [],
+        // The batch currently being sent (or sent without an answer): the first
+        // `count` changes travel again under the same id until confirmed.
+        inFlight,
+        // The next upload must be the whole file (nothing to diff against).
+        needsFullUpload: raw.needsFullUpload === true
+    };
+}
+
+function readOutboxRecord(bundle) {
+    return normalizeOutboxRecord(readOutboxStore()[outboxKeyFor(bundle)]);
+}
+
+function writeOutboxRecord(bundle, record) {
+    const store = readOutboxStore();
+    store[outboxKeyFor(bundle)] = normalizeOutboxRecord(record);
+    writeOutboxStore(store);
+}
+
+// Forget every queued row of a CASE # (used when the case itself is deleted).
+function removeOutboxRecordsForBucket(bucket) {
+    if (!bucket) return;
+    const store = readOutboxStore();
+    const prefix = `${bucket}::`;
+    let changed = false;
+    Object.keys(store).forEach((key) => {
+        if (key.indexOf(prefix) === 0) {
+            delete store[key];
+            changed = true;
+        }
+    });
+    if (changed) writeOutboxStore(store);
+}
+
+// Queue the rows that differ between the copy this device had and the copy it
+// just saved. Without a previous copy of the same file (first save on this
+// device, or a switch to another file) there is nothing to diff against, so
+// the next upload sends the whole file instead.
+function queueBundleChanges(previousBundle, nextBundle) {
+    const record = readOutboxRecord(nextBundle);
+    const utils = getSyncDeltaUtils();
+    if (!utils || !previousBundle || previousBundle.fileName !== nextBundle.fileName) {
+        record.needsFullUpload = true;
+        record.changes = [];
+        record.inFlight = null;
+        writeOutboxRecord(nextBundle, record);
+        return record;
+    }
+    if (record.needsFullUpload) {
+        // The pending whole-file upload will carry this save as well.
+        return record;
+    }
+    const changes = utils.computeBundleChanges(previousBundle, nextBundle);
+    if (!changes.length) return record;
+
+    // Changes that belong to a batch already sent must not be touched (a
+    // retry has to repeat that batch exactly), so only the ones behind it
+    // are coalesced with the new edits.
+    const locked = record.inFlight ? record.inFlight.count : 0;
+    let open = record.changes.slice(locked);
+    changes.forEach((change) => {
+        open = utils.coalesceChange(open, change);
+    });
+    record.changes = record.changes.slice(0, locked).concat(open);
+    writeOutboxRecord(nextBundle, record);
+    return record;
+}
+
+// The server answered a row batch: those changes are delivered.
+function confirmOutboxBatch(bundle, batchId) {
+    const record = readOutboxRecord(bundle);
+    if (!record.inFlight || record.inFlight.batchId !== batchId) return;
+    record.changes = record.changes.slice(record.inFlight.count);
+    record.inFlight = null;
+    writeOutboxRecord(bundle, record);
+}
+
+// A whole-file upload landed: everything queued before it started is covered
+// by it. Rows queued while it was travelling stay for the next row batch.
+function settleOutboxAfterFullUpload(bundle, queuedAtStart) {
+    const record = readOutboxRecord(bundle);
+    record.needsFullUpload = false;
+    record.inFlight = null;
+    record.changes = record.changes.slice(Math.min(queuedAtStart, record.changes.length));
+    writeOutboxRecord(bundle, record);
+}
+
+function createBatchId() {
+    if (typeof crypto !== 'undefined' && crypto && typeof crypto.randomUUID === 'function') {
+        return crypto.randomUUID();
+    }
+    return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
+}
+
+// Remember which CASE # the locally stored search file belongs to.
+function tagLocalBundleBucket() {
+    const bucket = getSyncBucket();
+    if (bucket) {
+        setStorageItem(BUNDLE_BUCKET_STORAGE_KEY, bucket);
+    } else {
+        removeStorageItem(BUNDLE_BUCKET_STORAGE_KEY);
+    }
+}
+
+// A stored search file tagged with another CASE # must never be shown here,
+// let alone uploaded into this case: drop it so the case is read from the
+// database instead. A copy without a tag (left by the previous build) is kept
+// for the one-time migration in syncWithServer(). Returns true when dropped.
+function discardForeignLocalCopy() {
+    const bucket = getSyncBucket();
+    const tag = getStorageItem(BUNDLE_BUCKET_STORAGE_KEY);
+    if (!bucket || !tag || tag === bucket || !getStorageItem(BUNDLE_STORAGE_KEY)) return false;
+    removeStorageItem(BUNDLE_STORAGE_KEY);
+    removeStorageItem(BUNDLE_BUCKET_STORAGE_KEY);
+    return true;
+}
+
+// Browsers refuse a keepalive request whose body is over 64 KiB - the upload
+// then fails with "Failed to fetch" and nothing reaches the server. Only a
+// body safely under that limit may ask to outlive the page.
+const KEEPALIVE_MAX_BODY_BYTES = 60000;
+
+function utf8ByteLength(text) {
+    let bytes = 0;
+    for (let i = 0; i < text.length; i++) {
+        const code = text.charCodeAt(i);
+        if (code < 0x80) bytes += 1;
+        else if (code < 0x800) bytes += 2;
+        else if (code >= 0xd800 && code <= 0xdbff) { bytes += 4; i++; }
+        else bytes += 3;
+    }
+    return bytes;
+}
+
+function fetchInitWithKeepalive(body, init = {}) {
+    const out = {...init, body};
+    if (typeof body === 'string' && body.length < KEEPALIVE_MAX_BODY_BYTES
+        && utf8ByteLength(body) < KEEPALIVE_MAX_BODY_BYTES) {
+        out.keepalive = true;
+    }
+    return out;
+}
+
+// Older builds kept a second full copy of the search file; it is not needed
+// any more and only takes up storage.
+removeStorageItem(LEGACY_SYNC_SNAPSHOT_STORAGE_KEY);
+
+// Store the search file locally, queue the rows that changed and (unless the
+// caller flushes later itself) send them. Returns the flush promise so callers
+// that reload or wait can await the write.
+function saveBundle(bundle, deferFlush = false) {
   bundle.lastModified = new Date().toISOString();
   const sanitized = sanitizeBundle(bundle);
-
+  const previous = getStorageItem(BUNDLE_STORAGE_KEY) ? loadBundle() : null;
+  queueBundleChanges(previous, sanitized);
   setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
-
-  let pushPromise = null;
-  if (!skipSync) {
-      // Send ONLY the rows this device changed. Return this promise so callers
-      // that reload or wait can await the write; track it in
-      // _inFlightPushPromise so background pulls never race in front.
-      pushPromise = pushBundleDelta(sanitized);
-      _inFlightPushPromise = pushPromise;
-      pushPromise.finally(() => {
-          if (_inFlightPushPromise === pushPromise) {
-              _inFlightPushPromise = null;
-          }
-      });
-      // Ensure the current file is always in the saved files list
-      saveFileToList(sanitized.fileName, sanitized);
-  }
-  
+  tagLocalBundleBucket();
+  // Ensure the current file is always in the saved files list
+  saveFileToList(sanitized.fileName, sanitized);
   updateFileNameDisplay();
-  return pushPromise;
+  if (deferFlush) return Promise.resolve(false);
+  return pushBundleDelta(sanitized);
 }
 
 function getSavedFiles() {
@@ -3055,25 +3235,43 @@ async function deleteCaseEverywhere(caseNumber) {
         }
     }
 
-    // Local cleanup: drop any cached copy (keyed by the CASE # or "<CASE>.json").
+    // Local cleanup. If the deleted case is the one currently open, drop the
+    // active copy first so nothing below can save it again (a save would queue
+    // rows and re-seed the case the server just removed). Rows still queued
+    // for the case are forgotten too, so nothing is re-sent for it.
+    let deletingActive = false;
+    try {
+        const active = loadBundle();
+        deletingActive = !!active && String(active.fileName || '').replace(/\.json$/i, '') === clean;
+    } catch (e) {}
+    if (deletingActive) {
+        removeStorageItem(BUNDLE_STORAGE_KEY);
+        removeStorageItem(BUNDLE_BUCKET_STORAGE_KEY);
+    }
+    removeOutboxRecordsForBucket(caseNumberToBucket(clean));
+
+    // Drop any cached copy (keyed by the CASE # or "<CASE>.json"). The deletion
+    // is logged into the activity log of the case that stays open, if any.
     const files = getSavedFiles();
     Object.keys(files).forEach((key) => {
-        if (String(key).replace(/\.json$/i, '') === clean) {
+        if (String(key).replace(/\.json$/i, '') !== clean) return;
+        if (deletingActive) {
+            delete files[key];
+            setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
+        } else {
             deleteFileFromList(key);
         }
     });
 
-    // If the deleted case is the one currently open, reset the active bundle and
-    // sync bucket. Await the setSyncBucket('') write so a caller that reloads
-    // cannot abort it, and refresh the file-name display for the current view.
-    try {
-        const active = loadBundle();
-        if (active && String(active.fileName || '').replace(/\.json$/i, '') === clean) {
-            removeStorageItem(BUNDLE_STORAGE_KEY);
+    // Reset the sync bucket of a deleted active case. Await the setSyncBucket('')
+    // write so a caller that reloads cannot abort it, and refresh the file-name
+    // display for the current view.
+    if (deletingActive) {
+        try {
             await setSyncBucket('');
             if (typeof updateFileNameDisplay === 'function') updateFileNameDisplay();
-        }
-    } catch (e) {}
+        } catch (e) {}
+    }
 
     return true;
 }
@@ -3514,11 +3712,18 @@ function saveRegionsAndRefresh(data) {
   recalculateEverything();
 }
 
+// Recompute every derived value (consensus, time per sweep, PSRi/PSRc, search
+// log PSR before/after). Rendering a page calls this too, so it only saves -
+// and therefore only sends rows - when a value actually changed; a plain
+// re-render stays silent. Returns the save promise (resolved false when
+// nothing changed).
 function recalculateEverything() {
   const bundle = loadBundle();
   const segmentsData = bundle.pages.page2 || [];
   const searchLogData = bundle.pages.page4 || [];
   const regionsData = bundle.pages.index;
+  // Only the pages are recomputed below; snapshot them to see whether anything moved.
+  const pagesBefore = JSON.stringify(bundle.pages);
 
   // 1. Recalculate Regions Consensus
   updateConsensusCells(regionsData);
@@ -3624,12 +3829,15 @@ function recalculateEverything() {
      }
   });
 
-  saveBundle(bundle);
+  if (JSON.stringify(bundle.pages) === pagesBefore) return Promise.resolve(false);
+
+  const savePromise = saveBundle(bundle);
 
   // Segment PSRc values (column 7) were just recomputed. If the CalTopo
   // assignment overlay is on, re-color and re-opacity the shapes on SARTopo so
   // the map always reflects the latest PSRc scale.
   refreshCalTopoAssignmentOverlayIfEnabled();
+  return savePromise;
 }
 
 function buildRegionsTable() {
@@ -12545,14 +12753,21 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
     }
     
-    // Pull the latest bundle and file list from the database BEFORE rendering so a
-    // reload restores everything (CASE # + all rows) from the server instead of
-    // showing an empty default — and so no empty bundle is pushed before the real
-    // data has been read back. Bounded by a timeout so a slow/down server still
-    // lets the page finish loading (it re-syncs on the next save/visibility change).
+    // Bring the local copy in step with the database BEFORE rendering, so a
+    // reload shows the current rows instead of an empty default and no empty
+    // bundle is pushed before the real data has been read back. A device that
+    // already holds this CASE #'s file only sends what it still has queued and
+    // asks for what changed; a device without one (or whose copy is not tagged
+    // with a CASE # yet) reads the file once. Bounded by a timeout so a slow or
+    // down server still lets the page finish loading (the poll catches up).
     if (getSyncBucket()) {
-        await withTimeout(syncWithServer(), 10000);
+        discardForeignLocalCopy();
+        const needsFullRead = !getStorageItem(BUNDLE_STORAGE_KEY)
+            || !getStorageItem(BUNDLE_BUCKET_STORAGE_KEY)
+            || isHomePage();
+        await withTimeout(needsFullRead ? syncWithServer() : flushAndPoll(), 10000);
     }
+    startSyncPolling();
     
     const bundle = loadBundle();
     applyTheme(bundle);
@@ -13206,8 +13421,11 @@ function importSegmentsAction(segments) {
         addActivityLogEntry('System', 'Imported segments: ' + importedNames.join(', '), b);
     }
 
-    const savePromise = saveBundle(b);
-    recalculateEverything();
+    // Queue the imported rows without sending yet: the recalculation right
+    // after fills in their derived cells, and both go out as ONE row batch
+    // (rather than an upload per step). The rebuild below is render-only.
+    saveBundle(b, true);
+    const savePromise = recalculateEverything().then((flushed) => (flushed ? true : pushBundleDelta(loadBundle())));
     if (isSegmentsPage()) buildSegmentsTable();
 
     setTimeout(() => {
@@ -13215,9 +13433,10 @@ function importSegmentsAction(segments) {
         if (isSegmentsPage()) buildSegmentsTable();
     }, 7000);
 
-    Promise.resolve(savePromise).finally(() => {
+    Promise.resolve(savePromise).catch(() => false).finally(() => {
         endUserAction();
     });
+    return savePromise;
 }
 
 async function showCalTopoLinkPopup(originalIdx) {
@@ -15314,12 +15533,6 @@ function mergeBundles(local, server) {
     return merged;
 }
 
-function areBundlesEqual(a, b) {
-    const aCopy = { ...a, lastModified: '' };
-    const bCopy = { ...b, lastModified: '' };
-    return JSON.stringify(aCopy) === JSON.stringify(bCopy);
-}
-
 function getAuthHeaders(extra = {}) {
     const creds = getUserCredentials();
     const headers = {
@@ -15394,6 +15607,11 @@ function withTimeout(promise, ms) {
     ]);
 }
 
+// The one-time full read of the search file: for a device that has no local
+// copy of this CASE # yet (or one left by the previous build), the home page
+// (which shows the file list) and a CASE # the server has never seen (seeded
+// from the local copy). Otherwise pages stay in step through the row batches
+// and the /state poll, and never re-read or re-upload the whole file.
 async function syncWithServer() {
     if (isSyncing) return;
     const bucket = getSyncBucket();
@@ -15411,9 +15629,9 @@ async function syncWithServer() {
     if (!bucket) return;
 
     // If a push is currently in flight, wait for it first so we don't fetch older server state
-    if (_inFlightPushPromise) {
+    if (_outboxFlushPromise) {
         try {
-            await _inFlightPushPromise;
+            await _outboxFlushPromise;
         } catch (e) {}
     }
 
@@ -15463,50 +15681,24 @@ async function syncWithServer() {
             }
         }
 
-        // 2. Sync active bundle
-        const endpoint = isNewDevice ? 'latest' : 'bundle';
-        const resp = await apiFetch(`${apiBase}/${endpoint}?_=${Date.now()}`, {
+        // 2. Read the search file. The server copy is the base; the rows this
+        // device still has queued are put back on top of it and sent.
+        const resp = await apiFetch(`${apiBase}/bundle?_=${Date.now()}`, {
             headers: getAuthHeaders()
         });
         if (resp.ok) {
             const serverBundle = await resp.json();
-            if (serverBundle) {
-                const localBundle = loadBundle();
-                const sMod = new Date(serverBundle.lastModified || 0).getTime();
-                const lMod = new Date(localBundle.lastModified || 0).getTime();
-
-                if (sMod > lMod) {
-                    const merged = mergeBundles(localBundle, serverBundle);
-                    // The server copy we just read is now the baseline every
-                    // later save is diffed against.
-                    writeSyncSnapshot(serverBundle);
-                    if (areBundlesEqual(merged, serverBundle)) {
-                        setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(serverBundle));
-                    } else {
-                        // Local holds rows the server has not seen. Store the
-                        // merge locally and send up ONLY those rows.
-                        saveBundle(merged, true);
-                        pushBundleDelta(sanitizeBundle(merged));
-                    }
-                    
-                    const files = getSavedFiles();
-                    if (serverBundle.fileName) {
-                        files[serverBundle.fileName] = {
-                            bundle: loadBundle(),
-                            lastModified: loadBundle().lastModified
-                        };
-                        setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
-                    }
-                    refreshSyncUI();
-                }
-                // When the local copy looks newer nothing is pushed here: the
-                // rows a device changed were already sent as they were entered.
+            if (serverBundle && typeof serverBundle === 'object' && !Array.isArray(serverBundle)) {
+                if (!isNewDevice) queueLegacyLocalRows(loadBundle(), serverBundle);
+                applyServerSections(serverBundle, serverBundle.lastModified, {advanceCursor: true});
+                await pushBundleDelta(loadBundle());
             }
         } else if (resp.status === 404) {
             // No search file on the server yet, so seed it once.
             const localBundle = loadBundle();
-            await pushBundleToServer(localBundle);
-            writeSyncSnapshot(localBundle);
+            if (await pushBundleToServer(localBundle, {seed: true})) {
+                settleOutboxAfterFullUpload(localBundle, readOutboxRecord(localBundle).changes.length);
+            }
         }
     } catch (err) {
         console.warn("Sync background check failed:", err);
@@ -15515,170 +15707,359 @@ async function syncWithServer() {
     }
 }
 
-function getSyncDeltaUtils() {
-    return (typeof window !== 'undefined' && window.SARSyncDelta) ? window.SARSyncDelta : null;
+// A device upgrading from the previous build has a local copy that is not
+// tagged with its CASE # yet. Rows it added that never reached the server (the
+// whole-file uploads of that build failed silently once the file grew large)
+// are queued now, so they are delivered instead of being lost when the server
+// copy is adopted. Only additions travel - new rows and rows typed into blank
+// ones - never a differing existing cell, which may well be another device's
+// newer edit.
+function isBlankRow(row) {
+    if (row === undefined || row === null || row === '') return true;
+    if (Array.isArray(row)) return row.every(isBlankRow);
+    if (typeof row === 'object') return Object.keys(row).every((key) => isBlankRow(row[key]));
+    return false;
 }
 
-// The snapshot is per CASE # + search file, so switching either one starts a
-// fresh comparison instead of diffing against an unrelated file.
-function syncSnapshotKeyFor(bundle) {
-    return `${getSyncBucket()}::${(bundle && bundle.fileName) || ''}`;
+function queueLegacyLocalRows(localBundle, serverBundle) {
+    const utils = getSyncDeltaUtils();
+    if (!utils || getStorageItem(BUNDLE_BUCKET_STORAGE_KEY)) return [];
+    if (!localBundle || !serverBundle || localBundle.fileName !== serverBundle.fileName) return [];
+
+    const additive = utils.computeBundleChanges(sanitizeBundle(serverBundle), localBundle).filter((change) => {
+        if (Array.isArray(change.append) || Array.isArray(change.prepend)) return true;
+        if (change.deleted === true || Object.prototype.hasOwnProperty.call(change, 'length')) return false;
+        if (!Object.prototype.hasOwnProperty.call(change, 'value')) return false;
+        if (!Object.prototype.hasOwnProperty.call(change, 'previous')) return false;
+        // Top-level settings and single records are not rows; leave them.
+        return change.path[0] === 'pages' && isBlankRow(change.previous) && !isBlankRow(change.value);
+    });
+    if (!additive.length) return additive;
+
+    const record = readOutboxRecord(localBundle);
+    if (record.needsFullUpload) return [];
+    const locked = record.inFlight ? record.inFlight.count : 0;
+    let open = record.changes.slice(locked);
+    additive.forEach((change) => {
+        open = utils.coalesceChange(open, change);
+    });
+    record.changes = record.changes.slice(0, locked).concat(open);
+    writeOutboxRecord(localBundle, record);
+    return additive;
 }
 
-function readSyncSnapshot(bundle) {
-    try {
-        const raw = getStorageItem(SYNC_SNAPSHOT_STORAGE_KEY);
-        if (!raw) return null;
-        const parsed = JSON.parse(raw);
-        if (!parsed || parsed.key !== syncSnapshotKeyFor(bundle)) return null;
-        return parsed.bundle || null;
-    } catch (e) {
-        return null;
-    }
-}
-
-function writeSyncSnapshot(snapshotBundle, keyBundle = snapshotBundle) {
-    try {
-        setStorageItem(SYNC_SNAPSHOT_STORAGE_KEY, JSON.stringify({
-            key: syncSnapshotKeyFor(keyBundle),
-            bundle: snapshotBundle
-        }));
-    } catch (e) {}
-}
-
-// Upload ONLY what this device changed.
+// Deliver the rows queued in the outbox (see saveBundle / queueBundleChanges).
 //
 // Several devices share one search file, so uploading the whole file made the
-// last writer wipe out every row the others had just typed. Instead we diff the
-// saved file against the snapshot the server confirmed last time and send just
-// those rows; the server merges them into the stored file row by row. When
-// nothing changed, no request is made at all.
+// last writer wipe out every row the others had just typed. Instead only the
+// rows this device changed travel, as one batch with a stable id, and the
+// server merges them into the stored file row by row. A batch stays queued
+// until the server confirms it, so a dropped connection or a closed tab never
+// loses an edit. Flushes run one at a time; the promise resolves to true when
+// the outbox is empty afterwards.
+let _outboxFlushPromise = null;
+
 async function pushBundleDelta(bundle) {
     const bucket = getSyncBucket();
     const serverUrl = getSyncServerUrl();
-    if (!serverUrl || !bucket || !getUserCredentials()) return;
+    if (!serverUrl || !bucket || !getUserCredentials()) return false;
 
-    const utils = getSyncDeltaUtils();
-    if (!utils) {
-        // The shared helper is not loaded on this page; fall back to the whole
-        // file rather than losing the edit.
-        await pushBundleToServer(bundle);
-        return;
+    // One flush at a time, so two batches are never in flight together and a
+    // retry always repeats the batch it stands for.
+    while (_outboxFlushPromise) {
+        try {
+            await _outboxFlushPromise;
+        } catch (e) {}
     }
+    let release;
+    _outboxFlushPromise = new Promise((resolve) => { release = resolve; });
 
-    const snapshot = readSyncSnapshot(bundle);
-    if (!snapshot) {
-        // Nothing to diff against yet (first save for this CASE # on this
-        // device). Seed the server once, then send rows only from here on.
-        await pushBundleToServer(bundle);
-        writeSyncSnapshot(bundle);
-        return;
-    }
-
-    const changes = utils.computeBundleChanges(snapshot, bundle);
-    if (!changes.length) return;
-
-    const baseUrl = serverUrl.replace(/\/$/, '');
     try {
-        const resp = await apiFetch(`${baseUrl}/api/v1/${bucket}/rows`, {
-            method: 'POST',
-            headers: getAuthHeaders({'X-Last-Modified': new Date().toISOString()}),
-            body: JSON.stringify({fileName: bundle.fileName, changes}),
-            keepalive: true
-        });
+        // Whole-file uploads always carry the newest local copy of the file.
+        const local = loadBundle();
+        if (!bundle || local.fileName === bundle.fileName) bundle = local;
+        const record = readOutboxRecord(bundle);
+        const queuedAtStart = record.changes.length;
+
+        if (record.needsFullUpload) {
+            // First copy of this file on this device, or a switch to another
+            // file: there was nothing to diff against, so the file goes whole.
+            const uploaded = await pushBundleToServer(bundle);
+            if (uploaded) settleOutboxAfterFullUpload(bundle, queuedAtStart);
+            return uploaded;
+        }
+        if (!queuedAtStart) return true;
+
+        // Repeat an unanswered batch exactly (same id, same rows); otherwise
+        // everything queued so far becomes a new batch.
+        const batchId = record.inFlight ? record.inFlight.batchId : createBatchId();
+        const count = record.inFlight ? Math.min(record.inFlight.count, queuedAtStart) || queuedAtStart : queuedAtStart;
+        const changes = record.changes.slice(0, count);
+        record.inFlight = {batchId, count};
+        writeOutboxRecord(bundle, record);
+
+        const baseUrl = serverUrl.replace(/\/$/, '');
+        let resp;
+        try {
+            resp = await apiFetch(`${baseUrl}/api/v1/${bucket}/rows`, fetchInitWithKeepalive(
+                JSON.stringify({fileName: bundle.fileName, batchId, changes}),
+                {method: 'POST', headers: getAuthHeaders()}
+            ));
+        } catch (err) {
+            // Offline or interrupted: the batch stays queued and is retried by
+            // the next save, poll or reconnect.
+            console.warn("Push row changes failed:", err);
+            return false;
+        }
 
         if (resp.ok) {
-            writeSyncSnapshot(bundle);
-            return;
+            const result = await resp.json().catch(() => ({}));
+            confirmOutboxBatch(bundle, batchId);
+            // The answer echoes the sections the batch touched, merged with
+            // what the other devices entered; show them without another round
+            // trip. The cursor is left alone: only a /state answer is complete.
+            if (result && result.state) {
+                applyServerSections(result.state, result.lastModified);
+            }
+            return readOutboxRecord(bundle).changes.length === 0;
         }
 
         const errorData = await resp.json().catch(() => ({}));
-        // needsFullSync: the server has no copy of this CASE # yet.
+        if (errorData && errorData.needsFullSync) {
+            // The server has never seen this CASE #: seed it once with the
+            // whole file. Should another device have seeded it meanwhile the
+            // rows simply stay queued and go as a row batch next time.
+            const seeded = await pushBundleToServer(bundle, {seed: true});
+            if (seeded) settleOutboxAfterFullUpload(bundle, queuedAtStart);
+            return seeded;
+        }
         // 400/404/405/501: an older or self-hosted backend without the row
         // endpoint. 413: so much changed that it is no longer a row update.
-        // In every case, fall back to the whole file so the edit is never
-        // silently dropped.
-        if ((errorData && errorData.needsFullSync) || [400, 404, 405, 413, 501].indexOf(resp.status) !== -1) {
-            await pushBundleToServer(bundle);
-            writeSyncSnapshot(bundle);
-            return;
+        // Fall back to the whole file so the edit is never silently dropped.
+        if ([400, 404, 405, 413, 501].indexOf(resp.status) !== -1) {
+            const uploaded = await pushBundleToServer(bundle);
+            if (uploaded) settleOutboxAfterFullUpload(bundle, queuedAtStart);
+            return uploaded;
+        }
+        if (resp.status === 403) {
+            // Super-Admin protection: this user may not change these rows.
+            // Drop them; the next poll puts the server's rows back on screen.
+            console.error("Push row changes refused:", errorData.message || errorData.error || '');
+            confirmOutboxBatch(bundle, batchId);
+            return false;
         }
         console.error("Push row changes failed:", resp.status, errorData.message || errorData.error || '');
+        return false;
     } catch (err) {
         console.error("Push row changes failed:", err);
+        return false;
+    } finally {
+        _outboxFlushPromise = null;
+        release();
+        try {
+            flushPendingSyncUI();
+        } catch (err) {
+            console.error("Refresh after push failed:", err);
+        }
     }
 }
 
-async function fetchServerPageData(pageName) {
-    const bucket = getSyncBucket();
-    const serverUrl = getSyncServerUrl();
-    if (!serverUrl || !bucket || !getUserCredentials()) return null;
-
-    try {
-        const resp = await apiFetch(
-            `${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/page/${encodeURIComponent(pageName)}?_=${Date.now()}`,
-            {headers: getAuthHeaders()}
-        );
-        if (!resp.ok) return null;
-        return await resp.json();
-    } catch (err) {
-        return null;
-    }
-}
-
-// Ask the database for THIS page's data only.
-//
-// Used when arriving on a page and right after a cell edit or button press was
-// pushed, so the device immediately shows what the other devices entered without
-// ever re-uploading the page it is on (or the page it just left).
-async function pullCurrentPageData({refresh = true} = {}) {
-    if (typeof pageKey !== 'function') return false;
-    const key = pageKey();
-    const payload = await fetchServerPageData(key);
-    if (!payload || payload.found !== true || payload.data === null) return false;
-
+// Put this device's undelivered rows back on top of a copy the server sent, so
+// an edit that has not reached the server yet stays on screen (it is sent
+// later). Rows the server already holds - an append it applied before the
+// answer got lost - are not added a second time. Returns a new bundle.
+function rebasePendingChanges(bundle, changes) {
     const utils = getSyncDeltaUtils();
-    const local = loadBundle();
-    const currentPage = local.pages ? local.pages[key] : undefined;
-    if (utils && utils.deepEqual(currentPage, payload.data)) return false;
-
-    if (!local.pages) local.pages = {};
-    local.pages[key] = payload.data;
-    const sanitized = sanitizeBundle(local);
-    // sanitizeBundle only keeps the known table pages, so a page it does not
-    // recognise was not stored and there is nothing to show.
-    if (!sanitized.pages || sanitized.pages[key] === undefined) return false;
-    setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
-
-    // Keep the snapshot in step for this page only, so the freshly pulled rows
-    // are not mistaken for local changes and echoed straight back.
-    const snapshot = readSyncSnapshot(sanitized);
-    if (snapshot) {
-        if (!snapshot.pages) snapshot.pages = {};
-        snapshot.pages[key] = JSON.parse(JSON.stringify(sanitized.pages[key]));
-        writeSyncSnapshot(snapshot, sanitized);
-    }
-
-    if (refresh) refreshSyncUI();
-    return true;
+    if (!utils || !Array.isArray(changes) || !changes.length) return bundle;
+    const target = JSON.parse(JSON.stringify(bundle));
+    const listAt = (path) => {
+        let node = target;
+        for (const key of path) {
+            if (!node || typeof node !== 'object') return undefined;
+            node = node[key];
+        }
+        return Array.isArray(node) ? node : [];
+    };
+    const pending = JSON.parse(JSON.stringify(changes)).map((change) => {
+        if (!Array.isArray(change.append) && !Array.isArray(change.prepend)) return change;
+        const list = listAt(change.path);
+        const missing = (row) => !list.some((existing) => utils.deepEqual(existing, row));
+        if (Array.isArray(change.append)) change.append = change.append.filter(missing);
+        if (Array.isArray(change.prepend)) change.prepend = change.prepend.filter(missing);
+        return change;
+    });
+    return utils.applyBundleChanges(target, pending).bundle;
 }
 
-async function pushBundleToServer(bundle, isReconcileRetry = false) {
+const withoutLastModified = (bundle) => {
+    const copy = {...bundle};
+    delete copy.lastModified;
+    return copy;
+};
+
+// Put what the server sent on screen without losing this device's work. The
+// received sections replace the local ones (sections the server did not send
+// keep their local value), then the rows still queued in the outbox are
+// re-applied on top, so an undelivered edit is shown now and sent later
+// instead of being wiped by an older server copy. The outbox cursor only
+// moves for a /state answer (`advanceCursor`): a /rows echo carries just the
+// sections that batch touched. Returns true when the local copy changed.
+function applyServerSections(sections, lastModified, {advanceCursor = false} = {}) {
+    const utils = getSyncDeltaUtils();
+    if (!utils || !sections || typeof sections !== 'object' || Array.isArray(sections)) return false;
+
+    const hadCopy = !!getStorageItem(BUNDLE_STORAGE_KEY);
+    const local = loadBundle();
+    const record = readOutboxRecord(local);
+    const merged = utils.mergeServerSections(local, sections);
+    const sanitized = sanitizeBundle(rebasePendingChanges(merged, record.changes));
+    const changed = !utils.deepEqual(withoutLastModified(sanitized), withoutLastModified(local));
+
+    if (changed || !hadCopy) {
+        setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
+        const files = getSavedFiles();
+        if (sanitized.fileName) {
+            files[sanitized.fileName] = {bundle: sanitized, lastModified: sanitized.lastModified};
+            setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
+        }
+    }
+    // The stored copy now reflects this CASE #'s file (a copy from the previous
+    // build had no tag yet).
+    tagLocalBundleBucket();
+
+    if (advanceCursor && typeof lastModified === 'string' && lastModified) {
+        record.cursor = lastModified;
+    }
+    if (outboxKeyFor(sanitized) !== outboxKeyFor(local)) {
+        // The server renamed the file: the queued rows follow it.
+        const store = readOutboxStore();
+        delete store[outboxKeyFor(local)];
+        writeOutboxStore(store);
+    }
+    writeOutboxRecord(sanitized, record);
+
+    if (changed) {
+        // The data is stored either way; a page that fails to redraw must not
+        // make the caller believe nothing arrived.
+        try {
+            refreshSyncUI();
+        } catch (err) {
+            console.error("Refresh after server update failed:", err);
+        }
+    }
+    return changed;
+}
+
+// Ask the database whether the other devices changed anything since the
+// version this device has, and put those sections on screen. The answer is
+// tiny when nothing changed. Resolves to true when new data was applied.
+let _pollPromise = null;
+
+function pollServerState() {
+    if (_pollPromise) return _pollPromise;
+    const run = (async () => {
+        const bucket = getSyncBucket();
+        const serverUrl = getSyncServerUrl();
+        if (!serverUrl || !bucket || !getUserCredentials() || isSyncing) return false;
+        // A device without a local copy needs the one-time full read instead.
+        if (!getStorageItem(BUNDLE_STORAGE_KEY)) return false;
+        // Rows still travelling are confirmed first, so the answer includes them.
+        if (_outboxFlushPromise) {
+            try {
+                await _outboxFlushPromise;
+            } catch (e) {}
+        }
+        const record = readOutboxRecord(loadBundle());
+        const baseUrl = serverUrl.replace(/\/$/, '');
+        try {
+            const resp = await withTimeout(apiFetch(
+                `${baseUrl}/api/v1/${bucket}/state?since=${encodeURIComponent(record.cursor)}&_=${Date.now()}`,
+                {headers: getAuthHeaders()}
+            ), 15000);
+            if (!resp) return false;
+            const body = await resp.json().catch(() => null);
+            if (resp.status === 404 && body && body.found === false) {
+                // The server has never seen this CASE #: seed it.
+                await syncWithServer();
+                return false;
+            }
+            if (!resp.ok || !body || body.found === false || body.modified === false) return false;
+            return applyServerSections(body.bundle, body.lastModified, {advanceCursor: true});
+        } catch (err) {
+            console.warn("State poll failed:", err);
+            return false;
+        }
+    })();
+    _pollPromise = run;
+    run.finally(() => {
+        if (_pollPromise === run) _pollPromise = null;
+    }).catch(() => {});
+    return run;
+}
+
+// Send whatever is still queued, then look for the other devices' changes.
+function flushAndPoll() {
+    return pushBundleDelta(loadBundle()).then(pollServerState).catch(() => false);
+}
+
+// Keep the page in step with the other devices while it is open: a poll every
+// SYNC_POLL_INTERVAL_MS (skipped while the tab is hidden or a round trip is
+// still running), plus an immediate one when the tab comes back or the
+// connection returns.
+let _syncPollTimer = null;
+
+function syncTick() {
+    if (document.hidden || _outboxFlushPromise || _pollPromise || isSyncing) return;
+    flushAndPoll();
+}
+
+function startSyncPolling() {
+    if (_syncPollTimer) return;
+    _syncPollTimer = setInterval(syncTick, SYNC_POLL_INTERVAL_MS);
+    window.addEventListener('online', syncTick);
+}
+
+// Upload the whole search file. With the row-level sync this only happens to
+// seed a CASE # the server has never seen (`seed`: refused with 409 when a copy
+// exists, so two devices seeding at once cannot wipe each other out), after a
+// switch to another file, and for older backends without the row endpoint.
+// A whole file is far larger than a browser allows for a keepalive request, so
+// it always travels as an ordinary request. Resolves to true when it landed.
+async function pushBundleToServer(bundle, {seed = false, isReconcileRetry = false} = {}) {
     const bucket = getSyncBucket();
     const serverUrl = getSyncServerUrl();
-    if (!serverUrl) return;
-    
+    if (!serverUrl || !bucket) return false;
+
     const headers = getAuthHeaders();
-    
+    const body = JSON.stringify(bundle);
+
     try {
         const baseUrl = serverUrl.replace(/\/$/, '');
         // 1. Push to the general active bundle endpoint
-        const resp = await apiFetch(`${baseUrl}/api/v1/${bucket}/bundle`, {
+        const resp = await apiFetch(`${baseUrl}/api/v1/${bucket}/bundle${seed ? '?seed=1' : ''}`, {
             method: 'PUT',
             headers: headers,
-            body: JSON.stringify(bundle),
-            keepalive: true
+            body
         });
+
+        if (!resp.ok) {
+            const errorData = await resp.json().catch(() => ({}));
+            if (resp.status === 409 && errorData.alreadyExists) {
+                // Another device seeded this CASE # first: adopt its copy as
+                // soon as this round trip is over. The rows queued here go on
+                // top of it and travel as a row batch.
+                setTimeout(() => { syncWithServer(); }, 0);
+                return false;
+            }
+            if (resp.status === 403 && (errorData.message || '').includes('older than server data')) {
+                if (!isReconcileRetry) {
+                    return reconcileAndRepushBundle(bundle, baseUrl, bucket, headers);
+                }
+                return false;
+            }
+            console.error("Push bundle failed:", resp.status, errorData.message || '');
+            return false;
+        }
 
         // 2. Also push to a file-specific endpoint to aid discovery and prevent truncation
         if (bundle.fileName) {
@@ -15686,32 +16067,22 @@ async function pushBundleToServer(bundle, isReconcileRetry = false) {
             await apiFetch(`${baseUrl}/api/v1/${bucket}/${fileKey}`, {
                 method: 'PUT',
                 headers: headers,
-                body: JSON.stringify(bundle),
-                keepalive: true
+                body
             }).catch(() => {});
         }
-
-        if (!resp.ok) {
-            const errorData = await resp.json().catch(() => ({}));
-            if (resp.status === 403 && (errorData.message || '').includes('older than server data')) {
-                if (!isReconcileRetry) {
-                    await reconcileAndRepushBundle(bundle, baseUrl, bucket, headers);
-                }
-                return;
-            }
-            console.error("Push bundle failed:", resp.status, errorData.message || '');
-        }
+        return true;
     } catch (err) {
         console.error("Push bundle failed:", err);
+        return false;
     }
 }
 
 async function reconcileAndRepushBundle(localBundle, baseUrl, bucket, headers) {
     try {
         const resp = await apiFetch(`${baseUrl}/api/v1/${bucket}/bundle?_=${Date.now()}`, { headers });
-        if (!resp.ok) return;
+        if (!resp.ok) return false;
         const serverBundle = await resp.json();
-        if (!serverBundle || typeof serverBundle !== 'object') return;
+        if (!serverBundle || typeof serverBundle !== 'object') return false;
 
         const reconciled = mergeBundles(serverBundle, localBundle);
         const serverTime = new Date(serverBundle.lastModified || 0).getTime() || 0;
@@ -15719,11 +16090,13 @@ async function reconcileAndRepushBundle(localBundle, baseUrl, bucket, headers) {
 
         const sanitized = sanitizeBundle(reconciled);
         setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
-        await pushBundleToServer(sanitized, true);
-        writeSyncSnapshot(sanitized);
+        tagLocalBundleBucket();
+        const uploaded = await pushBundleToServer(sanitized, {isReconcileRetry: true});
         refreshSyncUI();
+        return uploaded;
     } catch (err) {
         console.warn("Bundle reconcile failed:", err);
+        return false;
     }
 }
 
@@ -15737,12 +16110,12 @@ async function pushFileListToServer(files) {
     });
     
     try {
-        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/all-files`, {
-            method: 'PUT',
-            headers: headers,
-            body: JSON.stringify(files),
-            keepalive: true
-        });
+        // The list carries whole search files, so it is usually far too large
+        // for a keepalive request.
+        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/all-files`, fetchInitWithKeepalive(
+            JSON.stringify(files),
+            {method: 'PUT', headers: headers}
+        ));
         if (!resp.ok) {
             const errorData = await resp.json().catch(() => ({}));
             if (resp.status === 403 && (errorData.message || '').includes('older than server data')) {
@@ -15802,7 +16175,7 @@ function isEditingActive() {
 }
 
 function isUserActionActive() {
-    return _activeActionCount > 0 || isEditingActive() || _inFlightPushPromise !== null;
+    return _activeActionCount > 0 || isEditingActive() || _outboxFlushPromise !== null;
 }
 
 let _pendingUIRefresh = false;
@@ -15838,9 +16211,9 @@ function flushPendingSyncUI() {
     }
 }
 
-// Leaving a cell (or finishing a button press) has already sent just that row
-// up. All that is left to do is ask the database for this page's data so the
-// rows other devices changed appear straight away.
+// Leaving a cell (or finishing a button press) has already queued just that
+// row. All that is left to do is make sure it went out and ask the database
+// what the other devices changed, so their rows appear straight away.
 let _syncOnLeaveTimer = null;
 function scheduleSyncOnLeave() {
     if (_syncOnLeaveTimer) clearTimeout(_syncOnLeaveTimer);
@@ -15849,13 +16222,13 @@ function scheduleSyncOnLeave() {
         if (isEditingActive()) return;
         beginUserAction();
         try {
-            if (_inFlightPushPromise) {
-                await _inFlightPushPromise;
+            if (_outboxFlushPromise) {
+                await _outboxFlushPromise;
             }
         } finally {
             endUserAction();
         }
-        await pullCurrentPageData();
+        await flushAndPoll();
     }, 200);
 }
 
@@ -15876,17 +16249,17 @@ document.addEventListener('click', (e) => {
         beginUserAction();
         setTimeout(async () => {
             try {
-                if (_inFlightPushPromise) {
-                    await _inFlightPushPromise;
+                if (_outboxFlushPromise) {
+                    await _outboxFlushPromise;
                 }
             } catch (err) {
                 // ignore
             } finally {
                 endUserAction();
             }
-            // The button's own change was already sent as a row update; now read
-            // this page back so it reflects what everyone else entered.
-            await pullCurrentPageData();
+            // The button's own change was already queued as a row update; make
+            // sure it went out, then read back what everyone else entered.
+            await flushAndPoll();
         }, 50);
     }
 }, true);
@@ -15920,16 +16293,23 @@ document.addEventListener('visibilitychange', () => {
                 el.blur();
             }
         }
+    } else if (document.visibilityState === 'visible') {
+        // Back on this tab: send what was queued meanwhile and catch up at once
+        // instead of waiting for the next tick.
+        syncTick();
     }
 });
 
-// Arriving on a page: ask the database for this page's data. A device that has
-// no local copy of the search file yet still needs the one-time full read to
-// learn the file list and the other pages.
+// Arriving on a page: send anything still queued and ask the database what the
+// other devices changed. A device that has no local copy of the search file
+// yet still needs the one-time full read to learn the file list and the other
+// pages.
 setTimeout(() => {
-    if (!getStorageItem(BUNDLE_STORAGE_KEY) || isHomePage()) {
+    if (!getSyncBucket() || !getUserCredentials()) return;
+    discardForeignLocalCopy();
+    if (!getStorageItem(BUNDLE_STORAGE_KEY) || !getStorageItem(BUNDLE_BUCKET_STORAGE_KEY) || isHomePage()) {
         syncWithServer();
     } else {
-        pullCurrentPageData();
+        flushAndPoll();
     }
 }, 1000);

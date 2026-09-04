@@ -113,15 +113,15 @@ check('top-level lists send one item, not the whole list', () => {
     assert.deepStrictEqual(changes[0].path, ['uploads', '1']);
 });
 
-check('adding a row reports the new length plus only the new row', () => {
+check('adding a row sends only the new row, as an append', () => {
     const before = baseBundle();
     const after = clone(before);
-    after.pages.page2.push(['R2', 'Seg C', '', '', '', '', '', '', '', '']);
+    const newRow = ['R2', 'Seg C', '', '', '', '', '', '', '', ''];
+    after.pages.page2.push(newRow);
 
     const changes = syncDelta.computeBundleChanges(before, after);
-    assert.strictEqual(changes.length, 2);
-    assert.deepStrictEqual(changes[0], {path: ['pages', 'page2'], length: 3});
-    assert.deepStrictEqual(changes[1].path, ['pages', 'page2', '2']);
+    assert.strictEqual(changes.length, 1);
+    assert.deepStrictEqual(changes[0], {path: ['pages', 'page2'], append: [newRow]});
 });
 
 console.log('\napplyBundleChanges - the server merges row by row');
@@ -286,6 +286,24 @@ check('saving a page pushes a row delta, not the whole search file', () => {
     );
 });
 
+check('a save queues its rows in the persistent outbox and tags the local copy', () => {
+    const save = appSource.match(/function saveBundle[\s\S]*?\r?\n\}\r?\n/);
+    assert.ok(save, 'saveBundle must exist');
+    assert.ok(/queueBundleChanges\(/.test(save[0]), 'saveBundle must queue the changed rows');
+    assert.ok(/tagLocalBundleBucket\(/.test(save[0]), 'saveBundle must tag the local copy with its CASE #');
+
+    const queue = appSource.match(/function writeOutboxRecord[\s\S]*?\r?\n\}\r?\n/);
+    assert.ok(queue, 'writeOutboxRecord must exist');
+    assert.ok(/SYNC_OUTBOX_STORAGE_KEY/.test(appSource.match(/function writeOutboxStore[\s\S]*?\r?\n\}\r?\n/)[0]));
+    assert.ok(/BUNDLE_BUCKET_STORAGE_KEY/.test(appSource.match(/function tagLocalBundleBucket[\s\S]*?\r?\n\}\r?\n/)[0]));
+});
+
+check('a whole-file upload never asks for keepalive (browsers cap those at 64 KiB)', () => {
+    const push = appSource.match(/async function pushBundleToServer[\s\S]*?\r?\n\}\r?\n/);
+    assert.ok(push, 'pushBundleToServer must exist');
+    assert.ok(!/keepalive/.test(push[0]), 'pushBundleToServer must not use keepalive');
+});
+
 check('leaving a page never uploads it', () => {
     const pagehide = appSource.match(/addEventListener\('pagehide'[\s\S]*?\n\}\);/);
     assert.ok(pagehide, 'pagehide handler must exist');
@@ -316,9 +334,15 @@ check('an edit is never dropped when the server has no row endpoint', () => {
     assert.ok(/pushBundleToServer\(bundle\)/.test(push[0]));
 });
 
-check('the website can ask for a single page of data', () => {
-    assert.ok(/async function pullCurrentPageData/.test(appSource));
-    assert.ok(/\/page\/\$\{encodeURIComponent\(pageName\)\}/.test(appSource));
+check('the website asks only for what changed since its last answer, never a blind page copy', () => {
+    assert.ok(/function pollServerState/.test(appSource), 'pollServerState must exist');
+    assert.ok(/\/state\?since=\$\{encodeURIComponent\(record\.cursor\)\}/.test(appSource), 'the poll must carry the cursor');
+    assert.ok(!/pullCurrentPageData/.test(appSource), 'a page is never replaced blindly with the server copy');
+
+    const apply = appSource.match(/function applyServerSections[\s\S]*?\r?\n\}\r?\n/);
+    assert.ok(apply, 'applyServerSections must exist');
+    assert.ok(/mergeServerSections\(/.test(apply[0]), 'server sections are overlaid on the local copy');
+    assert.ok(/rebasePendingChanges\(/.test(apply[0]), 'undelivered local rows are put back on top');
 });
 
 check('the server exposes row-change and single-page endpoints', () => {
