@@ -389,6 +389,30 @@ const initDatabaseSchema = () => {
                 PRIMARY KEY (username, search_case)
             ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
         });
+
+        // One row per activity-log entry, keyed by the entry's own id and tied
+        // to the login username and the CASE # (see the "Activity log entries"
+        // section below). Unlike the activity_log mirror above this table is
+        // never rebuilt: a row is written when the entry arrives and only ever
+        // updated in place afterwards.
+        db.run(`CREATE TABLE IF NOT EXISTS \`${ACTIVITY_ENTRIES_TABLE}\` (
+            username VARCHAR(191) NOT NULL,
+            search_case VARCHAR(191) NOT NULL,
+            entry_id VARCHAR(191) NOT NULL,
+            user_handle VARCHAR(255),
+            team VARCHAR(255),
+            tag VARCHAR(255),
+            members TEXT,
+            action TEXT,
+            log_date VARCHAR(32),
+            log_time VARCHAR(32),
+            logged_at BIGINT DEFAULT NULL,
+            data LONGTEXT,
+            updatedAt VARCHAR(64),
+            deletedAt VARCHAR(64) DEFAULT NULL,
+            PRIMARY KEY (username, search_case, entry_id),
+            KEY idx_activity_entries_case_time (username, search_case, logged_at)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     });
 };
 
@@ -412,6 +436,9 @@ const SINGLE_TABLES = [
 
 // Every structured table that can be read back by the website.
 const STRUCTURED_TABLES = [...COLLECTION_TABLES, ...SINGLE_TABLES];
+
+// Per-entry activity log store (one row per entry, keyed by entry id).
+const ACTIVITY_ENTRIES_TABLE = 'activity_log_entries';
 
 // Promise wrapper around the sqlite-compatible db.run helper.
 const runAsync = (sql, params = []) => new Promise((resolve, reject) => {
@@ -605,12 +632,171 @@ const applyChangesToTables = async (username, fallbackCase, bundle, changes) => 
     }
 };
 
+// ----------------------------------------------------------------------------
+// Activity log entries
+//
+// Besides the activity_log mirror above (rebuilt from the file like every other
+// table), every activity-log entry that reaches the server is kept as its own
+// row in activity_log_entries, keyed by the entry's id and tied to the login
+// username and the CASE #. The row is written the moment the entry arrives -
+// in a row batch (POST /rows) or a whole-file upload/import - and is only ever
+// updated in place afterwards, so the database keeps a complete record of what
+// was done in a case: an entry edited later is updated, an entry removed from
+// the file keeps its row with deletedAt set. GET /:bucket/activity reads them.
+// ----------------------------------------------------------------------------
+
+// The CASE # the structured rows of a bundle belong to: the file name inside
+// the bundle, else the clean CASE # behind the bucket id (never the raw
+// per-login bucket).
+const resolveSearchCase = (bundle, bucket, username) => {
+    if (bundle && typeof bundle.fileName === 'string' && bundle.fileName.trim()) {
+        return bundle.fileName.trim();
+    }
+    const fallback = bucket && bucket !== STORE_BUNDLE_KEY ? caseNumberFromBucket(bucket, username) : '';
+    return fallback || '';
+};
+
+// Every entry the website writes carries an id ('log-<ms>-<n>'). Entries from
+// older builds or other code paths may not; those get a stable id derived from
+// their content so a re-upload never duplicates them.
+const activityEntryId = (entry) => {
+    if (!entry || typeof entry !== 'object') { return ''; }
+    const own = entry.id === undefined || entry.id === null ? '' : String(entry.id).trim();
+    if (own) { return own.slice(0, 191); }
+    const text = JSON.stringify([entry.timestamp, entry.date, entry.time, entry.team, entry.action]);
+    return `log-${syncDelta.hashValue(text)}`;
+};
+
+// The tag is '<base|#task> - <handle>': the handle is the team member who was
+// using the app when the entry was written.
+const activityEntryHandle = (entry) => {
+    const tag = String((entry && entry.tag) || '');
+    const idx = tag.indexOf(' - ');
+    return idx === -1 ? '' : tag.slice(idx + 3).trim();
+};
+
+const toText = (value, max = 0) => {
+    if (value === undefined || value === null) { return null; }
+    const text = String(value);
+    return max > 0 ? text.slice(0, max) : text;
+};
+
+const activityEntryRow = (entry) => {
+    const loggedAt = Number(entry.timestamp);
+    return {
+        entry_id: activityEntryId(entry),
+        user_handle: toLabel(activityEntryHandle(entry)),
+        team: toLabel(entry.team),
+        tag: toLabel(entry.tag),
+        members: toText(entry.members),
+        action: toText(entry.action),
+        log_date: toText(entry.date, 32),
+        log_time: toText(entry.time, 32),
+        logged_at: Number.isFinite(loggedAt) ? Math.trunc(loggedAt) : null,
+        data: JSON.stringify(entry)
+    };
+};
+
+// Write (or rewrite) one row per entry. REPLACE keys on (username, search_case,
+// entry_id), so an entry that arrives twice - a retried batch, a whole-file
+// upload after a row batch - stays a single row; an entry that comes back
+// after being removed loses its deletedAt again.
+const upsertActivityEntries = async (username, searchCase, entries, nowIso) => {
+    if (!username || !searchCase) { return 0; }
+    let written = 0;
+    for (const entry of Array.isArray(entries) ? entries : []) {
+        if (!entry || typeof entry !== 'object' || Array.isArray(entry)) { continue; }
+        const row = activityEntryRow(entry);
+        if (!row.entry_id) { continue; }
+        await runAsync(
+            `REPLACE INTO \`${ACTIVITY_ENTRIES_TABLE}\` (username, search_case, entry_id, user_handle, team, tag, members, action, log_date, log_time, logged_at, data, updatedAt, deletedAt)
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL)`,
+            [username, searchCase, row.entry_id, row.user_handle, row.team, row.tag, row.members, row.action,
+                row.log_date, row.log_time, row.logged_at, row.data, nowIso]
+        );
+        written++;
+    }
+    return written;
+};
+
+// An entry removed from the file keeps its row; only deletedAt is stamped.
+const markActivityEntriesDeleted = async (username, searchCase, entries, nowIso) => {
+    if (!username || !searchCase) { return 0; }
+    let marked = 0;
+    for (const entry of Array.isArray(entries) ? entries : []) {
+        const entryId = activityEntryId(entry);
+        if (!entryId) { continue; }
+        await runAsync(
+            `UPDATE \`${ACTIVITY_ENTRIES_TABLE}\` SET deletedAt = ? WHERE username = ? AND search_case = ? AND entry_id = ? AND deletedAt IS NULL`,
+            [nowIso, username, searchCase, entryId]
+        );
+        marked++;
+    }
+    return marked;
+};
+
+// Which activity-log entries a batch of applied row changes added or edited
+// (upserts) and which it removed (deletions). Pure, so it can be unit tested.
+const collectActivityEntryChanges = (bundle, changes) => {
+    const upserts = [];
+    const deletions = [];
+    const list = bundle && Array.isArray(bundle.activityLog) ? bundle.activityLog : [];
+    const hasValue = (change) => Object.prototype.hasOwnProperty.call(change, 'value');
+    (Array.isArray(changes) ? changes : []).forEach((change) => {
+        const path = syncDelta.normalizePath(change && change.path);
+        if (!path.length || path[0] !== 'activityLog') { return; }
+        if (Array.isArray(change.prepend)) { upserts.push(...change.prepend); }
+        if (Array.isArray(change.append)) { upserts.push(...change.append); }
+        if (path.length === 1) {
+            // The whole list was replaced (legacy clients, a reconcile upload).
+            if (hasValue(change) && Array.isArray(change.value)) { upserts.push(...change.value); }
+            return;
+        }
+        if (path.length !== 2) { return; }
+        if (change.deleted === true) {
+            if (change.previous && typeof change.previous === 'object') { deletions.push(change.previous); }
+            return;
+        }
+        if (hasValue(change)) {
+            // The row as it now stands in the merged file (a cell-by-cell merge
+            // may differ from what the sender put in `value`).
+            const index = Number.isInteger(change.appliedIndex) ? change.appliedIndex : Number(path[1]);
+            const merged = list[index];
+            upserts.push(merged && typeof merged === 'object' ? merged : change.value);
+        }
+    });
+    return {upserts, deletions};
+};
+
+// Row batch: store exactly the entries the batch touched.
+const recordActivityEntryChanges = async (username, bucket, bundle, changes) => {
+    const searchCase = resolveSearchCase(bundle, bucket, username);
+    if (!username || !searchCase) { return {written: 0, marked: 0}; }
+    const {upserts, deletions} = collectActivityEntryChanges(bundle, changes);
+    if (!upserts.length && !deletions.length) { return {written: 0, marked: 0}; }
+    const nowIso = new Date().toISOString();
+    const written = await upsertActivityEntries(username, searchCase, upserts, nowIso);
+    const marked = await markActivityEntriesDeleted(username, searchCase, deletions, nowIso);
+    return {written, marked};
+};
+
+// Whole-file upload / import / seed: every entry in the file gets its row.
+const recordActivityEntriesFromBundle = async (username, bucket, bundle) => {
+    if (!bundle || typeof bundle !== 'object' || !Array.isArray(bundle.activityLog)) { return 0; }
+    const searchCase = resolveSearchCase(bundle, bucket, username);
+    if (!username || !searchCase) { return 0; }
+    return upsertActivityEntries(username, searchCase, bundle.activityLog, new Date().toISOString());
+};
+
 // Expose the pure transform for unit testing without starting the server.
 if (typeof module !== 'undefined' && module.exports) {
     module.exports.buildStructuredPlan = buildStructuredPlan;
     module.exports.COLLECTION_TABLES = COLLECTION_TABLES;
     module.exports.SINGLE_TABLES = SINGLE_TABLES;
     module.exports.STRUCTURED_TABLES = STRUCTURED_TABLES;
+    module.exports.ACTIVITY_ENTRIES_TABLE = ACTIVITY_ENTRIES_TABLE;
+    module.exports.activityEntryId = activityEntryId;
+    module.exports.collectActivityEntryChanges = collectActivityEntryChanges;
     // Exposed so an integration test can drive the endpoints over HTTP without
     // the server having to bind a fixed port on its own.
     module.exports.app = app;
@@ -1089,6 +1275,9 @@ app.post('/api/v1/:bucket/rows', authMiddleware, async (req, res) => {
 
             await writeStoredBundle(bucket, userName, userPin, bundle, nowIso);
             await applyChangesToTables(userName, bucket, bundle, applied);
+            // Every activity-log entry the batch carried gets its own row, tied
+            // to this login and the CASE #, before the batch is confirmed.
+            await recordActivityEntryChanges(userName, bucket, bundle, applied);
             rememberBatch(bucket, batchId);
 
             const state = syncDelta.pickBundleSections(bundle, {
@@ -1142,6 +1331,31 @@ app.get('/api/v1/:bucket/state', authMiddleware, async (req, res) => {
         console.error('[SYNC] state read failed:', err.message);
         res.status(500).json({error: 'Failed to read state'});
     }
+});
+
+// The activity-log entries stored for this login and CASE # (newest first),
+// straight from the per-entry table. ?includeDeleted=1 also lists entries that
+// were later removed from the search file (they carry a deletedAt stamp).
+app.get('/api/v1/:bucket/activity', authMiddleware, async (req, res) => {
+    const {bucket} = req.params;
+    const username = req.user.username;
+    const searchCase = String(req.query.case || req.query.searchCase || '').trim() || caseNumberFromBucket(bucket, username);
+    const includeDeleted = String(req.query.includeDeleted || '') === '1';
+    if (!searchCase) {
+        return res.status(400).json({error: 'A CASE # is required'});
+    }
+    const params = [username, searchCase];
+    let sql = `SELECT * FROM \`${ACTIVITY_ENTRIES_TABLE}\` WHERE username = ? AND search_case = ?`;
+    if (!includeDeleted) { sql += ' AND deletedAt IS NULL'; }
+    sql += ' ORDER BY logged_at DESC, entry_id DESC';
+    db.all(sql, params, (err, rows) => {
+        if (err) { return res.status(500).json({error: 'Failed to read activity log'}); }
+        res.json({
+            username,
+            searchCase,
+            entries: (rows || []).map((row) => ({...row, data: safeJsonParse(row.data)}))
+        });
+    });
 });
 
 // Read back a single page of the stored search file.
@@ -1286,9 +1500,10 @@ app.delete('/api/v1/:bucket', authMiddleware, async (req, res) => {
         // 2) The case-history row so it stops appearing in Saved Cases.
         await runAsync("DELETE FROM user_buckets WHERE username = ? AND bucket = ?", [userName, bucket]);
         // 3) Structured rows for the specific CASE # (never the shared 'bundle'
-        //    store key, which is common to every case).
+        //    store key, which is common to every case), including the per-entry
+        //    activity log rows.
         if (searchCase) {
-            for (const table of STRUCTURED_TABLES) {
+            for (const table of [...STRUCTURED_TABLES, ACTIVITY_ENTRIES_TABLE]) {
                 await runAsync(`DELETE FROM \`${table}\` WHERE username = ? AND search_case = ?`, [userName, searchCase]);
             }
         }
@@ -1375,12 +1590,14 @@ const putActiveBundle = async (req, res) => {
                 // The import is only reported as done once every table holds
                 // the imported rows for (username, CASE #).
                 await decomposeBundleToTables(userName, STORE_BUNDLE_KEY, bundle);
+                await recordActivityEntriesFromBundle(userName, bucket, bundle);
                 // A retried row batch from before the import must not be
                 // mistaken for one already applied to the new copy.
                 recentBatchIds.delete(bucket);
                 return {status: 200, body: {success: true, imported: true, lastModified: nowIso}};
             }
             decomposeBundleToTables(userName, STORE_BUNDLE_KEY, bundle)
+                .then(() => recordActivityEntriesFromBundle(userName, bucket, bundle))
                 .catch((decomposeErr) => console.error('[DB] decompose error:', decomposeErr.message));
 
             return {status: 200, body: {success: true, lastModified: nowIso}};
@@ -1460,6 +1677,7 @@ app.put('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
                     // Also split the saved bundle into the structured tables,
                     // tagged with the team username and CASE # (the store key).
                     decomposeBundleToTables(userName, key, req.body)
+                        .then(() => recordActivityEntriesFromBundle(userName, key, req.body))
                         .catch((decomposeErr) => console.error('[DB] decompose error:', decomposeErr.message));
                     res.json({success: true});
                 });

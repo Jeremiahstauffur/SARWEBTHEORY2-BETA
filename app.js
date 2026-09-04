@@ -3234,6 +3234,192 @@ function defaultRegionsData() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// IC Report
+//
+// Every CASE # carries exactly one IC Report: a free-text report written by
+// the Incident Commander plus a "form completed" checkbox. The name typed into
+// the small field next to the checkbox is tagged onto the completion (with the
+// date/time) the moment the checkbox is ticked; when nobody typed a name the
+// signed-in user is tagged instead. It is edited on the Search Log page, right
+// below the two charts, and printed in the Case # Printout in the same spot.
+// ---------------------------------------------------------------------------
+
+function defaultIcReport() {
+  return {
+    text: '',
+    completedName: '',
+    completed: false,
+    completedBy: '',
+    completedAt: ''
+  };
+}
+
+function sanitizeIcReport(raw) {
+  const report = defaultIcReport();
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return report;
+  const str = value => (value === undefined || value === null) ? '' : String(value);
+  report.text = str(raw.text);
+  report.completedName = str(raw.completedName).trim();
+  report.completed = raw.completed === true;
+  report.completedBy = str(raw.completedBy).trim();
+  report.completedAt = str(raw.completedAt).trim();
+  if (!report.completed) {
+    report.completedBy = '';
+    report.completedAt = '';
+  }
+  return report;
+}
+
+// The report of `bundle`, created in place when the file predates IC Reports.
+function ensureIcReport(bundle) {
+  const b = bundle || loadBundle();
+  b.icReport = sanitizeIcReport(b.icReport);
+  return b.icReport;
+}
+
+// "MM-DD-YYYY HH:mm" the way the Search Log and activity log stamp times.
+function formatIcReportStamp(date) {
+  const d = (date && typeof date.getTime === 'function' && !isNaN(date.getTime())) ? date : new Date();
+  const pad = n => String(n).padStart(2, '0');
+  return `${pad(d.getMonth() + 1)}-${pad(d.getDate())}-${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+function getIcReportSignerName(report) {
+  const typed = String(report?.completedName || '').trim();
+  if (typed) return typed;
+  const user = getCurrentUser();
+  return user ? getAccountName(user) : 'Unknown User';
+}
+
+// Ticks the checkbox: whoever is named in the small text field (else the
+// signed-in user) is tagged with the completion date/time. Returns the report.
+function markIcReportCompleted(bundle, now = new Date()) {
+  const report = ensureIcReport(bundle);
+  report.completed = true;
+  report.completedBy = getIcReportSignerName(report);
+  report.completedAt = formatIcReportStamp(now);
+  return report;
+}
+
+// Unticks the checkbox; the typed name stays so it can be re-signed quickly.
+function reopenIcReport(bundle) {
+  const report = ensureIcReport(bundle);
+  report.completed = false;
+  report.completedBy = '';
+  report.completedAt = '';
+  return report;
+}
+
+function getIcReportCompletionLabel(report) {
+  const r = sanitizeIcReport(report);
+  if (!r.completed) return 'Mark IC Report as Completed';
+  const by = r.completedBy || 'Unknown User';
+  return r.completedAt ? `Completed by ${by} at ${r.completedAt}` : `Completed by ${by}`;
+}
+
+// The CASE # shown under the "IC Report" title (the file name without .json).
+function getIcReportCaseLabel(bundle) {
+  const name = String((bundle && bundle.fileName) || DEFAULT_FILE_NAME).replace(/\.json$/i, '');
+  return name;
+}
+
+function escapeIcReportHtml(value) {
+  return String(value === undefined || value === null ? '' : value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+// Static markup of the report for the Case # Printout.
+function getIcReportPrintHTML(bundle) {
+  const report = sanitizeIcReport(bundle && bundle.icReport);
+  const caseLabel = escapeIcReportHtml(getIcReportCaseLabel(bundle));
+  const text = report.text.trim()
+    ? escapeIcReportHtml(report.text)
+    : '<span class="ic-report-empty">No IC report has been written for this case.</span>';
+  const completion = report.completed
+    ? `<span class="ic-report-check">&#9745;</span> ${escapeIcReportHtml(getIcReportCompletionLabel(report))}`
+    : '<span class="ic-report-check">&#9744;</span> Form not yet completed';
+  return `
+            <div class="ic-report">
+                <h2 class="ic-report-title">IC Report</h2>
+                <div class="ic-report-case">Case # ${caseLabel}</div>
+                <div class="ic-report-text">${text}</div>
+                <div class="ic-report-completion">${completion}</div>
+            </div>`;
+}
+
+// The editable form on the Search Log page (page4.html, between the charts
+// and the Search Log table). Re-run on every table rebuild, including the
+// ones triggered by another device's edits, so a field the user is typing in
+// right now is left alone.
+function renderIcReportForm() {
+  const panel = document.getElementById('ic-report-panel');
+  if (!panel) return;
+  const caseEl = document.getElementById('ic-report-case');
+  const textArea = document.getElementById('ic-report-text');
+  const check = document.getElementById('ic-report-completed');
+  const nameInput = document.getElementById('ic-report-name');
+  const statusEl = document.getElementById('ic-report-status');
+  if (!textArea || !check || !nameInput) return;
+
+  const bundle = loadBundle();
+  const report = ensureIcReport(bundle);
+  const active = document.activeElement;
+
+  if (caseEl) caseEl.textContent = `Case # ${getIcReportCaseLabel(bundle)}`;
+  if (active !== textArea && textArea.value !== report.text) textArea.value = report.text;
+  if (active !== nameInput && nameInput.value !== report.completedName) nameInput.value = report.completedName;
+  check.checked = report.completed;
+  nameInput.readOnly = report.completed;
+  if (report.completed) {
+    if (nameInput.value !== report.completedBy) nameInput.value = report.completedBy;
+    panel.classList.add('is-completed');
+  } else {
+    panel.classList.remove('is-completed');
+  }
+  if (statusEl) {
+    statusEl.textContent = getIcReportCompletionLabel(report);
+    statusEl.classList.toggle('is-completed', report.completed);
+  }
+
+  textArea.oninput = () => {
+    const b = loadBundle();
+    ensureIcReport(b).text = textArea.value;
+    saveBundle(b);
+  };
+
+  nameInput.oninput = () => {
+    const b = loadBundle();
+    const r = ensureIcReport(b);
+    if (r.completed) return;
+    r.completedName = nameInput.value.trim();
+    saveBundle(b);
+  };
+
+  check.onchange = () => {
+    const b = loadBundle();
+    const r = ensureIcReport(b);
+    const user = getCurrentUser();
+    const userName = user ? getAccountName(user) : 'Unknown User';
+    if (check.checked) {
+      r.completedName = nameInput.value.trim();
+      const signed = markIcReportCompleted(b);
+      saveBundle(b);
+      addActivityLogEntry('System', `IC Report for Case # ${getIcReportCaseLabel(b)} marked as completed by ${signed.completedBy}${signed.completedBy !== userName ? ` (entered by ${userName})` : ''}`);
+    } else {
+      const previouslyBy = r.completedBy;
+      reopenIcReport(b);
+      saveBundle(b);
+      addActivityLogEntry('System', `IC Report for Case # ${getIcReportCaseLabel(b)} reopened (marked not completed) by ${userName}${previouslyBy ? ` - was completed by ${previouslyBy}` : ''}`);
+    }
+    renderIcReportForm();
+  };
+}
+
 function defaultBundle() {
   return {
     fileName: DEFAULT_FILE_NAME,
@@ -3272,6 +3458,8 @@ function defaultBundle() {
     // automatically. Missing = on.
     mapFeatureTypeFilters: {marker: true, shape: true, assignment: true, route: true, other: true},
     permanentPersonnel: {},
+    // The one IC Report of this CASE # (Search Log page, below the charts).
+    icReport: defaultIcReport(),
     accounts: [
       { username: 'Super Admin', pin: '1976', color: 'none', handle: 'Super-Admin', isFileManager: true, theme: 'dark', visiblePages: ['index', 'page2', 'page3', 'page4', 'page5', 'page6', 'page7', 'settings', 'home', 'page8', 'page9', 'page10'] }
     ],
@@ -3461,6 +3649,7 @@ function sanitizeBundle(bundle) {
   const unwantedMapFeatures = getUnwantedMapFeatures(bundle);
   const mapUnaccountedAutoCheck = bundle.mapUnaccountedAutoCheck !== false;
   const mapFeatureTypeFilters = getMapFeatureTypeFilters(bundle);
+  const icReport = sanitizeIcReport(bundle.icReport);
 
   let accounts = Array.isArray(bundle.accounts) ? bundle.accounts : fallback.accounts;
 
@@ -3585,6 +3774,7 @@ function sanitizeBundle(bundle) {
     mapUnaccountedAutoCheck,
     mapFeatureTypeFilters,
     permanentPersonnel,
+    icReport,
     accounts: syncedAccounts 
   };
 }
@@ -3593,10 +3783,95 @@ function loadBundle() {
   try {
     const raw = getStorageItem(BUNDLE_STORAGE_KEY);
     if (!raw) return defaultBundle();
-    return sanitizeBundle(JSON.parse(raw));
+    const bundle = sanitizeBundle(JSON.parse(raw));
+    rememberActivityLogVersion(bundle);
+    return bundle;
   } catch {
     return defaultBundle();
   }
+}
+
+// ----------------------------------------------------------------------------
+// Activity log entries must never be lost by a stale save.
+//
+// Many handlers load the search file, change it and save it a moment later.
+// If something else is saved in between - addActivityLogEntry() writing an
+// entry on its own, another handler, a server poll bringing another device's
+// entries - the handler's copy no longer has those entries, and saving it
+// would erase them again: locally, and (as a "deleted" row) on the server, so
+// they never reached the database. promoteToTeamLead() did exactly that with
+// its own "reassigned" entry.
+//
+// loadBundle() therefore remembers, per stored version (lastModified), which
+// entry ids that version held. When a save comes from an older version than
+// the one in storage, every entry the stored copy has that the saved copy
+// lacks is put back - unless the caller's version already had it, in which
+// case the caller removed it on purpose (deleting a task, a timecard, ...).
+// ----------------------------------------------------------------------------
+// version (lastModified) -> Set of entry keys. Created on first use so that
+// loadBundle() may run before this part of the file has been evaluated.
+function getActivityLogVersionRegistry() {
+  if (!getActivityLogVersionRegistry.map) getActivityLogVersionRegistry.map = new Map();
+  return getActivityLogVersionRegistry.map;
+}
+
+function activityLogEntryKey(entry) {
+  if (!entry || typeof entry !== 'object') return '';
+  if (entry.id !== undefined && entry.id !== null && String(entry.id).trim()) return String(entry.id).trim();
+  return `${entry.timestamp || ''}|${entry.date || ''}|${entry.time || ''}|${entry.team || ''}|${entry.action || ''}`;
+}
+
+function rememberActivityLogVersion(bundle) {
+  const version = bundle && typeof bundle.lastModified === 'string' ? bundle.lastModified : '';
+  const registry = getActivityLogVersionRegistry();
+  if (!version || registry.has(version)) return;
+  registry.set(version, new Set((bundle.activityLog || []).map(activityLogEntryKey).filter(Boolean)));
+  // Only the most recent versions matter: a handler saves within moments of loading.
+  while (registry.size > 16) {
+    registry.delete(registry.keys().next().value);
+  }
+}
+
+// The version stamp (lastModified) for the copy about to be stored: now, but
+// always later than the copy it replaces, so two saves never share a stamp and
+// a handler can always tell whether the stored copy moved on since it loaded.
+function nextLocalVersionStamp(previous) {
+  const stamp = new Date().toISOString();
+  const previousStamp = previous && typeof previous.lastModified === 'string' ? previous.lastModified : '';
+  if (!previousStamp || stamp > previousStamp) return stamp;
+  const previousMs = new Date(previousStamp).getTime();
+  return Number.isFinite(previousMs) ? new Date(previousMs + 1).toISOString() : stamp;
+}
+
+// What saveBundle does to a copy before storing it: put back the activity-log
+// entries that were logged since the copy was loaded (see above), then give it
+// the next version stamp. `previous` is the copy in storage right now.
+function stampBundleForSave(bundle, previous) {
+  restoreActivityLogEntriesAddedMeanwhile(bundle, previous, bundle.lastModified);
+  bundle.lastModified = nextLocalVersionStamp(previous);
+}
+
+// Puts the entries that were added to the stored copy after `bundle` was loaded
+// back into `bundle` (see above). `loadedVersion` is the lastModified `bundle`
+// carried when it was loaded, `stored` the copy in storage right now. Returns
+// how many entries were restored.
+function restoreActivityLogEntriesAddedMeanwhile(bundle, stored, loadedVersion) {
+  if (!bundle || !stored || !Array.isArray(stored.activityLog) || !stored.activityLog.length) return 0;
+  if (typeof loadedVersion !== 'string' || !loadedVersion || stored.lastModified === loadedVersion) return 0;
+  const base = getActivityLogVersionRegistry().get(loadedVersion);
+  if (!base) return 0;
+  if (!Array.isArray(bundle.activityLog)) bundle.activityLog = [];
+  const present = new Set(bundle.activityLog.map(activityLogEntryKey));
+  let restored = 0;
+  stored.activityLog.forEach((entry, index) => {
+    const key = activityLogEntryKey(entry);
+    if (!key || present.has(key) || base.has(key)) return;
+    // Keep the entry where the stored copy had it (the log is newest-first).
+    bundle.activityLog.splice(Math.min(index, bundle.activityLog.length), 0, JSON.parse(JSON.stringify(entry)));
+    present.add(key);
+    restored++;
+  });
+  return restored;
 }
 
 // ----------------------------------------------------------------------------
@@ -3831,9 +4106,9 @@ function didSearchActivityChange(previous, next) {
 // description gets the task's summary. That refresh is debounced and silent,
 // and a no-op unless the assignment overlay is enabled.
 function saveBundle(bundle, deferFlush = false) {
-  bundle.lastModified = new Date().toISOString();
-  const sanitized = sanitizeBundle(bundle);
   const previous = getStorageItem(BUNDLE_STORAGE_KEY) ? loadBundle() : null;
+  stampBundleForSave(bundle, previous);
+  const sanitized = sanitizeBundle(bundle);
   queueBundleChanges(previous, sanitized);
   setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
   tagLocalBundleBucket();
@@ -9407,6 +9682,7 @@ function buildSearchLogTable() {
   }
   
   initCharts();
+  renderIcReportForm();
 }
 
 function getLocalISOString(date) {
@@ -13332,6 +13608,7 @@ function printSearchFile() {
         .sort((a, b) => parseInt(a) - parseInt(b))
         .map(num => `<div class="print-section">${getTaskFormPrintHTML(num, forms[num])}</div>`)
         .join('');
+    const icReportHTML = getIcReportPrintHTML(bundle);
 
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
@@ -13366,6 +13643,14 @@ function printSearchFile() {
         .chart-item { flex: 1; display: flex; flex-direction: column; border: 1px solid #ddd; padding: 10px; border-radius: 8px; }
         .chart-label { font-size: 9pt; font-weight: bold; margin-bottom: 5px; color: #555; text-align: center; }
         .chart-svg-wrap { flex: 1; min-height: 140px; }
+
+        .ic-report { border: 2px solid #000; padding: 12px 15px; margin-bottom: 20px; page-break-inside: avoid; }
+        .ic-report-title { font-size: 16pt; border-bottom: 2px solid #000; margin: 0 0 4px 0; padding-bottom: 3px; }
+        .ic-report-case { font-size: 11pt; font-weight: bold; color: #444; margin-bottom: 10px; }
+        .ic-report-text { min-height: 1.5in; border: 1px solid #999; padding: 8px; font-size: 11pt; white-space: pre-wrap; word-wrap: break-word; margin-bottom: 10px; }
+        .ic-report-empty { font-style: italic; color: #888; }
+        .ic-report-completion { font-size: 10pt; font-weight: bold; display: flex; align-items: center; gap: 6px; }
+        .ic-report-check { font-size: 14pt; line-height: 1; }
 
         .task-form { border: 2px solid #000; padding: 15px; margin-bottom: 20px; position: relative; }
         .form-header { display: flex; justify-content: space-between; border-bottom: 2px solid #000; margin-bottom: 15px; padding-bottom: 5px; }
@@ -13411,6 +13696,9 @@ function printSearchFile() {
                     <div id="pos-chart" class="chart-svg-wrap"></div>
                 </div>
             </div>
+
+            <!-- IC Report (one per CASE #) -->
+            ${icReportHTML}
 
             <table class="search-log-table">
                 <thead>
@@ -18214,6 +18502,15 @@ function applyServerSections(sections, lastModified, {advanceCursor = false} = {
     const merged = utils.mergeServerSections(local, sections);
     const sanitized = sanitizeBundle(rebasePendingChanges(merged, record.changes));
     const changed = !utils.deepEqual(withoutLastModified(sanitized), withoutLastModified(local));
+
+    // The stored copy now holds the server's version of these sections, so it
+    // carries the server's version stamp: a handler that loaded the copy before
+    // this arrived can tell it moved on (restoreActivityLogEntriesAddedMeanwhile).
+    if (changed) {
+        sanitized.lastModified = (typeof lastModified === 'string' && lastModified && lastModified !== local.lastModified)
+            ? lastModified
+            : nextLocalVersionStamp(local);
+    }
 
     if (changed || !hadCopy) {
         setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));

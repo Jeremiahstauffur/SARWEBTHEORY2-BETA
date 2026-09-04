@@ -77,6 +77,22 @@ const query = (rawSql, params, cb) => {
         return cb(null, {affectedRows: 1});
     }
 
+    // ---- per-entry activity log (activity_log_entries) ----
+    if (/^REPLACE INTO `activity_log_entries` \(username, search_case, entry_id,/.test(sql)) {
+        const rows = tableRows('activity_log_entries');
+        const kept = rows.filter(r => !(r.username === p[0] && r.search_case === p[1] && r.entry_id === p[2]));
+        kept.push({username: p[0], search_case: p[1], entry_id: p[2], user_handle: p[3], team: p[4], tag: p[5],
+            members: p[6], action: p[7], log_date: p[8], log_time: p[9], logged_at: p[10], data: p[11], updatedAt: p[12], deletedAt: null});
+        tables.set('activity_log_entries', kept);
+        return cb(null, {affectedRows: 1});
+    }
+    if (/^UPDATE `activity_log_entries` SET deletedAt = \? WHERE username = \? AND search_case = \? AND entry_id = \? AND deletedAt IS NULL$/.test(sql)) {
+        tableRows('activity_log_entries').forEach(r => {
+            if (r.username === p[1] && r.search_case === p[2] && r.entry_id === p[3] && r.deletedAt === null) r.deletedAt = p[0];
+        });
+        return cb(null, {affectedRows: 1});
+    }
+
     return cb(new Error(`unhandled SQL in test stand-in: ${sql}`));
 };
 

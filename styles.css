@@ -2062,6 +2062,85 @@ tr.log-sweeps-due::after {
     height: 180px;
 }
 
+/* IC Report (Search Log page, between the charts and the Search Log table) */
+.ic-report-panel .ic-report-heading {
+  margin: 0 0 2px;
+  font-size: 1.25rem;
+}
+
+.ic-report-subtitle {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--muted);
+  margin-bottom: 12px;
+}
+
+.ic-report-label {
+  display: block;
+  font-size: 0.75rem;
+  font-weight: 800;
+  color: var(--muted);
+  text-transform: uppercase;
+  margin: 0 0 6px 2px;
+}
+
+.ic-report-textarea {
+  min-height: 220px;
+  resize: vertical;
+  line-height: 1.5;
+  box-sizing: border-box;
+}
+
+.ic-report-completion-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin-top: 12px;
+  padding: 10px 16px;
+  border-radius: 12px;
+  border: 1px solid var(--line);
+  background: rgba(var(--accent-rgb), 0.06);
+  width: fit-content;
+  max-width: 100%;
+}
+
+.ic-report-panel.is-completed .ic-report-completion-row {
+  border-color: var(--accent);
+  background: rgba(var(--accent-rgb), 0.12);
+}
+
+.ic-report-completion-row .pill-checkbox {
+  flex: 0 0 auto;
+}
+
+.ic-report-name {
+  width: 220px;
+  max-width: 100%;
+  min-height: 0;
+  padding: 6px 10px;
+  font-size: 0.9rem;
+}
+
+.ic-report-status {
+  font-size: 0.9rem;
+  font-weight: 700;
+  color: var(--muted);
+}
+
+.ic-report-status.is-completed {
+  color: var(--accent);
+}
+
+@media (max-width: 768px) {
+  .ic-report-completion-row {
+    width: 100%;
+  }
+  .ic-report-name {
+    width: 100%;
+  }
+}
+
 /* Responsive Improvements */
 @media (max-width: 1024px) {
   .hero-columns {
