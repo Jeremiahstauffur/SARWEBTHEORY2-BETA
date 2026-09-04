@@ -5463,6 +5463,45 @@ function getTeamMembers(teamName) {
   return data.filter(row => row[1] === teamName);
 }
 
+// Reads the GPS / Radio / Medic toggles of a personnel roster row (page3,
+// columns 3/4/5) so the Task Assignment form can pre-fill them.
+function getPersonnelRoleFlags(row) {
+  return {
+    gps: !!row && row[3] === 'true',
+    radio: !!row && row[4] === 'true',
+    medic: !!row && row[5] === 'true'
+  };
+}
+
+function buildTaskFormMemberFromRoster(row) {
+  return {
+    name: row[0],
+    leader: row[2] === row[0],
+    ...getPersonnelRoleFlags(row),
+    rolesLoaded: true
+  };
+}
+
+// Task forms created before the roster toggles were carried over have every
+// role unchecked. Seed those members once from the roster; members that were
+// already seeded keep whatever the user set on the form.
+function syncTaskFormMemberRolesFromRoster(members, roster) {
+  if (!Array.isArray(members)) return false;
+  let changed = false;
+  members.forEach(m => {
+    if (!m || !m.name || m.rolesLoaded) return;
+    const row = (roster || []).find(r => r && r[0] === m.name);
+    if (!row) return;
+    const flags = getPersonnelRoleFlags(row);
+    if (!m.gps && flags.gps) { m.gps = true; changed = true; }
+    if (!m.radio && flags.radio) { m.radio = true; changed = true; }
+    if (!m.medic && flags.medic) { m.medic = true; changed = true; }
+    m.rolesLoaded = true;
+    changed = true;
+  });
+  return changed;
+}
+
 function isParCheckDue(teamName, bundle) {
   const baseTeamNames = ['Base Support', 'Off Duty', 'Command'];
   if (baseTeamNames.includes(teamName)) return false;
@@ -10941,13 +10980,7 @@ function buildTaskAssignmentForm() {
        teamName = match ? match[1] : teamNameWithCount;
     }
 
-    const members = getTeamMembers(teamName).map(m => ({
-      name: m[0],
-      leader: m[2] === m[0],
-      gps: false,
-      radio: false,
-      medic: false
-    }));
+    const members = getTeamMembers(teamName).map(buildTaskFormMemberFromRoster);
     
     bundle.forms[currentTaskNumber] = {
       incidentNumber: '',
@@ -11008,6 +11041,10 @@ function renderTaskForm(container, taskNum, formData) {
   if (!formData.lostPersonDescription && profile.lostPersonDescription) { formData.lostPersonDescription = profile.lostPersonDescription; changed = true; }
   if (!formData.lostPersonClothing && profile.lostPersonClothing) { formData.lostPersonClothing = profile.lostPersonClothing; changed = true; }
   if (!formData.lostPersonPhysical && profile.lostPersonPhysical) { formData.lostPersonPhysical = profile.lostPersonPhysical; changed = true; }
+
+  // 1b. Carry the personnel GPS / Radio / Medic toggles onto members that
+  // have not been seeded from the roster yet.
+  if (syncTaskFormMemberRolesFromRoster(formData.teamMembers, bundle.pages?.page3)) { changed = true; }
 
   // 2. Auto-fill Timestamps from logs
   if (!formData.overrides) formData.overrides = {};
@@ -11546,13 +11583,7 @@ function renderTaskForm(container, taskNum, formData) {
        mBtn.className = 'mini-pill';
        mBtn.textContent = m[0];
        mBtn.onclick = () => {
-         formData.teamMembers.push({
-           name: m[0],
-           leader: m[0] === m[2],
-           gps: m[3] === 'true',
-           radio: m[4] === 'true',
-           medic: m[5] === 'true'
-         });
+         formData.teamMembers.push(buildTaskFormMemberFromRoster(m));
          save();
          popup.remove();
          renderTaskForm(container, taskNum, formData);
