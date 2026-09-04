@@ -192,11 +192,14 @@ function formatSegmentAssignmentLabel(region, segment) {
 function buildActiveSearchSegmentNameSet(bundle, rows) {
     const utils = getMapSegmentUtils();
     if (typeof utils.buildActiveSearchSegmentNameSet === 'function') {
-        return utils.buildActiveSearchSegmentNameSet(
+        const utilNames = utils.buildActiveSearchSegmentNameSet(
             rows || ensureSegmentsPageRows(bundle),
             bundle?.currentAssignments || {},
             bundle?.teamStatuses || {}
         );
+        // Custom (manually entered) searches have no team status; they stay
+        // "active" until their Task Assignment form is marked completed.
+        return addCustomSearchActiveSegmentNames(bundle, utilNames);
     }
 
     const names = new Set();
@@ -213,7 +216,7 @@ function buildActiveSearchSegmentNameSet(bundle, rows) {
         names.add(normalizeSegmentNameForMatch(row?.[1]));
         names.add(normalizeSegmentNameForMatch(fullName));
     });
-    return names;
+    return addCustomSearchActiveSegmentNames(bundle, names);
 }
 
 function isFeatureActivelyBeingSearched(feature, activeSearchNames) {
@@ -4592,6 +4595,15 @@ function buildSegmentsTable() {
                   
                   navigateToPage('page4.html?scroll=latest');
                 });
+              }, {
+                // "Custom" team: no roster team, no status workflow - the search
+                // log row is filled in from the task assignment form instead.
+                onCustom: () => {
+                  const region = sortedData[r][0] || '';
+                  const segment = sortedData[r][1] || '';
+                  const taskNumber = createCustomSearchTask(region, segment);
+                  navigateToPage(`page5.html?task=${taskNumber}`);
+                }
               });
             };
           }
@@ -5588,6 +5600,157 @@ function addAutoSearchLogEntry(teamName, region, segment) {
   return taskNumber;
 }
 
+// ---------------------------------------------------------------------------
+// Custom (manually entered) searches
+//
+// A custom search is started from the Segments page like any other search, but
+// instead of picking a roster team the user picks "Custom". No team status,
+// par-check timer or activity-log workflow is driven for it; everything the
+// Search Log needs (personnel count, timestamps, par checks) is typed straight
+// into the task's Task Assignment form. The task counts as "still out" until
+// that form is marked completed, which is also when its sweep count is asked
+// for and when the map stops drawing the segment in the active-search style.
+// ---------------------------------------------------------------------------
+const CUSTOM_SEARCH_DEFAULT_TEAM_NAME = 'Custom';
+
+function isCustomSearchTaskForm(form) {
+  return !!(form && form.customSearch === true);
+}
+
+function getCustomSearchTaskForm(bundle, taskNum) {
+  const num = String(taskNum || '').replace('#', '');
+  const form = bundle?.forms?.[num];
+  return isCustomSearchTaskForm(form) ? form : null;
+}
+
+// A custom task is in progress until its Task Assignment form is marked finished.
+function isCustomSearchTaskInProgress(bundle, taskNum) {
+  const form = getCustomSearchTaskForm(bundle, taskNum);
+  return !!form && !form.completed;
+}
+
+function countCustomSearchTaskPersonnel(form) {
+  return (form?.teamMembers || []).filter(m => m && String(m.name || '').trim()).length;
+}
+
+function getCustomSearchTaskTeamName(form) {
+  const name = String(form?.teamName || '').trim();
+  return name || CUSTOM_SEARCH_DEFAULT_TEAM_NAME;
+}
+
+// The Search Log "Team" cell ("Name (N)") of a custom task is derived from the
+// form: the personnel count is the number of members typed into it.
+function buildCustomSearchTeamCell(form) {
+  return `${getCustomSearchTaskTeamName(form)} (${countCustomSearchTaskPersonnel(form)})`;
+}
+
+function syncCustomSearchTaskLogRow(bundle, taskNum) {
+  const form = getCustomSearchTaskForm(bundle, taskNum);
+  if (!form) return false;
+  const tag = '#' + String(taskNum).replace('#', '');
+  const row = (bundle.pages?.page4 || []).find(r => r && r[0] === tag);
+  if (!row) return false;
+  const cell = buildCustomSearchTeamCell(form);
+  if (row[7] === cell) return false;
+  row[7] = cell;
+  return true;
+}
+
+// Search-log task tags ("#N") of custom searches whose form is not finished yet.
+function getCustomSearchTasksInProgress(bundle) {
+  const forms = bundle?.forms || {};
+  return Object.keys(forms)
+    .filter(num => isCustomSearchTaskForm(forms[num]) && !forms[num].completed)
+    .map(num => '#' + num);
+}
+
+// Adds the segments of in-progress custom searches to a set of normalized
+// segment names so the map draws them in the active-search style.
+function addCustomSearchActiveSegmentNames(bundle, names) {
+  const target = names instanceof Set ? names : new Set();
+  const inProgress = new Set(getCustomSearchTasksInProgress(bundle));
+  if (inProgress.size === 0) return target;
+  (bundle?.pages?.page4 || []).forEach(row => {
+    if (!row || !inProgress.has(row[0])) return;
+    const fullName = formatSegmentAssignmentLabel(row[3], row[4]);
+    if (!fullName) return;
+    target.add(normalizeSegmentNameForMatch(row[4]));
+    target.add(normalizeSegmentNameForMatch(fullName));
+  });
+  return target;
+}
+
+function buildCustomSearchTaskForm(region, segment, dateStamp) {
+  return {
+    customSearch: true,
+    incidentNumber: '',
+    opPeriod: '1',
+    dateTime: dateStamp,
+    lostPersonName: '',
+    lostPersonAge: '',
+    lostPersonGender: '',
+    lostPersonDescription: '',
+    lostPersonClothing: '',
+    lostPersonPhysical: '',
+    onSceneFamily: false,
+    onSceneMedia: false,
+    briefedBy: '',
+    radioNumber: '',
+    gpsNumber: '',
+    leaveBase: '',
+    beginSearch: '',
+    completeSearch: '',
+    returnBase: '',
+    teamType: '',
+    teamTypes: { hasty: false, grid: false, area: false, k9: false, atv: false, argo: false, drone: false, boat: false, other: false },
+    otherTeamType: '',
+    instructions: '',
+    segment: formatSegmentAssignmentLabel(region, segment),
+    teamName: CUSTOM_SEARCH_DEFAULT_TEAM_NAME,
+    teamMembers: [],
+    manualParChecks: [],
+    parChecksRaw: [],
+    statusUpdates: Array.from({length: 8}, () => ({time: '', clue: '', usng: ''}))
+  };
+}
+
+// Creates the Search Log row plus the Task Assignment form for a custom search
+// of `region - segment` and returns the new task number.
+function createCustomSearchTask(region, segment) {
+  const bundle = loadBundle();
+  const logData = bundle.pages.page4 || [];
+  const now = new Date();
+  const dateStr = `${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}-${now.getFullYear()}`;
+  const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+
+  const psrBefore = getLatestPSR(region, segment);
+  const segInfo = getSegmentInfo(region, segment);
+  const taskNumber = getNextTaskNumber();
+
+  const form = buildCustomSearchTaskForm(region, segment, `${dateStr} ${timeStr}`);
+  const newRow = [
+    `#${taskNumber}`,
+    dateStr,
+    timeStr,
+    region,
+    segment,
+    psrBefore,
+    '', // PSR After
+    buildCustomSearchTeamCell(form),
+    segInfo.sweep,
+    '' // Num of Sweeps
+  ];
+
+  logData.push(newRow);
+  bundle.pages.page4 = logData;
+  if (!bundle.forms) bundle.forms = {};
+  bundle.forms[taskNumber] = form;
+  logCreation('Search Log Entry', '#' + taskNumber, bundle);
+  addActivityLogEntry('System', `Custom search started on #${taskNumber} ${formatSegmentAssignmentLabel(region, segment)} (manual entry)`, bundle);
+  saveBundle(bundle);
+  return taskNumber;
+}
+
 function reassignMember(memberName, targetTeam) {
   const bundle = loadBundle();
   const data = bundle.pages.page3 || [];
@@ -6263,7 +6426,7 @@ function showNewSegmentPopup(teamName, parentPopup) {
   }
 }
 
-function showTeamSelectionPopup(onTeamSelected) {
+function showTeamSelectionPopup(onTeamSelected, options = {}) {
   const bundle = loadBundle();
   const data = bundle.pages.page3 || [];
   const teamsMap = new Map();
@@ -6282,10 +6445,40 @@ function showTeamSelectionPopup(onTeamSelected) {
   const segmentsGrid = document.createElement('div');
   segmentsGrid.className = 'popup-segments-grid';
   
-  if (sortedTeams.length === 0) {
+  if (sortedTeams.length === 0 && typeof options.onCustom !== 'function') {
     const p = document.createElement('p');
     p.textContent = 'No teams currently available.';
     segmentsGrid.appendChild(p);
+  }
+
+  if (typeof options.onCustom === 'function') {
+    const customBtn = document.createElement('button');
+    customBtn.className = 'mini-pill';
+    customBtn.style.width = '100%';
+    customBtn.style.padding = '12px';
+    customBtn.style.display = 'flex';
+    customBtn.style.flexDirection = 'column';
+    customBtn.style.alignItems = 'center';
+    customBtn.style.gap = '4px';
+    customBtn.style.background = 'rgba(255, 140, 0, 0.15)';
+    customBtn.style.borderColor = 'rgba(255, 140, 0, 0.5)';
+
+    const nameDiv = document.createElement('div');
+    nameDiv.style.fontWeight = 'bold';
+    nameDiv.textContent = 'Custom';
+    customBtn.appendChild(nameDiv);
+
+    const pill = document.createElement('div');
+    pill.style.fontSize = '0.75rem';
+    pill.style.color = '#ff8c00';
+    pill.textContent = 'Enter search data manually';
+    customBtn.appendChild(pill);
+
+    customBtn.onclick = () => {
+      closePopup(popup);
+      options.onCustom();
+    };
+    segmentsGrid.appendChild(customBtn);
   }
 
   sortedTeams.forEach(team => {
@@ -7937,6 +8130,12 @@ function recountTeamMembersForSearchLog() {
   logData.forEach(entry => {
     const taskNum = entry[0];
     const teamCell = entry[7] || '';
+
+    // Custom searches take their personnel count from the task form.
+    if (getCustomSearchTaskForm(bundle, taskNum)) {
+      if (syncCustomSearchTaskLogRow(bundle, taskNum)) changed = true;
+      return;
+    }
     
     let teamName = teamCell;
     const match = teamCell.match(/^(.*)\s\(\d+\)$/);
@@ -8042,6 +8241,7 @@ function buildSearchLogTable() {
       }
     }
   }
+  getCustomSearchTasksInProgress(bundle).forEach(tag => unfinishedTasks.add(tag));
 
   // Recalculate PSR After for all entries (now handled by recalculateEverything above)
   saveCurrentPageData(data);
@@ -11020,6 +11220,10 @@ function renderTaskForm(container, taskNum, formData) {
   const bundle = loadBundle();
   const profile = bundle.profile || {};
   const taskTag = '#' + taskNum;
+  // Custom (manual entry) searches have no team workflow behind them: the
+  // timestamps and par checks are typed in here instead of read from the
+  // activity log, and the Search Log personnel count follows the form.
+  const isCustom = isCustomSearchTaskForm(formData);
 
   container.innerHTML = '';
   
@@ -11029,6 +11233,7 @@ function renderTaskForm(container, taskNum, formData) {
   const save = () => {
     const b = loadBundle();
     b.forms[taskNum] = formData;
+    if (isCustom) syncCustomSearchTaskLogRow(b, taskNum);
     saveBundle(b);
   };
 
@@ -11050,6 +11255,7 @@ function renderTaskForm(container, taskNum, formData) {
   if (!formData.overrides) formData.overrides = {};
 
   const findLog = (actionPart) => {
+    if (isCustom) return undefined;
     return bundle.activityLog.find(l => 
       (l.tag === taskTag || l.tag.startsWith(taskTag + ' - ')) && 
       l.action.toLowerCase().includes(actionPart.toLowerCase())
@@ -11117,7 +11323,9 @@ function renderTaskForm(container, taskNum, formData) {
   
   const finishLog = findLog('finish') || findLog('complete') || findLog('returning to base');
   let arriveLog;
-  if (finishLog) {
+  if (isCustom) {
+      arriveLog = undefined;
+  } else if (finishLog) {
       const finishIdx = bundle.activityLog.indexOf(finishLog);
       arriveLog = [...bundle.activityLog.slice(0, finishIdx)].reverse().find(l => l.action.toLowerCase().includes('arrived at base') && l.team === formData.teamName);
   } else {
@@ -11138,9 +11346,15 @@ function renderTaskForm(container, taskNum, formData) {
   }
 
   // 3. 20 Minute Status (Par Checks)
+  if (isCustom) {
+    // Entered by hand on the form; mirrored into parChecksRaw for printing.
+    if (!Array.isArray(formData.manualParChecks)) formData.manualParChecks = [];
+    formData.parChecksRaw = formData.manualParChecks.map(p => ({time: p.time || '', action: p.action || ''}));
+  } else {
     formData.parChecksRaw = [...bundle.activityLog]
     .filter(l => (l.tag === taskTag || l.tag.startsWith(taskTag + ' - ')) && (l.action.toLowerCase().includes('par check') || l.action.toLowerCase().includes('check-in')))
     .reverse();
+  }
 
   if (changed) save();
 
@@ -11172,7 +11386,7 @@ function renderTaskForm(container, taskNum, formData) {
     lbl.textContent = label;
     labelContainer.appendChild(lbl);
 
-    const isOverridden = ['leaveBase', 'beginSearch', 'completeSearch', 'returnBase'].includes(key) && formData.overrides?.[key] !== undefined;
+    const isOverridden = !isCustom && ['leaveBase', 'beginSearch', 'completeSearch', 'returnBase'].includes(key) && formData.overrides?.[key] !== undefined;
     if (isOverridden) {
         const resetBtn = document.createElement('button');
         resetBtn.innerHTML = '<svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M3 12a9 9 0 0 1 9-9 9.75 9.75 0 0 1 6.74 2.74L21 8"></path><path d="M21 3v5h-5"></path><path d="M21 12a9 9 0 0 1-9 9 9.75 9.75 0 0 1-6.74-2.74L3 16"></path><path d="M8 16H3v5"></path></svg>';
@@ -11219,6 +11433,10 @@ function renderTaskForm(container, taskNum, formData) {
   addGroup('Date/Time', 'dateTime');
   addGroup('Task #', 'taskNumDisplay', 'text', true);
   formData.taskNumDisplay = '#' + taskNum;
+  if (isCustom) {
+    formData.searchTypeDisplay = 'Custom search (manual entry)';
+    addGroup('Search Type', 'searchTypeDisplay', 'text', true);
+  }
 
   addSection('Lost Person Information');
   addGroup('Name', 'lostPersonName');
@@ -11268,6 +11486,10 @@ function renderTaskForm(container, taskNum, formData) {
   currentCard.appendChild(cbGroup);
 
   addSection('Assignment Details');
+  if (isCustom) {
+    // Shown in the Search Log "Team" column as "<name> (<personnel count>)".
+    addGroup('Team Name', 'teamName');
+  }
   addGroup('Briefed By', 'briefedBy');
   addGroup('Radio #', 'radioNumber');
   addGroup('GPS #', 'gpsNumber');
@@ -11350,7 +11572,75 @@ function renderTaskForm(container, taskNum, formData) {
   parWrap.style.gap = '8px';
   parWrap.style.marginTop = '10px';
 
-  (formData.parChecksRaw || []).forEach(log => {
+  if (isCustom) {
+    // Manual par checks: time + note per row, editable in place.
+    const renderManualParCheck = (check, idx) => {
+      const row = document.createElement('div');
+      row.className = 'pill-cell';
+      row.style.display = 'flex';
+      row.style.alignItems = 'center';
+      row.style.gap = '10px';
+      row.style.padding = '8px 15px';
+      row.style.marginBottom = '5px';
+      row.style.width = '100%';
+      row.style.boxSizing = 'border-box';
+
+      const timeInp = document.createElement('input');
+      timeInp.type = 'text';
+      timeInp.className = 'form-input';
+      timeInp.placeholder = 'HH:MM';
+      timeInp.style.width = '90px';
+      timeInp.style.flex = '0 0 auto';
+      timeInp.value = check.time || '';
+      timeInp.oninput = () => { check.time = timeInp.value; save(); };
+      row.appendChild(timeInp);
+
+      const noteInp = document.createElement('input');
+      noteInp.type = 'text';
+      noteInp.className = 'form-input';
+      noteInp.placeholder = 'Par check / status note';
+      noteInp.style.flex = '1';
+      noteInp.value = check.action || '';
+      noteInp.oninput = () => { check.action = noteInp.value; save(); };
+      row.appendChild(noteInp);
+
+      const trashIcon = document.createElement('div');
+      trashIcon.className = 'pill-hover-trash no-print';
+      trashIcon.title = 'Remove Par Check';
+      trashIcon.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>';
+      trashIcon.onclick = (e) => {
+        e.stopPropagation();
+        formData.manualParChecks.splice(idx, 1);
+        save();
+        renderTaskForm(container, taskNum, formData);
+      };
+      row.appendChild(trashIcon);
+
+      return row;
+    };
+
+    formData.manualParChecks.forEach((check, idx) => {
+      parWrap.appendChild(renderManualParCheck(check, idx));
+    });
+
+    const addParContainer = document.createElement('div');
+    addParContainer.style.textAlign = 'right';
+    const addParBtn = document.createElement('button');
+    addParBtn.className = 'mini-pill';
+    addParBtn.style.padding = '5px 15px';
+    addParBtn.textContent = '+ Add Par Check';
+    addParBtn.onclick = () => {
+      const now = new Date();
+      const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+      formData.manualParChecks.push({time: timeStr, action: 'Par check'});
+      save();
+      renderTaskForm(container, taskNum, formData);
+    };
+    addParContainer.appendChild(addParBtn);
+    parWrap.appendChild(addParContainer);
+  }
+
+  (isCustom ? [] : (formData.parChecksRaw || [])).forEach(log => {
      const row = document.createElement('div');
      row.className = 'pill-cell clickable-pill';
      row.style.display = 'flex';
@@ -11596,6 +11886,41 @@ function renderTaskForm(container, taskNum, formData) {
     }
     
     content.insertBefore(list, btnContainer);
+
+    if (isCustom) {
+      // Custom searches may involve people who are not on the roster at all.
+      const manualWrap = document.createElement('div');
+      manualWrap.className = 'popup-input-container';
+      manualWrap.style.marginBottom = '20px';
+
+      const manualInput = document.createElement('input');
+      manualInput.type = 'text';
+      manualInput.className = 'pill-input';
+      manualInput.placeholder = 'Or type a name not on the roster';
+      manualInput.style.flex = '1';
+      manualWrap.appendChild(manualInput);
+
+      const addManual = () => {
+        const name = manualInput.value.trim();
+        if (!name) return;
+        formData.teamMembers.push({name, leader: false, gps: false, radio: false, medic: false, rolesLoaded: true});
+        save();
+        popup.remove();
+        renderTaskForm(container, taskNum, formData);
+      };
+      manualInput.onkeydown = (e) => {
+        if (e.key === 'Enter') { e.preventDefault(); addManual(); }
+      };
+
+      const manualBtn = document.createElement('button');
+      manualBtn.className = 'popup-btn primary';
+      manualBtn.textContent = 'Add';
+      manualBtn.onclick = addManual;
+      manualWrap.appendChild(manualBtn);
+
+      content.insertBefore(manualWrap, btnContainer);
+      setTimeout(() => manualInput.focus(), 50);
+    }
   };
   addRowContainer.appendChild(addPBtn);
   currentCard.appendChild(addRowContainer);
@@ -11649,6 +11974,11 @@ function renderTaskForm(container, taskNum, formData) {
       save();
       
       addActivityLogEntry(formData.teamName || 'N/A', `Form #${taskNum} marked as completed by ${userName}`);
+      if (isCustom) {
+        // Completing the form is what finishes a custom search: the segment
+        // leaves the active-search map style and its sweep count becomes due.
+        showToast(`Custom search #${taskNum} finished - log its sweep count on the Segments page.`);
+      }
       
       renderTaskForm(container, taskNum, formData);
       checkParChecksAndNotify(); // Refresh header if needed
@@ -12367,6 +12697,7 @@ function buildManageFormsTable() {
 
 function isTaskUnfinished(taskWithHash) {
   const bundle = loadBundle();
+  if (isCustomSearchTaskInProgress(bundle, taskWithHash)) return true;
   if (!bundle.currentAssignments || !bundle.teamStatuses) return false;
   for (const team in bundle.currentAssignments) {
     const status = bundle.teamStatuses[team] || '';
@@ -12713,6 +13044,15 @@ function showToastNotification(title, text, action, extraClass = '') {
     }, 5000);
 }
 
+// Plain informational toast (no title, nothing to do on click).
+function showToast(text, title = 'Info') {
+    try {
+        showToastNotification(title, text, () => {});
+    } catch (e) {
+        console.warn('showToast failed', e);
+    }
+}
+
 function repositionToasts() {
     const toasts = document.querySelectorAll('.notif-toast');
     let offset = 20;
@@ -12805,7 +13145,8 @@ function updateNotifications() {
   searchLog.forEach(row => {
     if (row[0] && row[0].startsWith('#')) {
       const num = row[0].substring(1);
-      if (!isTaskUnfinished(row[0]) && (!forms[num] || !forms[num].completed)) {
+      // Custom searches are finished BY completing the form, so they always need it.
+      if ((isCustomSearchTaskForm(forms[num]) || !isTaskUnfinished(row[0])) && (!forms[num] || !forms[num].completed)) {
         add('Fill Form', `Task #${num} (${row[3]}/${row[4]}) form needs completion.`, () => {
           navigateToPage(`page5.html?task=${num}`);
         });
