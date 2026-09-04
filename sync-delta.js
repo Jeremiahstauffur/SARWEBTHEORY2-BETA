@@ -84,7 +84,8 @@
         segmentActiveSearchFillColor: 'settings_page',
         segmentActiveSearchBorderOpacityPercent: 'settings_page',
         segmentActiveSearchBorderColor: 'settings_page',
-        segmentActiveSearchBorderWidth: 'settings_page'
+        segmentActiveSearchBorderWidth: 'settings_page',
+        mapUnaccountedAutoCheck: 'settings_page'
     };
 
     const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);

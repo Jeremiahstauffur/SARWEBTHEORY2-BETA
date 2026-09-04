@@ -19,7 +19,7 @@
       } catch (e) {}
     })();
   </script>
-  <link rel="stylesheet" href="styles.css?v=20260829" />
+  <link rel="stylesheet" href="styles.css?v=20260904" />
 </head>
 <body data-page="settings">
   <div class="site-shell">
@@ -147,6 +147,22 @@
             <div class="home-row">
               <input type="number" id="par-freq-input" class="pill-cell" style="width: 80px; text-align: center;" min="1" step="1">
               <span id="par-freq-label" style="margin-left: 10px;">minutes</span>
+            </div>
+          </div>
+
+          <div class="home-panel">
+            <h2>Map Feature Check</h2>
+            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+              When ON, the app re-fetches the CalTopo map every 5 minutes and sends a notification naming any
+              shapes that are not imported as segments and not marked unwanted. When OFF, only the check button
+              on the Maps page looks for them.
+            </p>
+            <div class="home-row">
+              <label class="toggle-switch">
+                <input type="checkbox" id="map-auto-check-toggle">
+                <span class="slider"></span>
+              </label>
+              <span id="map-auto-check-label">Automatic check is ON</span>
             </div>
           </div>
 
@@ -294,9 +310,9 @@
         </a>
     </nav>
   </div>
-  <script src="map-segment-utils.js"></script>
-  <script src="sync-delta.js?v=20260829"></script>
-  <script src="app.js?v=20260829"></script>
+  <script src="map-segment-utils.js?v=20260904"></script>
+  <script src="sync-delta.js?v=20260904"></script>
+  <script src="app.js?v=20260904"></script>
 
     <div class="notification-sidebar" id="notif-sidebar">
       <div class="notification-header">

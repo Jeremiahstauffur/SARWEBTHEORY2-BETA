@@ -325,6 +325,145 @@
         return bundle.pages.page2;
     }
 
+    // ------------------------------------------------------------------
+    // Fetched-feature bookkeeping: sorting, searching, and telling which
+    // CalTopo features are "accounted for" (already a segment or marked as
+    // unwanted) versus still waiting to be imported.
+    // ------------------------------------------------------------------
+
+    function getFeatureDisplayName(feature) {
+        const attrs = feature?.attributes || feature?.properties || {};
+        const name = attrs.name || attrs.label || attrs.title || feature?.name || '';
+        return String(name || '').trim() || 'Unnamed Graphic';
+    }
+
+    // Ids the app makes up for shapes CalTopo returned without one ("gfx-7")
+    // only identify a feature within a single fetch, so they are never used to
+    // match features across fetches.
+    function isSyntheticFeatureId(featureId) {
+        return /^gfx-\d+$/i.test(String(featureId || '').trim());
+    }
+
+    function getFeatureIdentity(feature) {
+        const attrs = feature?.attributes || feature?.properties || {};
+        const rawId = attrs.id !== undefined && attrs.id !== null ? attrs.id : feature?.id;
+        const id = String(rawId === undefined || rawId === null ? '' : rawId).trim();
+        return {
+            id: id && !isSyntheticFeatureId(id) ? id : '',
+            name: normalizeSegmentName(getFeatureDisplayName(feature))
+        };
+    }
+
+    function getFeatureIdentityKey(feature) {
+        const identity = getFeatureIdentity(feature);
+        return identity.id ? `id:${identity.id}` : `name:${identity.name}`;
+    }
+
+    function compareFeatureNames(a, b) {
+        return getFeatureDisplayName(a).localeCompare(getFeatureDisplayName(b), undefined, {
+            numeric: true,
+            sensitivity: 'base'
+        });
+    }
+
+    // Returns a new array sorted A-Z by display name; the input is not mutated.
+    function sortFeaturesByName(features) {
+        return (Array.isArray(features) ? features.slice() : []).sort(compareFeatureNames);
+    }
+
+    function filterFeaturesByName(features, query) {
+        const list = Array.isArray(features) ? features : [];
+        const needle = normalizeSegmentName(query);
+        if (!needle) return list.slice();
+        return list.filter(feature => normalizeSegmentName(getFeatureDisplayName(feature)).includes(needle));
+    }
+
+    function normalizeUnwantedEntry(entry) {
+        if (!entry || typeof entry !== 'object') return null;
+        const id = String(entry.id || '').trim();
+        const name = normalizeSegmentName(entry.name);
+        if (!id && !name) return null;
+        const normalized = {id: isSyntheticFeatureId(id) ? '' : id, name};
+        if (entry.markedAt) normalized.markedAt = entry.markedAt;
+        return normalized;
+    }
+
+    function normalizeUnwantedFeatureList(list) {
+        return (Array.isArray(list) ? list : []).map(normalizeUnwantedEntry).filter(Boolean);
+    }
+
+    function buildUnwantedFeatureEntry(feature, markedAt) {
+        const identity = getFeatureIdentity(feature);
+        const entry = {id: identity.id, name: identity.name};
+        entry.markedAt = markedAt || new Date().toISOString();
+        return entry;
+    }
+
+    // A feature is unwanted when its CalTopo id was marked, or (for features
+    // without a real id on either side) when its name was marked.
+    function isFeatureUnwanted(feature, unwantedList) {
+        const identity = getFeatureIdentity(feature);
+        return normalizeUnwantedFeatureList(unwantedList).some(entry => {
+            if (identity.id && entry.id) return identity.id === entry.id;
+            return !!identity.name && identity.name === entry.name;
+        });
+    }
+
+    // Segments page rows: [region, segment, area, length, sweep, time, psri, psrc, notes, caltopoId]
+    function isFeatureAccountedFor(feature, segmentRows) {
+        const identity = getFeatureIdentity(feature);
+        return (Array.isArray(segmentRows) ? segmentRows : []).some(row => {
+            if (!Array.isArray(row)) return false;
+            const rowId = String(row[9] || '').trim();
+            if (identity.id && rowId && identity.id === rowId) return true;
+            const rowName = normalizeSegmentName(row[1]);
+            return !!rowName && rowName === identity.name;
+        });
+    }
+
+    // Features that are neither a segment yet nor marked unwanted, sorted A-Z.
+    function getUnaccountedFeatures(features, segmentRows, unwantedList) {
+        const unwanted = normalizeUnwantedFeatureList(unwantedList);
+        return sortFeaturesByName((Array.isArray(features) ? features : []).filter(feature =>
+            !isFeatureAccountedFor(feature, segmentRows) && !isFeatureUnwanted(feature, unwanted)));
+    }
+
+    // Returns a new list with `features` added (no duplicates); the input list
+    // is not mutated.
+    function markFeaturesUnwanted(unwantedList, features, markedAt) {
+        const result = normalizeUnwantedFeatureList(unwantedList);
+        (Array.isArray(features) ? features : []).forEach(feature => {
+            if (isFeatureUnwanted(feature, result)) return;
+            result.push(buildUnwantedFeatureEntry(feature, markedAt));
+        });
+        return result;
+    }
+
+    // Returns a new list without the entries that match `features`.
+    function unmarkFeaturesUnwanted(unwantedList, features) {
+        const identities = (Array.isArray(features) ? features : []).map(getFeatureIdentity);
+        return normalizeUnwantedFeatureList(unwantedList).filter(entry => !identities.some(identity => {
+            if (identity.id && entry.id) return identity.id === entry.id;
+            return !!identity.name && identity.name === entry.name;
+        }));
+    }
+
+    // "Alpha, Bravo and 3 more are on the map but not imported as segments."
+    function formatUnaccountedFeatureNotification(names, maxNames = 5) {
+        const list = (Array.isArray(names) ? names : []).map(name => String(name || '').trim()).filter(Boolean);
+        if (!list.length) return '';
+        const shown = list.slice(0, Math.max(1, maxNames));
+        const remaining = list.length - shown.length;
+        let text = shown.length === 1
+            ? shown[0]
+            : `${shown.slice(0, -1).join(', ')} and ${shown[shown.length - 1]}`;
+        if (remaining > 0) {
+            text = `${shown.join(', ')} and ${remaining} more`;
+        }
+        const verb = list.length === 1 ? 'is' : 'are';
+        return `${text} ${verb} on the map but not imported as ${list.length === 1 ? 'a segment' : 'segments'}.`;
+    }
+
     return {
         getFeatureTypeKey,
         getCalTopoApiObjectType,
@@ -339,6 +478,21 @@
         getFeaturePsrcAssignmentStyle,
         filterSegmentImportsByType,
         polygonAreaAcres,
-        ensureSegmentsPageRows
+        ensureSegmentsPageRows,
+        getFeatureDisplayName,
+        isSyntheticFeatureId,
+        getFeatureIdentity,
+        getFeatureIdentityKey,
+        compareFeatureNames,
+        sortFeaturesByName,
+        filterFeaturesByName,
+        normalizeUnwantedFeatureList,
+        buildUnwantedFeatureEntry,
+        isFeatureUnwanted,
+        isFeatureAccountedFor,
+        getUnaccountedFeatures,
+        markFeaturesUnwanted,
+        unmarkFeaturesUnwanted,
+        formatUnaccountedFeatureNotification
     };
 });

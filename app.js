@@ -34,6 +34,14 @@ const CALTOPO_ASSIGNMENT_OVERLAY_STORAGE_KEY = 'sar-caltopo-assignment-overlay-v
 // as a map keyed by sync bucket (CASE # + username), so each user keeps a
 // separate toggle state for each case.
 const SEGMENTS_PSRC_SORT_STORAGE_KEY = 'sar-segments-psrc-sort-v1';
+// How often the app re-fetches the CalTopo map to look for shapes that are
+// neither imported as segments nor marked unwanted ("unaccounted" features).
+const MAP_UNACCOUNTED_CHECK_INTERVAL_MS = 5 * 60 * 1000;
+// When the last automatic check ran on this device. Kept in localStorage so
+// navigating between pages does not restart the 5-minute clock.
+const MAP_UNACCOUNTED_LAST_CHECK_STORAGE_KEY = 'sar-map-unaccounted-last-check-v1';
+const UNACCOUNTED_FEATURES_NOTIFICATION_TITLE = 'Unaccounted Map Features';
+const UNACCOUNTED_FEATURES_NOTIFICATION_CLASS = 'map-features-unaccounted';
 
 function getMapSegmentUtils() {
     return (typeof window !== 'undefined' && window.SARMapSegmentUtils) ? window.SARMapSegmentUtils : {};
@@ -321,6 +329,162 @@ function buildSegmentNameSet(rows) {
         if (nameKey) names.add(nameKey);
     });
     return names;
+}
+
+// ---------------------------------------------------------------------------
+// Fetched CalTopo features: A-Z ordering, name search, and the hidden
+// "unwanted" list that keeps shapes nobody wants imported out of the way.
+// ---------------------------------------------------------------------------
+
+function getMapFeatureDisplayName(feature) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getFeatureDisplayName === 'function') return utils.getFeatureDisplayName(feature);
+    const attrs = feature?.attributes || feature?.properties || {};
+    return String(attrs.name || attrs.label || attrs.title || '').trim() || 'Unnamed Graphic';
+}
+
+function sortMapFeaturesByName(features) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.sortFeaturesByName === 'function') return utils.sortFeaturesByName(features);
+    return (Array.isArray(features) ? features.slice() : []).sort((a, b) =>
+        getMapFeatureDisplayName(a).localeCompare(getMapFeatureDisplayName(b), undefined, {numeric: true, sensitivity: 'base'}));
+}
+
+function filterMapFeaturesByName(features, query) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.filterFeaturesByName === 'function') return utils.filterFeaturesByName(features, query);
+    const needle = normalizeSegmentNameForMatch(query);
+    const list = Array.isArray(features) ? features : [];
+    if (!needle) return list.slice();
+    return list.filter(feature => normalizeSegmentNameForMatch(getMapFeatureDisplayName(feature)).includes(needle));
+}
+
+function getMapFeatureIdentityKey(feature) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getFeatureIdentityKey === 'function') return utils.getFeatureIdentityKey(feature);
+    const attrs = feature?.attributes || feature?.properties || {};
+    const id = String(attrs.id || '').trim();
+    return id && !isSyntheticCalTopoFeatureId(id) ? `id:${id}` : `name:${normalizeSegmentNameForMatch(getMapFeatureDisplayName(feature))}`;
+}
+
+// {id, name} of a fetched feature: the real CalTopo id (never a made-up gfx-N
+// one) and the lower-cased display name.
+function getMapFeatureIdentity(feature) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getFeatureIdentity === 'function') return utils.getFeatureIdentity(feature);
+    const attrs = feature?.attributes || feature?.properties || {};
+    const rawId = attrs.id !== undefined && attrs.id !== null ? attrs.id : feature?.id;
+    const id = String(rawId === undefined || rawId === null ? '' : rawId).trim();
+    return {
+        id: id && !isSyntheticCalTopoFeatureId(id) ? id : '',
+        name: normalizeSegmentNameForMatch(getMapFeatureDisplayName(feature))
+    };
+}
+
+function unwantedEntryMatchesIdentity(entry, identity) {
+    if (identity.id && entry.id) return identity.id === entry.id;
+    return !!identity.name && identity.name === entry.name;
+}
+
+function getUnwantedMapFeatures(bundle) {
+    const utils = getMapSegmentUtils();
+    const list = bundle?.unwantedMapFeatures;
+    if (typeof utils.normalizeUnwantedFeatureList === 'function') return utils.normalizeUnwantedFeatureList(list);
+    return (Array.isArray(list) ? list : []).map(entry => {
+        if (!entry || typeof entry !== 'object') return null;
+        const id = String(entry.id || '').trim();
+        const name = normalizeSegmentNameForMatch(entry.name);
+        if (!id && !name) return null;
+        const normalized = {id: isSyntheticCalTopoFeatureId(id) ? '' : id, name};
+        if (entry.markedAt) normalized.markedAt = entry.markedAt;
+        return normalized;
+    }).filter(Boolean);
+}
+
+function isMapFeatureUnwanted(feature, bundle) {
+    const utils = getMapSegmentUtils();
+    const unwanted = getUnwantedMapFeatures(bundle);
+    if (typeof utils.isFeatureUnwanted === 'function') return utils.isFeatureUnwanted(feature, unwanted);
+    const identity = getMapFeatureIdentity(feature);
+    return unwanted.some(entry => unwantedEntryMatchesIdentity(entry, identity));
+}
+
+function isMapFeatureAccountedFor(feature, bundle) {
+    const utils = getMapSegmentUtils();
+    const rows = ensureSegmentsPageRows(bundle);
+    if (typeof utils.isFeatureAccountedFor === 'function') return utils.isFeatureAccountedFor(feature, rows);
+    const identity = getMapFeatureIdentity(feature);
+    return (Array.isArray(rows) ? rows : []).some(row => {
+        if (!Array.isArray(row)) return false;
+        const rowId = String(row[9] || '').trim();
+        if (identity.id && rowId && identity.id === rowId) return true;
+        const rowName = normalizeSegmentNameForMatch(row[1]);
+        return !!rowName && rowName === identity.name;
+    });
+}
+
+// Fetched features that are neither a segment yet nor marked unwanted, A-Z.
+function getUnaccountedMapFeatures(bundle) {
+    const b = bundle || loadBundle();
+    const map = Array.isArray(b.maps) && b.maps[0] ? b.maps[0] : null;
+    const features = map && Array.isArray(map.features) ? map.features : [];
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getUnaccountedFeatures === 'function') {
+        return utils.getUnaccountedFeatures(features, ensureSegmentsPageRows(b), getUnwantedMapFeatures(b));
+    }
+    return sortMapFeaturesByName(features.filter(feature => !isMapFeatureAccountedFor(feature, b) && !isMapFeatureUnwanted(feature, b)));
+}
+
+// Adds `features` to the hidden unwanted list (features that are already
+// segments are skipped: they are accounted for anyway). Returns how many
+// entries were newly added.
+function markMapFeaturesUnwanted(features, bundle = null) {
+    const utils = getMapSegmentUtils();
+    const b = bundle || loadBundle();
+    const candidates = (Array.isArray(features) ? features : []).filter(feature => !isMapFeatureAccountedFor(feature, b));
+    const before = getUnwantedMapFeatures(b);
+    let after;
+    if (typeof utils.markFeaturesUnwanted === 'function') {
+        after = utils.markFeaturesUnwanted(before, candidates);
+    } else {
+        after = before.slice();
+        const markedAt = new Date().toISOString();
+        candidates.forEach(feature => {
+            const identity = getMapFeatureIdentity(feature);
+            if (after.some(entry => unwantedEntryMatchesIdentity(entry, identity))) return;
+            after.push({id: identity.id, name: identity.name, markedAt});
+        });
+    }
+    const added = after.length - before.length;
+    if (added > 0) {
+        b.unwantedMapFeatures = after;
+        if (!bundle) saveBundle(b);
+    }
+    return added;
+}
+
+function unmarkMapFeaturesUnwanted(features, bundle = null) {
+    const utils = getMapSegmentUtils();
+    const b = bundle || loadBundle();
+    const before = getUnwantedMapFeatures(b);
+    let after;
+    if (typeof utils.unmarkFeaturesUnwanted === 'function') {
+        after = utils.unmarkFeaturesUnwanted(before, features);
+    } else {
+        const identities = (Array.isArray(features) ? features : []).map(getMapFeatureIdentity);
+        after = before.filter(entry => !identities.some(identity => unwantedEntryMatchesIdentity(entry, identity)));
+    }
+    const removed = before.length - after.length;
+    if (removed > 0) {
+        b.unwantedMapFeatures = after;
+        if (!bundle) saveBundle(b);
+    }
+    return removed;
+}
+
+function isMapUnaccountedAutoCheckEnabled(bundle) {
+    const b = bundle || loadBundle();
+    return b.mapUnaccountedAutoCheck !== false;
 }
 
 function isMapPsrcOverlayEnabled() {
@@ -2656,6 +2820,10 @@ function defaultBundle() {
     forms: {},
     uploads: [],
     maps: [],
+    // CalTopo shapes the team decided not to import (hidden from the "only new"
+    // and unaccounted views) and whether the 5-minute unaccounted check runs.
+    unwantedMapFeatures: [],
+    mapUnaccountedAutoCheck: true,
     permanentPersonnel: {},
     accounts: [
       { username: 'Super Admin', pin: '1976', color: 'none', handle: 'Super-Admin', isFileManager: true, theme: 'dark', visiblePages: ['index', 'page2', 'page3', 'page4', 'page5', 'page6', 'page7', 'settings', 'home', 'page8', 'page9', 'page10'] }
@@ -2843,6 +3011,8 @@ function sanitizeBundle(bundle) {
   const profile = bundle.profile || fallback.profile;
   const uploads = Array.isArray(bundle.uploads) ? bundle.uploads : [];
   const maps = Array.isArray(bundle.maps) ? bundle.maps : [];
+  const unwantedMapFeatures = getUnwantedMapFeatures(bundle);
+  const mapUnaccountedAutoCheck = bundle.mapUnaccountedAutoCheck !== false;
 
   let accounts = Array.isArray(bundle.accounts) ? bundle.accounts : fallback.accounts;
 
@@ -2963,6 +3133,8 @@ function sanitizeBundle(bundle) {
     profile, 
     uploads, 
     maps,
+    unwantedMapFeatures,
+    mapUnaccountedAutoCheck,
     permanentPersonnel,
     accounts: syncedAccounts 
   };
@@ -9919,6 +10091,23 @@ function buildSettingsPage() {
     };
   }
 
+  const mapAutoCheckToggle = document.getElementById('map-auto-check-toggle');
+  const mapAutoCheckLabel = document.getElementById('map-auto-check-label');
+  if (mapAutoCheckToggle) {
+    const describe = enabled => `Automatic check is ${enabled ? 'ON' : 'OFF'}`;
+    mapAutoCheckToggle.checked = isMapUnaccountedAutoCheckEnabled(bundle);
+    if (mapAutoCheckLabel) mapAutoCheckLabel.textContent = describe(mapAutoCheckToggle.checked);
+    mapAutoCheckToggle.onchange = () => {
+      const nextBundle = loadBundle();
+      nextBundle.mapUnaccountedAutoCheck = mapAutoCheckToggle.checked;
+      saveBundle(nextBundle);
+      if (mapAutoCheckLabel) mapAutoCheckLabel.textContent = describe(mapAutoCheckToggle.checked);
+      status.textContent = mapAutoCheckToggle.checked
+        ? 'Unaccounted map features will be checked every 5 minutes.'
+        : 'Automatic map feature check turned off. Use the check button on the Maps page instead.';
+    };
+  }
+
   toggle.onchange = () => {
     const nextBundle = loadBundle();
     nextBundle.deleteMode = toggle.checked;
@@ -13160,6 +13349,14 @@ function updateNotifications() {
     }, 'profile-incomplete');
   }
 
+  // CalTopo shapes found by the unaccounted-feature check (see
+  // checkUnaccountedMapFeaturesAndNotify) that still need importing.
+  const unaccountedNames = Array.isArray(window._unaccountedMapFeatureNames) ? window._unaccountedMapFeatureNames : [];
+  if (unaccountedNames.length > 0) {
+    add(UNACCOUNTED_FEATURES_NOTIFICATION_TITLE, getUnaccountedFeatureNotificationText(unaccountedNames),
+      openUnaccountedMapFeatures, UNACCOUNTED_FEATURES_NOTIFICATION_CLASS);
+  }
+
   if (dot) {
     if (count > 0) {
       dot.classList.add('active');
@@ -13300,6 +13497,10 @@ document.addEventListener('DOMContentLoaded', async () => {
   
   checkParChecksAndNotify();
   setInterval(checkParChecksAndNotify, 60000);
+
+  // Every 5 minutes (unless turned off in Settings) re-fetch the CalTopo map
+  // and point out shapes that are not imported as segments or marked unwanted.
+  startUnaccountedMapFeatureChecks();
 
   // Auto-save every 5 minutes to the file list on the home page
   setInterval(() => {
@@ -13834,6 +14035,15 @@ function showSegmentsImportPreviewPopup(segments, options = {}) {
 
         importSegmentsAction(selected);
         closePopup(popup);
+        // Lets the caller react to what was actually imported (e.g. the CalTopo
+        // shapes flow marks everything that was left out as unwanted).
+        if (typeof options.onImported === 'function') {
+            try {
+                options.onImported(selected);
+            } catch (err) {
+                console.error('onImported callback failed:', err);
+            }
+        }
     };
     btnContainer.appendChild(submitBtn);
 }
@@ -14355,38 +14565,103 @@ function showCalTopoShapesPopup(features) {
   bodyContainer.style.overflow = 'hidden';
   content.insertBefore(bodyContainer, btnContainer);
 
-    const segmentsToPreview = features.map(buildCalTopoSegmentImportItem);
+    const bundle = loadBundle();
+    // Shapes are listed A-Z. `featureIndex` keeps each one tied to its position
+    // in `features`, so the selection survives sorting, searching and filtering.
+    const segmentsToPreview = sortMapFeaturesByName(features).map(feature => {
+        const item = buildCalTopoSegmentImportItem(feature);
+        item.featureIndex = features.indexOf(feature);
+        item.imported = isMapFeatureAccountedFor(feature, bundle);
+        item.unwanted = !item.imported && isMapFeatureUnwanted(feature, bundle);
+        return item;
+    });
+    const isNewShape = seg => !seg.imported && !seg.unwanted;
+    const countByType = typeKey => segmentsToPreview.filter(seg => seg.typeKey === typeKey).length;
+    const newCount = () => segmentsToPreview.filter(isNewShape).length;
+
     let activeFilter = 'all';
-    const selectionState = new Map(segmentsToPreview.map((seg, index) => [index, true]));
+    let onlyNew = false;
+    let searchQuery = '';
+    // Shapes that are already segments or were marked unwanted start unchecked,
+    // so a quick "Submit Import" only brings in what is actually new.
+    const selectionState = new Map(segmentsToPreview.map(seg => [seg.featureIndex, isNewShape(seg)]));
+    const selectedCount = () => segmentsToPreview.filter(seg => selectionState.get(seg.featureIndex) !== false).length;
 
-    const renderTable = () => {
-        const visibleSegments = getFilteredSegmentImports(segmentsToPreview, activeFilter);
-        const selectedVisibleCount = visibleSegments.filter(seg => selectionState.get(seg.featureIndex) !== false).length;
-        const allVisibleChecked = visibleSegments.length > 0 && selectedVisibleCount === visibleSegments.length;
-
-        bodyContainer.innerHTML = `
-      <p style="margin-bottom: 15px; opacity: 0.8; flex-shrink: 0;">Select the shapes you want to import as segments, then click <strong>Submit Import</strong> to open the same import preview used on the Segments page.</p>
-      <div style="display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; align-items: center;">
-        <span style="opacity: 0.8; font-size: 0.95rem;">Filter:</span>
-        <button type="button" class="mini-pill caltopo-filter-btn ${activeFilter === 'all' ? 'active' : ''}" data-filter="all">All (${segmentsToPreview.length})</button>
-        <button type="button" class="mini-pill caltopo-filter-btn ${activeFilter === 'marker' ? 'active' : ''}" data-filter="marker">Markers (${segmentsToPreview.filter(seg => seg.typeKey === 'marker').length})</button>
-        <button type="button" class="mini-pill caltopo-filter-btn ${activeFilter === 'assignment' ? 'active' : ''}" data-filter="assignment">Assignments (${segmentsToPreview.filter(seg => seg.typeKey === 'assignment').length})</button>
-        <button type="button" class="mini-pill caltopo-filter-btn ${activeFilter === 'track' ? 'active' : ''}" data-filter="track">Tracks (${segmentsToPreview.filter(seg => seg.typeKey === 'track').length})</button>
-        <span style="margin-left: auto; opacity: 0.7; font-size: 0.85rem;">Showing ${visibleSegments.length} of ${segmentsToPreview.length}</span>
+    bodyContainer.innerHTML = `
+      <p style="margin-bottom: 15px; opacity: 0.8; flex-shrink: 0;">Select the shapes you want to import as segments, then click <strong>Submit Import</strong> to open the same import preview used on the Segments page. Shapes left out of an import are remembered as <strong>unwanted</strong>, so <strong>Only new</strong> hides them the next time you fetch.</p>
+      <div style="display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; align-items: center;">
+        <input type="search" id="caltopo-shape-search" class="pill-input" placeholder="Search by segment name..." autocomplete="off" style="flex: 1; min-width: 200px; min-height: 40px;">
+        <label style="display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; cursor: pointer; white-space: nowrap;">
+          <span class="toggle-switch" style="transform: scale(0.9);">
+            <input type="checkbox" id="caltopo-only-new-toggle">
+            <span class="slider"></span>
+          </span>
+          <span>Only new (<span id="caltopo-only-new-count">${newCount()}</span>)</span>
+        </label>
       </div>
+      <div id="caltopo-filter-row" style="display: flex; flex-wrap: wrap; gap: 10px; margin-bottom: 12px; align-items: center;"></div>
       <div style="margin-bottom: 10px; display: flex; align-items: center; gap: 10px;">
-          <input type="checkbox" id="check-all-shapes" ${allVisibleChecked ? 'checked' : ''} style="width: 18px; height: 18px; cursor: pointer;">
+          <input type="checkbox" id="check-all-shapes" style="width: 18px; height: 18px; cursor: pointer;">
           <label for="check-all-shapes" style="cursor: pointer; font-weight: bold;">Check / Uncheck Visible</label>
       </div>
     `;
 
-        const tableWrap = document.createElement('div');
-        tableWrap.style.overflowX = 'auto';
-        tableWrap.style.flex = '1';
-        tableWrap.style.overflowY = 'auto';
-        tableWrap.style.background = 'rgba(0,0,0,0.1)';
-        tableWrap.style.borderRadius = '12px';
+    const tableWrap = document.createElement('div');
+    tableWrap.style.overflowX = 'auto';
+    tableWrap.style.flex = '1';
+    tableWrap.style.overflowY = 'auto';
+    tableWrap.style.background = 'rgba(0,0,0,0.1)';
+    tableWrap.style.borderRadius = '12px';
+    bodyContainer.appendChild(tableWrap);
 
+    const searchInput = bodyContainer.querySelector('#caltopo-shape-search');
+    const onlyNewToggle = bodyContainer.querySelector('#caltopo-only-new-toggle');
+    const filterRow = bodyContainer.querySelector('#caltopo-filter-row');
+    const checkAll = bodyContainer.querySelector('#check-all-shapes');
+    const onlyNewCountEl = bodyContainer.querySelector('#caltopo-only-new-count');
+    let submitBtn = null;
+
+    const getVisibleSegments = () => {
+        let visible = getFilteredSegmentImports(segmentsToPreview, activeFilter);
+        if (onlyNew) visible = visible.filter(isNewShape);
+        if (searchQuery.trim()) {
+            const keep = new Set(filterMapFeaturesByName(visible.map(seg => seg.feature), searchQuery));
+            visible = visible.filter(seg => keep.has(seg.feature));
+        }
+        return visible;
+    };
+
+    const updateSubmitLabel = () => {
+        if (submitBtn) submitBtn.textContent = `Submit Import (${selectedCount()})`;
+    };
+
+    const renderFilters = () => {
+        filterRow.innerHTML = `
+        <span style="opacity: 0.8; font-size: 0.95rem;">Filter:</span>
+        <button type="button" class="mini-pill caltopo-filter-btn ${activeFilter === 'all' ? 'active' : ''}" data-filter="all">All (${segmentsToPreview.length})</button>
+        <button type="button" class="mini-pill caltopo-filter-btn ${activeFilter === 'marker' ? 'active' : ''}" data-filter="marker">Markers (${countByType('marker')})</button>
+        <button type="button" class="mini-pill caltopo-filter-btn ${activeFilter === 'assignment' ? 'active' : ''}" data-filter="assignment">Assignments (${countByType('assignment')})</button>
+        <button type="button" class="mini-pill caltopo-filter-btn ${activeFilter === 'route' ? 'active' : ''}" data-filter="route">Tracks / Lines (${countByType('route')})</button>
+        <span class="caltopo-showing" style="margin-left: auto; opacity: 0.7; font-size: 0.85rem;"></span>
+      `;
+        filterRow.querySelectorAll('.caltopo-filter-btn').forEach(btn => {
+            btn.onclick = () => {
+                activeFilter = btn.dataset.filter || 'all';
+                renderFilters();
+                renderTable();
+            };
+        });
+    };
+
+    const renderTable = () => {
+        const visibleSegments = getVisibleSegments();
+        const selectedVisibleCount = visibleSegments.filter(seg => selectionState.get(seg.featureIndex) !== false).length;
+        checkAll.checked = visibleSegments.length > 0 && selectedVisibleCount === visibleSegments.length;
+        if (onlyNewCountEl) onlyNewCountEl.textContent = newCount();
+        const showing = filterRow.querySelector('.caltopo-showing');
+        if (showing) showing.textContent = `Showing ${visibleSegments.length} of ${segmentsToPreview.length}`;
+
+        tableWrap.innerHTML = '';
         const table = document.createElement('table');
         table.className = 'grid-table';
         table.style.width = '100%';
@@ -14397,6 +14672,7 @@ function showCalTopoShapesPopup(features) {
           <th style="width: 40px; text-align: center; padding: 12px;"></th>
           <th style="padding: 12px;">Name</th>
           <th style="padding: 12px;">Type</th>
+          <th style="padding: 12px;">Status</th>
           <th style="padding: 12px;">Max Dim (mi)</th>
           <th style="padding: 12px;">Area (acres)</th>
           <th style="padding: 12px;">W x H (mi)</th>
@@ -14406,47 +14682,67 @@ function showCalTopoShapesPopup(features) {
 
         const tbody = document.createElement('tbody');
         if (visibleSegments.length === 0) {
-            tbody.innerHTML = '<tr><td colspan="6" style="text-align:center; padding: 28px; color: var(--muted);">No shapes match the current filter.</td></tr>';
+            const emptyText = segmentsToPreview.length === 0
+                ? 'No shapes were fetched from the map.'
+                : (onlyNew && !searchQuery.trim() && activeFilter === 'all'
+                    ? 'Every fetched shape is already imported or marked unwanted.'
+                    : 'No shapes match the current search / filter.');
+            tbody.innerHTML = `<tr><td colspan="7" style="text-align:center; padding: 28px; color: var(--muted);">${emptyText}</td></tr>`;
         } else {
             visibleSegments.forEach(seg => {
                 const tr = document.createElement('tr');
+                const status = seg.imported
+                    ? '<span class="mini-pill" style="padding: 4px 10px; font-size: 0.75rem; background: rgba(64, 192, 87, 0.12); border-color: rgba(64, 192, 87, 0.35);">Imported</span>'
+                    : (seg.unwanted
+                        ? '<span style="display: inline-flex; align-items: center; gap: 6px;"><span class="mini-pill" style="padding: 4px 10px; font-size: 0.75rem; opacity: 0.7;">Unwanted</span><button type="button" class="mini-pill restore-shape" style="padding: 4px 10px; font-size: 0.75rem; cursor: pointer;" title="Remove from the unwanted list">Restore</button></span>'
+                        : '<span class="mini-pill" style="padding: 4px 10px; font-size: 0.75rem; background: rgba(var(--accent-rgb), 0.12); border-color: rgba(var(--accent-rgb), 0.35);">New</span>');
                 tr.innerHTML = `
           <td style="text-align: center;"><input type="checkbox" class="shape-checkbox" data-index="${seg.featureIndex}" ${selectionState.get(seg.featureIndex) !== false ? 'checked' : ''} style="width: 18px; height: 18px; cursor: pointer;"></td>
           <td><div class="pill-cell readonly-pill" style="padding: 8px 12px;">${seg.segment}</div></td>
           <td><div class="pill-cell readonly-pill" style="padding: 8px 12px;">${seg.typeLabel}</div></td>
+          <td style="padding: 8px 12px;">${status}</td>
           <td><div class="pill-cell readonly-pill" style="padding: 8px 12px;">${seg.length || '0.00'} mi</div></td>
           <td><div class="pill-cell readonly-pill" style="padding: 8px 12px;">${seg.area || '0.00'} ac</div></td>
           <td><div class="pill-cell readonly-pill" style="padding: 8px 12px; font-size: 0.8rem;">${seg.width} x ${seg.height}</div></td>
         `;
+                const cb = tr.querySelector('.shape-checkbox');
+                cb.onchange = () => {
+                    selectionState.set(seg.featureIndex, cb.checked);
+                    const stillVisible = getVisibleSegments();
+                    checkAll.checked = stillVisible.length > 0 && stillVisible.every(s => selectionState.get(s.featureIndex) !== false);
+                    updateSubmitLabel();
+                };
+                const restoreBtn = tr.querySelector('.restore-shape');
+                if (restoreBtn) {
+                    restoreBtn.onclick = () => {
+                        unmarkMapFeaturesUnwanted([seg.feature]);
+                        seg.unwanted = false;
+                        selectionState.set(seg.featureIndex, true);
+                        renderTable();
+                        if (isMapsPage()) renderUnaccountedFeaturesPanel();
+                    };
+                }
                 tbody.appendChild(tr);
             });
         }
 
         table.appendChild(tbody);
         tableWrap.appendChild(table);
-        bodyContainer.appendChild(tableWrap);
+        updateSubmitLabel();
+    };
 
-        bodyContainer.querySelectorAll('.caltopo-filter-btn').forEach(btn => {
-            btn.onclick = () => {
-                activeFilter = btn.dataset.filter || 'all';
-                renderTable();
-            };
-        });
-
-        const checkAll = bodyContainer.querySelector('#check-all-shapes');
-        if (checkAll) {
-            checkAll.onchange = () => {
-                visibleSegments.forEach(seg => selectionState.set(seg.featureIndex, checkAll.checked));
-                renderTable();
-            };
-        }
-
-        bodyContainer.querySelectorAll('.shape-checkbox').forEach(cb => {
-            cb.onchange = () => {
-                selectionState.set(parseInt(cb.dataset.index, 10), cb.checked);
-            };
-        });
-  };
+    checkAll.onchange = () => {
+        getVisibleSegments().forEach(seg => selectionState.set(seg.featureIndex, checkAll.checked));
+        renderTable();
+    };
+    searchInput.oninput = () => {
+        searchQuery = searchInput.value || '';
+        renderTable();
+    };
+    onlyNewToggle.onchange = () => {
+        onlyNew = onlyNewToggle.checked;
+        renderTable();
+    };
 
   btnContainer.innerHTML = '';
   btnContainer.style.display = 'flex';
@@ -14460,12 +14756,12 @@ function showCalTopoShapesPopup(features) {
   cancelBtn.onclick = () => closePopup(popup);
   btnContainer.appendChild(cancelBtn);
 
-  const submitBtn = document.createElement('button');
+  submitBtn = document.createElement('button');
   submitBtn.className = 'popup-btn primary';
   submitBtn.style.flex = '1';
   submitBtn.textContent = 'Submit Import';
   submitBtn.onclick = () => {
-      const selected = segmentsToPreview.filter((seg, index) => selectionState.get(index) !== false);
+      const selected = segmentsToPreview.filter(seg => selectionState.get(seg.featureIndex) !== false);
       if (selected.length === 0) {
           alert('No shapes selected.');
           return;
@@ -14474,17 +14770,37 @@ function showCalTopoShapesPopup(features) {
       closePopup(popup);
       showSegmentsImportPreviewPopup(selected, {
           title: 'Import Segments from CalTopo',
-          description: 'Review the selected CalTopo shapes before importing them into Segments.',
-          onBack: () => showCalTopoShapesPopup(features)
+          description: 'Review the selected CalTopo shapes before importing them into Segments. Fetched shapes that are not imported will be marked unwanted so they stop showing up as new.',
+          onBack: () => showCalTopoShapesPopup(features),
+          onImported: imported => finishCalTopoFeatureImport(features, imported)
       });
   };
   btnContainer.appendChild(submitBtn);
 
-    segmentsToPreview.forEach((seg, index) => {
-        seg.featureIndex = index;
-    });
-
+    renderFilters();
     renderTable();
+}
+
+// After an import that started from a list of fetched CalTopo shapes: every
+// shape in `features` that was NOT imported (and is not a segment already) goes
+// on the hidden unwanted list, so it stops clogging the "only new" and
+// unaccounted views. Returns how many shapes were newly marked.
+function finishCalTopoFeatureImport(features, importedItems) {
+    const importedKeys = new Set((Array.isArray(importedItems) ? importedItems : [])
+        .map(item => item && item.feature ? getMapFeatureIdentityKey(item.feature) : '')
+        .filter(Boolean));
+    const leftOut = (Array.isArray(features) ? features : []).filter(feature => !importedKeys.has(getMapFeatureIdentityKey(feature)));
+    const marked = markMapFeaturesUnwanted(leftOut);
+    if (marked > 0) {
+        addActivityLogEntry('System', `Marked ${marked} CalTopo shape${marked === 1 ? '' : 's'} as unwanted (not imported)`);
+        showToast(`${marked} shape${marked === 1 ? '' : 's'} not imported ${marked === 1 ? 'was' : 'were'} marked unwanted.`, 'Import Complete');
+    }
+    if (isMapsPage()) {
+        renderUnaccountedFeaturesPanel();
+        if (typeof renderFeaturesList === 'function') renderFeaturesList();
+    }
+    refreshUnaccountedMapFeatureNotifications();
+    return marked;
 }
 
 function importCalTopoSegments(selected) {
@@ -14700,14 +15016,29 @@ async function verifyCalTopoAccount() {
   }
 }
 
+// Fetch the active map's shapes through the proxy and store them on the map.
+// Options:
+//   silent - do not open the "Import Shapes" popup afterwards.
+//   quiet  - background use (the 5-minute unaccounted check): no alerts at all,
+//            problems are only logged. Implies silent.
+// Resolves to the fetched feature list, or null when nothing was fetched.
 async function caltopo_request(btn = null, options = {}) {
-    const {silent = false} = options;
+    const {quiet = false} = options;
+    const silent = options.silent === true || quiet;
+    const report = message => {
+        if (quiet) {
+            console.warn(message);
+        } else {
+            alert(message);
+        }
+    };
   const bundle = loadBundle();
   const map = bundle.maps ? bundle.maps[0] : null;
-  if (!map || !map.id) return;
+  if (!map || !map.id) return null;
 
   const activeMapId = map.id;
   const activeMapDomain = normalizeCalTopoDomain(map.domain);
+  let fetchedFeatures = null;
 
   if (btn) {
     btn.disabled = true;
@@ -14718,8 +15049,8 @@ async function caltopo_request(btn = null, options = {}) {
   try {
     const proxyUrl = getCalTopoProxy();
     if (!proxyUrl) {
-      alert('No CalTopo Proxy configured. Please go to Settings and set the Proxy URL.');
-      return;
+      report('No CalTopo Proxy configured. Please go to Settings and set the Proxy URL.');
+      return null;
     }
 
     const controller = new AbortController();
@@ -14796,8 +15127,9 @@ async function caltopo_request(btn = null, options = {}) {
       if (features.length === 0) {
         console.warn('CalTopo Proxy Data received but no features filtered:', data);
         const rawCount = (data.state && data.state.features) ? data.state.features.length : 0;
-        alert(`No compatible shapes found on this map. (Total objects from proxy: ${rawCount}). Check your service account permissions or object types (polygon, line, marker, assignment).`);
+        report(`No compatible shapes found on this map. (Total objects from proxy: ${rawCount}). Check your service account permissions or object types (polygon, line, marker, assignment).`);
       } else {
+        fetchedFeatures = features;
         const b = loadBundle();
         if (b.maps && b.maps[0]) {
           b.maps[0].features = features;
@@ -14807,6 +15139,7 @@ async function caltopo_request(btn = null, options = {}) {
         if (isMapsPage()) {
           const urlParams = new URLSearchParams(window.location.search);
           const activeTab = urlParams.get('tab') || 'map';
+          renderUnaccountedFeaturesPanel();
           if (activeTab === 'features') {
             renderFeaturesList();
           } else if (activeTab === 'arcgis') {
@@ -14819,17 +15152,18 @@ async function caltopo_request(btn = null, options = {}) {
     } else {
       const errData = await proxyResp.json().catch(() => ({}));
       const errMsg = errData.message || errData.error || proxyResp.statusText;
-      alert(`Proxy Error: ${errMsg}`);
+      report(`Proxy Error: ${errMsg}`);
     }
   } catch (err) {
     console.error(err);
-    alert(`Could not fetch shapes: ${err.message}`);
+    report(`Could not fetch shapes: ${err.message}`);
   } finally {
     if (btn) {
       btn.disabled = false;
       btn.textContent = btn.dataset.originalText || 'Fetch Shapes';
     }
   }
+  return fetchedFeatures;
 }
 
 let arcgisView = null;
@@ -15022,13 +15356,13 @@ function renderFeaturesList() {
   }
 
   tbody.innerHTML = '';
-  features.forEach(f => {
+  sortMapFeaturesByName(features).forEach(f => {
     const tr = document.createElement('tr');
     const attrs = f.attributes || {};
     const name = attrs.name || 'Unnamed Graphic';
     const type = (f.geometry?.type || attrs.class || attrs.type || (attrs.vertices ? 'Shape' : 'Graphic'));
     const objectId = attrs.ObjectID || 'N/A';
-      const existingSegment = segmentNames.has(normalizeSegmentNameForMatch(name));
+      const existingSegment = segmentNames.has(normalizeSegmentNameForMatch(name)) || isMapFeatureAccountedFor(f, bundle);
       const importLabel = existingSegment ? 'Reimport' : 'Import';
 
     tr.innerHTML = `
@@ -15424,7 +15758,7 @@ function buildMapsPage() {
   container.innerHTML = `
     <section class="hero">
       <h1>Maps Management</h1>
-      <p>Manage your CalTopo maps here. Add a Map ID to embed the map and enable the website to fetch shapes (aka assignments). Assignments are imported as segments, lines are not imported. Also, use the toggle button to enable color scaling and opacity effects for the linked segments based on the color scale and opacity set in the settings page.</p>
+      <p>Manage your CalTopo maps here. Add a Map ID to embed the map and enable the website to fetch shapes (aka assignments). Assignments are imported as segments, lines are not imported. Also, use the toggle button to enable color scaling and opacity effects for the linked segments based on the color scale and opacity set in the settings page. Shapes on the map that are not imported and not marked unwanted are listed below the map, and the app checks for them every 5 minutes (see Settings).</p>
       
       <div class="tabs" style="display: flex; gap: 10px; margin-top: 20px;">
         <button id="tab-map" class="mini-pill ${activeTab === 'map' ? 'active' : ''}" style="padding: 10px 24px; font-size: 1rem; cursor: pointer;">CalTopo View</button>
@@ -15459,6 +15793,43 @@ function buildMapsPage() {
           </div>
         </div>
         <iframe id="map-iframe" style="width: 100%; height: calc(100% - 62px); border: none;" allow="geolocation" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+      </section>
+
+      <section id="unaccounted-features-section" class="table-card" style="display: none; margin-top: 20px;">
+        <div class="table-tools" style="display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap;">
+          <div style="flex: 1; min-width: 240px;">
+            <h2 style="margin: 0; font-size: 1.2rem; display: flex; align-items: center; gap: 10px;">
+              <span>Unaccounted Map Features</span>
+              <span id="unaccounted-features-count" class="mini-pill" style="padding: 3px 10px; font-size: 0.75rem;">0</span>
+            </h2>
+            <p style="margin: 8px 0 0; color: var(--muted); font-size: 0.9rem;">Shapes on the CalTopo map that are not imported as segments and not marked unwanted. Check the ones to import, then click <strong>Import Selected</strong>; everything left unchecked is marked unwanted so it stops showing up here.</p>
+          </div>
+          <div class="tool-actions" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <button id="check-unaccounted-btn" class="clear-btn" title="Check CalTopo for unaccounted segments" aria-label="Check for unaccounted segments" style="display: inline-flex; align-items: center; gap: 8px;">
+              <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="23 4 23 10 17 10"></polyline><polyline points="1 20 1 14 7 14"></polyline><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"></path></svg>
+              <span class="unaccounted-check-label">Check</span>
+            </button>
+            <button id="import-selected-unaccounted-btn" class="clear-btn" style="background: rgba(64, 192, 87, 0.12); border-color: rgba(64, 192, 87, 0.35);">Import Selected</button>
+          </div>
+        </div>
+        <div style="overflow-x: auto; padding-top: 10px;">
+          <table class="grid-table" style="width: 100%;">
+            <thead>
+              <tr>
+                <th style="width: 40px; text-align: center; padding: 12px;"><input type="checkbox" id="unaccounted-check-all" title="Check / uncheck all" style="width: 18px; height: 18px; cursor: pointer;"></th>
+                <th style="padding: 12px;">Segment</th>
+                <th style="padding: 12px;">Type</th>
+                <th style="padding: 12px;">Area (acres)</th>
+                <th style="padding: 12px;">Length (mi)</th>
+                <th style="padding: 12px;">Sweep (ft)</th>
+                <th style="padding: 12px;">Time per Sweep (hr)</th>
+                <th style="padding: 12px;">CalTopo</th>
+              </tr>
+            </thead>
+            <tbody id="unaccounted-features-body"></tbody>
+          </table>
+        </div>
+        <div id="unaccounted-features-status" style="margin-top: 10px; font-size: 0.85rem; color: var(--muted);"></div>
       </section>
 
       <section class="table-card" style="margin-top: 20px;">
@@ -15590,11 +15961,14 @@ function buildMapsPage() {
   let activeMapDomain = 'caltopo.com';
   let isFullMode = true;
 
+  const unaccountedSection = document.getElementById('unaccounted-features-section');
+
   const renderMaps = (skipScroll = false) => {
     if (!bundle.maps || bundle.maps.length === 0) {
       mapsList.innerHTML = '<p style="grid-column: 1/-1; text-align: center; color: var(--muted); padding: 40px;">No map added yet. Enter a Map ID above.</p>';
       mapsList.style.display = 'grid';
       mapViewSection.style.display = 'none';
+      if (unaccountedSection) unaccountedSection.style.display = 'none';
       mapIframe.src = '';
       activeMapId = null;
       activeMapTeamId = null;
@@ -15605,6 +15979,8 @@ function buildMapsPage() {
     mapsList.style.display = 'none';
 
     viewMap(map.id, map.name, map.domain, map.teamId, skipScroll);
+    if (unaccountedSection) unaccountedSection.style.display = 'block';
+    renderUnaccountedFeaturesPanel();
     if (activeTab === 'features') renderFeaturesList();
     if (activeTab === 'arcgis') renderArcGISMap();
   };
@@ -15661,7 +16037,321 @@ function buildMapsPage() {
   fetchShapesBtn.onclick = () => caltopo_request(fetchShapesBtn);
   if (refreshFeaturesBtn) refreshFeaturesBtn.onclick = () => caltopo_request(refreshFeaturesBtn);
 
+  const checkUnaccountedBtn = document.getElementById('check-unaccounted-btn');
+  if (checkUnaccountedBtn) {
+    checkUnaccountedBtn.onclick = () => checkUnaccountedMapFeaturesAndNotify({manual: true, button: checkUnaccountedBtn});
+  }
+  const importSelectedBtn = document.getElementById('import-selected-unaccounted-btn');
+  if (importSelectedBtn) {
+    importSelectedBtn.onclick = () => importSelectedUnaccountedFeatures();
+  }
+  const unaccountedCheckAll = document.getElementById('unaccounted-check-all');
+  if (unaccountedCheckAll) {
+    unaccountedCheckAll.onchange = () => {
+      const selection = getUnaccountedSelection();
+      getUnaccountedMapFeatures().forEach(feature => {
+        const key = getMapFeatureIdentityKey(feature);
+        if (unaccountedCheckAll.checked) selection.add(key);
+        else selection.delete(key);
+      });
+      renderUnaccountedFeaturesPanel();
+    };
+  }
+
   renderMaps(true);
+}
+
+// ---------------------------------------------------------------------------
+// Unaccounted map features: the import-preview style table below the CalTopo
+// map, the manual/automatic checks and their notifications.
+// ---------------------------------------------------------------------------
+
+// Checkbox state of the table below the map. The Maps page is rebuilt whenever
+// the server sends a change, so the selection lives outside the DOM; every box
+// starts unchecked (the user opts each shape in).
+function getUnaccountedSelection() {
+    if (!(window._unaccountedFeatureSelection instanceof Set)) {
+        window._unaccountedFeatureSelection = new Set();
+    }
+    return window._unaccountedFeatureSelection;
+}
+
+function renderUnaccountedFeaturesPanel() {
+    const tbody = document.getElementById('unaccounted-features-body');
+    if (!tbody) return;
+    const bundle = loadBundle();
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    const hasFeatures = !!(map && Array.isArray(map.features) && map.features.length);
+    const unaccounted = getUnaccountedMapFeatures(bundle);
+    const selection = getUnaccountedSelection();
+    // Drop selections for shapes that are no longer unaccounted.
+    const liveKeys = new Set(unaccounted.map(getMapFeatureIdentityKey));
+    Array.from(selection).forEach(key => {
+        if (!liveKeys.has(key)) selection.delete(key);
+    });
+
+    const countEl = document.getElementById('unaccounted-features-count');
+    if (countEl) countEl.textContent = String(unaccounted.length);
+    const checkAll = document.getElementById('unaccounted-check-all');
+    if (checkAll) {
+        checkAll.checked = unaccounted.length > 0 && unaccounted.every(feature => selection.has(getMapFeatureIdentityKey(feature)));
+        checkAll.disabled = unaccounted.length === 0;
+    }
+    const importBtn = document.getElementById('import-selected-unaccounted-btn');
+    if (importBtn) {
+        importBtn.textContent = selection.size > 0 ? `Import Selected (${selection.size})` : 'Import Selected';
+        importBtn.disabled = unaccounted.length === 0;
+    }
+    const statusEl = document.getElementById('unaccounted-features-status');
+    if (statusEl) {
+        const unwantedCount = getUnwantedMapFeatures(bundle).length;
+        const lastCheck = parseInt(getStorageItem(MAP_UNACCOUNTED_LAST_CHECK_STORAGE_KEY) || '0', 10);
+        const parts = [];
+        if (unwantedCount > 0) parts.push(`${unwantedCount} shape${unwantedCount === 1 ? '' : 's'} hidden as unwanted (restore them from Fetch Shapes).`);
+        if (lastCheck > 0) parts.push(`Last check ${new Date(lastCheck).toLocaleTimeString([], {hour: '2-digit', minute: '2-digit'})}.`);
+        parts.push(isMapUnaccountedAutoCheckEnabled(bundle)
+            ? 'Automatic check runs every 5 minutes.'
+            : 'Automatic check is turned off in Settings.');
+        statusEl.textContent = parts.join(' ');
+    }
+
+    tbody.innerHTML = '';
+    if (!hasFeatures) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 28px; color: var(--muted);">No features loaded yet. Use "Fetch Shapes" or the check button to load the map\'s shapes.</td></tr>';
+        return;
+    }
+    if (unaccounted.length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 28px; color: var(--muted);">Every shape on the map is imported or marked unwanted.</td></tr>';
+        return;
+    }
+
+    unaccounted.forEach(feature => {
+        const item = buildCalTopoSegmentImportItem(feature);
+        const key = getMapFeatureIdentityKey(feature);
+        const lengthVal = parseFloat(item.length) || 0;
+        const timeVal = lengthVal / 0.5;
+        const tr = document.createElement('tr');
+
+        const tdCheck = document.createElement('td');
+        tdCheck.style.textAlign = 'center';
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.className = 'unaccounted-checkbox';
+        chk.checked = selection.has(key);
+        chk.style.width = '18px';
+        chk.style.height = '18px';
+        chk.style.cursor = 'pointer';
+        chk.onchange = () => {
+            if (chk.checked) selection.add(key);
+            else selection.delete(key);
+            if (checkAll) checkAll.checked = unaccounted.every(f => selection.has(getMapFeatureIdentityKey(f)));
+            if (importBtn) importBtn.textContent = selection.size > 0 ? `Import Selected (${selection.size})` : 'Import Selected';
+        };
+        tdCheck.appendChild(chk);
+        tr.appendChild(tdCheck);
+
+        [
+            item.segment,
+            item.typeLabel,
+            item.area ? `${item.area} ac` : '',
+            item.length ? `${item.length} mi` : '',
+            `${item.sweep || 20} ft`,
+            timeVal > 0 ? `${timeVal.toFixed(2)} hr` : '',
+            feature?.attributes?.id && !isSyntheticCalTopoFeatureId(feature.attributes.id) ? feature.attributes.id : ''
+        ].forEach((val, idx) => {
+            const td = document.createElement('td');
+            const pill = document.createElement('div');
+            pill.className = 'pill-cell readonly-pill';
+            pill.style.padding = '8px 12px';
+            if (idx === 6) {
+                pill.style.fontFamily = 'monospace';
+                pill.style.fontSize = '0.8rem';
+            }
+            pill.textContent = val;
+            td.appendChild(pill);
+            tr.appendChild(td);
+        });
+        tbody.appendChild(tr);
+    });
+}
+
+// "Import Selected" below the map: the checked shapes become segments and every
+// unchecked unaccounted shape is marked unwanted so the table empties out.
+function importSelectedUnaccountedFeatures() {
+    const bundle = loadBundle();
+    const unaccounted = getUnaccountedMapFeatures(bundle);
+    if (!unaccounted.length) {
+        alert('There are no unaccounted map features to import.');
+        return;
+    }
+    const selection = getUnaccountedSelection();
+    const selected = unaccounted.filter(feature => selection.has(getMapFeatureIdentityKey(feature)));
+    if (!selected.length) {
+        alert('Check at least one map feature to import.');
+        return;
+    }
+    const leftOut = unaccounted.filter(feature => !selection.has(getMapFeatureIdentityKey(feature)));
+
+    importSegmentsAction(selected.map(buildCalTopoSegmentImportItem));
+    const marked = markMapFeaturesUnwanted(leftOut);
+    selection.clear();
+
+    const importedNames = selected.map(getMapFeatureDisplayName);
+    let summary = `Imported ${selected.length} segment${selected.length === 1 ? '' : 's'}: ${importedNames.join(', ')}.`;
+    if (marked > 0) {
+        addActivityLogEntry('System', `Marked ${marked} CalTopo shape${marked === 1 ? '' : 's'} as unwanted (not imported)`);
+        summary += ` ${marked} unchecked shape${marked === 1 ? ' was' : 's were'} marked unwanted.`;
+    }
+    showToast(summary, 'Import Complete');
+
+    renderUnaccountedFeaturesPanel();
+    if (typeof renderFeaturesList === 'function') renderFeaturesList();
+    refreshUnaccountedMapFeatureNotifications();
+}
+
+function getUnaccountedFeatureNotificationText(names) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.formatUnaccountedFeatureNotification === 'function') {
+        return utils.formatUnaccountedFeatureNotification(names);
+    }
+    return names.length ? `${names.join(', ')} not imported as segments.` : '';
+}
+
+function openUnaccountedMapFeatures() {
+    if (isMapsPage()) {
+        const section = document.getElementById('unaccounted-features-section');
+        if (section && section.style.display !== 'none') {
+            section.scrollIntoView({behavior: 'smooth', block: 'start'});
+            return;
+        }
+    }
+    navigateToPage('page10.html');
+}
+
+// Recompute the unaccounted list from what is stored (no network) and update
+// the bell / sidebar entry and the Maps nav highlight. Used at page load, after
+// imports and after unwanted-list changes. This never toasts: the toast is
+// raised by checkUnaccountedMapFeaturesAndNotify() each time a check finds
+// unaccounted shapes, so the sidebar's own one-time toast is claimed here.
+function refreshUnaccountedMapFeatureNotifications(bundle = null) {
+    const names = getUnaccountedMapFeatures(bundle || loadBundle()).map(getMapFeatureDisplayName);
+    window._unaccountedMapFeatureNames = names;
+    if (names.length) {
+        if (!window._shownToasts) window._shownToasts = new Set();
+        window._shownToasts.add(UNACCOUNTED_FEATURES_NOTIFICATION_TITLE + getUnaccountedFeatureNotificationText(names));
+    }
+    const navMaps = document.getElementById('nav-maps');
+    if (navMaps) {
+        navMaps.classList.toggle(UNACCOUNTED_FEATURES_NOTIFICATION_CLASS, names.length > 0);
+        navMaps.title = names.length > 0 ? `Maps - ${names.length} unaccounted feature${names.length === 1 ? '' : 's'}` : 'Maps';
+    }
+    updateNotifications();
+    return names;
+}
+
+// Fetch the CalTopo map again and notify about shapes that are neither
+// imported as segments nor marked unwanted. `manual` is the refresh button on
+// the Maps page (which also reports when everything is accounted for); the
+// automatic run is quiet and only speaks up when something is unaccounted.
+let _unaccountedCheckPromise = null;
+
+async function checkUnaccountedMapFeaturesAndNotify(options = {}) {
+    const {manual = false, button = null} = options;
+    if (_unaccountedCheckPromise) return _unaccountedCheckPromise;
+
+    const run = (async () => {
+        const bundle = loadBundle();
+        const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+        if (!map || !map.id) {
+            if (manual) alert('Add a CalTopo map first.');
+            return [];
+        }
+        if (!getCalTopoProxy()) {
+            if (manual) alert('No CalTopo Proxy configured. Please go to Settings and set the Proxy URL.');
+            return [];
+        }
+
+        let label = null;
+        if (button) {
+            button.disabled = true;
+            label = button.querySelector('.unaccounted-check-label');
+            if (label) label.textContent = 'Checking...';
+        }
+        try {
+            const fetched = await caltopo_request(null, {quiet: true});
+            setStorageItem(MAP_UNACCOUNTED_LAST_CHECK_STORAGE_KEY, String(Date.now()));
+            if (fetched === null && !manual) {
+                // Could not reach CalTopo: say nothing, the next run will try again.
+                return [];
+            }
+            if (fetched === null && manual) {
+                showToast('Could not fetch the map\'s shapes from CalTopo. Check the proxy status and try again.', 'Check Failed');
+                return [];
+            }
+
+            const names = refreshUnaccountedMapFeatureNotifications();
+            const text = getUnaccountedFeatureNotificationText(names);
+            const toastKey = UNACCOUNTED_FEATURES_NOTIFICATION_TITLE + text;
+            if (isMapsPage()) renderUnaccountedFeaturesPanel();
+
+            if (names.length === 0) {
+                if (manual) showToast('Every shape on the map is imported or marked unwanted.', 'All Accounted For');
+                return names;
+            }
+
+            // A message the user dismissed with its X stays quiet until the set of
+            // unaccounted shapes changes (a manual check always reports).
+            const dismissed = (loadBundle().dismissedNotifications || []).includes(toastKey);
+            if (manual || !dismissed) {
+                showToastNotification(UNACCOUNTED_FEATURES_NOTIFICATION_TITLE, text, openUnaccountedMapFeatures, UNACCOUNTED_FEATURES_NOTIFICATION_CLASS);
+                if (typeof Notification !== 'undefined' && Notification.permission === 'granted') {
+                    try {
+                        const notification = new Notification(UNACCOUNTED_FEATURES_NOTIFICATION_TITLE, {body: text, tag: 'sar-unaccounted-map-features'});
+                        notification.onclick = () => {
+                            try { window.focus(); } catch (e) {}
+                            openUnaccountedMapFeatures();
+                        };
+                    } catch (e) {}
+                }
+            }
+            return names;
+        } finally {
+            if (button) {
+                button.disabled = false;
+                if (label) label.textContent = 'Check';
+            }
+        }
+    })();
+
+    _unaccountedCheckPromise = run;
+    run.finally(() => {
+        if (_unaccountedCheckPromise === run) _unaccountedCheckPromise = null;
+    }).catch(() => {});
+    return run;
+}
+
+// Runs the automatic check every MAP_UNACCOUNTED_CHECK_INTERVAL_MS. The clock
+// is kept in localStorage so moving between pages does not restart it, and a
+// page that has been open for a while still checks on time.
+let _unaccountedCheckTimer = null;
+
+function startUnaccountedMapFeatureChecks() {
+    if (_unaccountedCheckTimer) return;
+    const tick = () => {
+        if (document.hidden) return;
+        const bundle = loadBundle();
+        if (!isMapUnaccountedAutoCheckEnabled(bundle)) return;
+        const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+        if (!map || !map.id || !getCalTopoProxy()) return;
+        const last = parseInt(getStorageItem(MAP_UNACCOUNTED_LAST_CHECK_STORAGE_KEY) || '0', 10) || 0;
+        if (Date.now() - last < MAP_UNACCOUNTED_CHECK_INTERVAL_MS) return;
+        // Claim the slot first so several open tabs do not all fetch at once.
+        setStorageItem(MAP_UNACCOUNTED_LAST_CHECK_STORAGE_KEY, String(Date.now()));
+        checkUnaccountedMapFeaturesAndNotify().catch(err => console.warn('Unaccounted map feature check failed:', err));
+    };
+    _unaccountedCheckTimer = setInterval(tick, 30000);
+    // Show what is already known (from the stored features) straight away.
+    refreshUnaccountedMapFeatureNotifications();
 }
 
 let isSyncing = false;
@@ -15974,6 +16664,16 @@ function mergeBundles(local, server) {
     }
     if (local.dismissedNotifications || server.dismissedNotifications) {
         merged.dismissedNotifications = { ...(server.dismissedNotifications || {}), ...(local.dismissedNotifications || {}) };
+    }
+    if (local.unwantedMapFeatures || server.unwantedMapFeatures) {
+        // Union of both devices' unwanted shapes, deduped by CalTopo id / name.
+        const seen = new Set();
+        merged.unwantedMapFeatures = [...getUnwantedMapFeatures(server), ...getUnwantedMapFeatures(local)].filter(entry => {
+            const key = entry.id ? `id:${entry.id}` : `name:${entry.name}`;
+            if (seen.has(key)) return false;
+            seen.add(key);
+            return true;
+        });
     }
     if (local.maps || server.maps) {
         const localMaps = Array.isArray(local.maps) ? local.maps : [];

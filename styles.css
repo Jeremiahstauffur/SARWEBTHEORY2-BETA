@@ -1536,6 +1536,14 @@ footer {
   padding: 8px 14px;
 }
 
+#nav-maps.map-features-unaccounted {
+  background-color: transparent !important;
+  color: #4dabf7 !important;
+  border: 2px solid #4dabf7 !important;
+  border-radius: 999px;
+  padding: 8px 14px;
+}
+
 /* Notification Sidebar */
 .notif-toast.par-check-due {
   border: 2px solid #ff8c00;
@@ -1562,6 +1570,15 @@ footer {
 
 .notif-toast.profile-incomplete svg {
   color: #ffa500 !important;
+}
+
+.notif-toast.map-features-unaccounted {
+  border: 2px solid #4dabf7;
+  color: #4dabf7;
+}
+
+.notif-toast.map-features-unaccounted svg {
+  color: #4dabf7 !important;
 }
 
 .notification-sidebar {
