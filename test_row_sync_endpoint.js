@@ -258,6 +258,59 @@ const run = async () => {
         assert.strictEqual(page.status, 401);
     });
 
+    // A device whose CORS preflight is blocked (some Windows antivirus/proxy
+    // setups swallow the OPTIONS request) re-sends the very same call in a
+    // shape that needs no preflight: credentials as _h_x_... query parameters,
+    // a JSON body labelled text/plain, and PUT tunnelled through POST. The
+    // server must understand that shape, without loosening authentication.
+    console.log('\nPreflight-free (compatibility) requests');
+
+    const compatParams = (extra = {}) => new URLSearchParams({
+        _h_x_user_name: TEST_USER.username,
+        _h_x_user_pin: TEST_USER.pin,
+        _h_x_user_password: TEST_USER.pin,
+        ...extra
+    }).toString();
+
+    await check('a row POST with query-string credentials and a text/plain body is applied', async () => {
+        const resp = await fetch(`${baseUrl}/api/v1/${BUCKET}/rows?${compatParams()}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'text/plain;charset=UTF-8'},
+            body: JSON.stringify({
+                fileName: FILE_NAME,
+                changes: [{path: ['pages', 'index', 'rows', '1'], value: ['South Valley', '99', '99']}]
+            })
+        });
+        assert.strictEqual(resp.status, 200);
+        assert.deepStrictEqual(storedBundle().pages.index.rows[1], ['South Valley', '99', '99']);
+    });
+
+    await check('a PUT tunnelled through POST reaches the PUT route', async () => {
+        const lastModified = new Date(Date.now() + 600000).toISOString();
+        const params = compatParams({_method: 'PUT', _h_x_last_modified: lastModified});
+        const resp = await fetch(`${baseUrl}/api/v1/${BUCKET}/bundle?${params}`, {
+            method: 'POST',
+            headers: {'Content-Type': 'text/plain;charset=UTF-8'},
+            body: JSON.stringify({...seedBundle(), lastModified, theme: 'light'})
+        });
+        assert.strictEqual(resp.status, 200);
+        assert.strictEqual(storedBundle().theme, 'light');
+    });
+
+    await check('query-string credentials still have to be valid', async () => {
+        const params = new URLSearchParams({
+            _h_x_user_name: 'Nobody',
+            _h_x_user_password: 'wrong-pin'
+        }).toString();
+        const resp = await fetch(`${baseUrl}/api/v1/${BUCKET}/page/index?${params}`);
+        assert.strictEqual(resp.status, 401);
+    });
+
+    await check('only the app\'s own X- headers can be injected from the query string', async () => {
+        const resp = await fetch(`${baseUrl}/api/v1/${BUCKET}/page/index?_h_authorization=Basic%20abc`);
+        assert.strictEqual(resp.status, 401, 'a non X- header must not be smuggled in as authentication');
+    });
+
     console.log(`\nAll ${passed} endpoint checks passed.`);
 };
 

@@ -96,6 +96,10 @@ function createSandbox(options = {}) {
         // The auth requests abort themselves on a timeout, so the sandbox needs
         // the same primitive a browser provides.
         AbortController,
+        // getAuthHeaders() checks whether the extra headers are a FormData
+        // instance, so the sandbox needs that browser global too.
+        FormData: typeof FormData !== 'undefined' ? FormData : class FormData {},
+        XMLHttpRequest: options.XMLHttpRequest,
         localStorage,
         sessionStorage: localStorage,
         document,
@@ -171,7 +175,7 @@ const DEFAULT_URL = 'https://sarwebtheory2-production.up.railway.app';
             return failedToFetch();
         };
 
-        const {resp, serverUrl} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1});
+        const {resp, serverUrl} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1, transports: ['json']});
         assert.deepStrictEqual(tried, [
             'https://old-server.example.com/api/auth/login',
             `${DEFAULT_URL}/api/auth/login`
@@ -195,7 +199,7 @@ const DEFAULT_URL = 'https://sarwebtheory2-production.up.railway.app';
         assert.strictEqual(app.isBlockedMixedContentUrl('http://localhost:3000'), false,
             'loopback is a secure context and must stay usable');
 
-        const {serverUrl} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1});
+        const {serverUrl} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1, transports: ['json']});
         assert.deepStrictEqual(tried, [`${DEFAULT_URL}/api/auth/login`],
             'the mixed-content address must be skipped instead of failing with "Failed to fetch"');
         assert.strictEqual(serverUrl, DEFAULT_URL);
@@ -207,7 +211,7 @@ const DEFAULT_URL = 'https://sarwebtheory2-production.up.railway.app';
         app.fetch = failedToFetch;
 
         await assert.rejects(
-            () => app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1}),
+            () => app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1, transports: ['json']}),
             (error) => {
                 const message = String(error.message);
                 assert.ok(/Cannot reach the sync server/i.test(message), message);
@@ -260,7 +264,8 @@ const DEFAULT_URL = 'https://sarwebtheory2-production.up.railway.app';
 
         const {resp} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {
             attempts: 3,
-            timeoutMs: 150
+            timeoutMs: 150,
+            transports: ['json']
         });
         assert.ok(resp.ok, 'the retry must recover a login the first attempt lost');
         assert.strictEqual(calls, 2, 'exactly one retry was needed');
@@ -299,12 +304,134 @@ const DEFAULT_URL = 'https://sarwebtheory2-production.up.railway.app';
         app.fetch = failedToFetch;
 
         await assert.rejects(
-            () => app.postAuthRequest('/api/auth/login', {}, {attempts: 1}),
+            () => app.postAuthRequest('/api/auth/login', {}, {attempts: 1, transports: ['json']}),
             (error) => {
                 assert.ok(/offline/i.test(error.message), error.message);
                 return true;
             }
         );
+    }
+
+    // --- 10. A device whose CORS preflight is blocked (the Windows 10 laptop:
+    //         "tried the default good sync url with no success") still logs in
+    //         through the preflight-free request, and remembers it ----------
+    {
+        const app = createSandbox();
+        const seen = [];
+        app.fetch = (url, options = {}) => {
+            const contentType = (options.headers || {})['Content-Type'] || '';
+            seen.push(contentType);
+            // Anything that is not a CORS "simple request" needs an OPTIONS
+            // preflight first, and on this device that preflight never gets an
+            // answer - which the browser reports as "Failed to fetch".
+            if (/application\/json/i.test(contentType)) return failedToFetch();
+            return okResponse(url);
+        };
+
+        const {resp, transport} = await app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1});
+        assert.ok(resp.ok, 'the preflight-free request must be able to log in');
+        assert.strictEqual(transport, 'simple');
+        assert.ok(/text\/plain/i.test(seen[seen.length - 1]),
+            `the fallback must be sent as a simple request, got: ${seen.join(' | ')}`);
+        assert.strictEqual(app.isPreflightFallbackEnabled(), true,
+            'the device must remember that it needs the preflight-free path');
+    }
+
+    // --- 11. Once remembered, the authenticated data calls avoid the
+    //         preflight too: no X-... headers, no application/json, and
+    //         DELETE tunnelled through POST ---------------------------------
+    {
+        const app = createSandbox();
+        app.setPreflightFallbackEnabled(true);
+        app.setCookie('sar-user-name-v1', 'jane');
+        app.setCookie('sar-user-password-v1', '1234');
+
+        const calls = [];
+        app.fetch = (url, options = {}) => {
+            calls.push({url, options});
+            return Promise.resolve({ok: true, status: 200, url, json: () => Promise.resolve({})});
+        };
+
+        await app.apiFetch(`${DEFAULT_URL}/api/v1/CASE1/bundle`, {
+            method: 'DELETE',
+            headers: app.getAuthHeaders()
+        });
+
+        const call = calls[0];
+        assert.strictEqual(call.options.method, 'POST',
+            'DELETE is not a CORS simple method, so it must be tunnelled through POST');
+        assert.ok(call.url.includes('_method=DELETE'), call.url);
+        assert.ok(call.url.includes('_h_x_user_name=jane'), call.url);
+        assert.ok(call.url.includes('_h_x_user_password=1234'), call.url);
+        Object.keys(call.options.headers).forEach((name) => {
+            assert.ok(!/^x-/i.test(name), `custom header ${name} would re-introduce the preflight`);
+        });
+        assert.ok(!/application\/json/i.test(call.options.headers['Content-Type'] || ''),
+            'an application/json body would re-introduce the preflight');
+
+        // With the fallback off, the request must stay exactly as it was.
+        app.setPreflightFallbackEnabled(false);
+        calls.length = 0;
+        await app.apiFetch(`${DEFAULT_URL}/api/v1/CASE1/bundle`, {
+            method: 'DELETE',
+            headers: app.getAuthHeaders()
+        });
+        assert.strictEqual(calls[0].options.method, 'DELETE');
+        assert.strictEqual(calls[0].url, `${DEFAULT_URL}/api/v1/CASE1/bundle`);
+        assert.strictEqual(calls[0].options.headers['X-User-Name'], 'jane');
+    }
+
+    // --- 12. The "Test" button distinguishes a blocked preflight from a
+    //         server that is really unreachable ----------------------------
+    {
+        const app = createSandbox();
+        app.fetch = (url, options = {}) => {
+            const contentType = (options.headers || {})['Content-Type'] || '';
+            if (/application\/json/i.test(contentType)) return failedToFetch();
+            return Promise.resolve({ok: true, status: 400, url, json: () => Promise.resolve({})});
+        };
+
+        const diagnosis = await app.diagnoseSyncServerConnection(DEFAULT_URL);
+        assert.strictEqual(diagnosis.ok, true);
+        assert.strictEqual(diagnosis.preflightBlocked, true,
+            'a health check that works while the JSON login fails means the preflight is blocked');
+        const report = diagnosis.lines.join('\n');
+        assert.ok(/compatibility mode/i.test(report), report);
+
+        // Nothing reachable at all must NOT be reported as a preflight problem.
+        const dead = createSandbox();
+        dead.fetch = failedToFetch;
+        const deadDiagnosis = await dead.diagnoseSyncServerConnection(DEFAULT_URL);
+        assert.strictEqual(deadDiagnosis.ok, false);
+        assert.strictEqual(deadDiagnosis.preflightBlocked, false);
+        assert.strictEqual(deadDiagnosis.serverReachable, false);
+    }
+
+    // --- 13. A backend that has not been redeployed with the compatibility
+    //         middleware answers the preflight-free request with a 500. That
+    //         must not be mistaken for a working path ---------------------
+    {
+        const app = createSandbox();
+        app.fetch = (url, options = {}) => {
+            const contentType = (options.headers || {})['Content-Type'] || '';
+            if (/application\/json/i.test(contentType)) return failedToFetch();
+            return Promise.resolve({ok: false, status: 500, url, json: () => Promise.resolve({})});
+        };
+
+        await assert.rejects(
+            () => app.postAuthRequest('/api/auth/login', {username: 'jane', pin: '1234'}, {attempts: 1}),
+            (error) => {
+                assert.ok(/Cannot reach the sync server/i.test(error.message), error.message);
+                return true;
+            }
+        );
+        assert.strictEqual(app.isPreflightFallbackEnabled(), false,
+            'a 500 from an outdated server must not switch this device to compatibility mode');
+
+        const diagnosis = await app.diagnoseSyncServerConnection(DEFAULT_URL);
+        assert.strictEqual(diagnosis.ok, false);
+        assert.strictEqual(diagnosis.preflightBlocked, false);
+        assert.ok(/updated\/redeployed/i.test(diagnosis.lines.join('\n')), diagnosis.lines.join('\n'));
     }
 
     // app.js schedules its own background sync timers on load; exit before they

@@ -619,7 +619,49 @@ app.use(cors({
     methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
     allowedHeaders: ['Content-Type', 'Authorization', 'X-User-Name', 'X-User-Pin', 'X-User-Password', 'X-Last-Modified']
 }));
-app.use(express.json({limit: '50mb'}));
+
+// Compatibility path for devices that cannot complete a CORS preflight.
+//
+// A cross-origin request only skips the browser's OPTIONS preflight when it is
+// a "simple request": GET/HEAD/POST, no custom headers, and a content type of
+// text/plain, multipart/form-data or application/x-www-form-urlencoded. The app
+// normally sends application/json plus X-User-... headers, which always require
+// that preflight - and some Windows security suites (antivirus "web shield" /
+// HTTPS scanning) and older corporate proxies silently drop OPTIONS requests.
+// The client then cannot reach this server at all, even though the site itself
+// loads (see postAuthRequest/apiFetch in app.js).
+//
+// Such a device re-sends the identical request in a preflight-free shape:
+//   * headers as query parameters: ?_h_x_user_name=...&_h_x_user_password=...
+//   * a JSON body labelled text/plain
+//   * PUT/DELETE tunnelled through POST with ?_method=PUT
+// This middleware translates that shape back into a normal request, so every
+// route below stays unchanged.
+app.use((req, res, next) => {
+    const query = req.query || {};
+    Object.keys(query).forEach((key) => {
+        const match = /^_h_(.+)$/.exec(key);
+        if (!match) return;
+        const headerName = match[1].replace(/_/g, '-').toLowerCase();
+        // Only the app's own X-... headers may be injected this way.
+        if (!headerName.startsWith('x-')) return;
+        if (req.headers[headerName]) return;
+        const value = Array.isArray(query[key]) ? query[key][0] : query[key];
+        if (value === undefined || value === null || value === '') return;
+        req.headers[headerName] = String(value);
+    });
+
+    const override = String(query._method || '').toUpperCase();
+    if (req.method === 'POST' && ['PUT', 'DELETE', 'PATCH'].includes(override)) {
+        req.method = override;
+    }
+
+    next();
+});
+
+// text/plain is accepted because a preflight-free request cannot declare
+// application/json; the body is still JSON, so it is parsed the same way.
+app.use(express.json({limit: '50mb', type: ['application/json', 'application/*+json', 'text/plain']}));
 
 // Auth Endpoints
 app.post('/api/auth/register', (req, res) => {

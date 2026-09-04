@@ -988,7 +988,7 @@ async function loadServerSettings() {
     _serverSettingsLoading = true;
     try {
         const serverUrl = getSyncServerUrl();
-        const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/auth/settings`, {
+        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/auth/settings`, {
             headers: {
                 'X-User-Name': creds.name,
                 'X-User-Password': creds.password
@@ -1020,7 +1020,7 @@ async function saveServerSettings(settings) {
     } catch (e) {}
     try {
         const serverUrl = getSyncServerUrl();
-        await fetch(`${serverUrl.replace(/\/$/, '')}/api/auth/settings`, {
+        await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/auth/settings`, {
             method: 'PUT',
             headers: {
                 'Content-Type': 'application/json',
@@ -1052,7 +1052,7 @@ async function fetchUserHistory() {
     if (!serverUrl) return [];
 
     try {
-        const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/auth/history`, {
+        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/auth/history`, {
             headers: {
                 'X-User-Name': creds.name
             }
@@ -1184,8 +1184,124 @@ function describeConnectionError(error) {
     return error.message || 'unreachable';
 }
 
+// A cross-origin POST that carries "Content-Type: application/json" (or any
+// custom X-... header) is NOT a CORS "simple request": before it is sent the
+// browser must first get an OPTIONS preflight answered. Plenty of Windows
+// security suites with HTTPS/web scanning, along with older corporate proxies,
+// silently swallow that OPTIONS request - the page itself loads fine, yet every
+// API call dies with the same opaque "Failed to fetch". The workaround is to
+// re-send the identical JSON body as a preflight-free simple request
+// ("text/plain" content type, no custom headers); the server parses it exactly
+// the same way. Once that has been shown to be necessary the choice is
+// remembered for this device so the authenticated data calls use it too.
+const SYNC_NO_PREFLIGHT_STORAGE_KEY = 'sar-sync-no-preflight-v1';
+const SIMPLE_REQUEST_CONTENT_TYPE = 'text/plain;charset=UTF-8';
+
+function isPreflightFallbackEnabled() {
+    return getCookie(SYNC_NO_PREFLIGHT_STORAGE_KEY) === '1';
+}
+
+function setPreflightFallbackEnabled(enabled) {
+    setCookie(SYNC_NO_PREFLIGHT_STORAGE_KEY, enabled ? '1' : '');
+}
+
+// XMLHttpRequest, wrapped in the small part of the fetch Response surface this
+// code uses. It is the last resort for a device where fetch() itself is broken
+// (an injected extension/AV script, or a browser old enough that its fetch does
+// not handle the request) but the underlying network is fine.
+function postViaXhr(url, body, timeoutMs = AUTH_REQUEST_TIMEOUT_MS, headers = {}) {
+    return new Promise((resolve, reject) => {
+        if (typeof XMLHttpRequest === 'undefined') {
+            const error = new Error('XMLHttpRequest is not available');
+            error.isUnsupported = true;
+            return reject(error);
+        }
+        const xhr = new XMLHttpRequest();
+        xhr.open('POST', url, true);
+        xhr.timeout = timeoutMs;
+        // Only simple-request headers here: a custom header would re-introduce
+        // the preflight this transport exists to avoid.
+        xhr.setRequestHeader('Content-Type', headers['Content-Type'] || SIMPLE_REQUEST_CONTENT_TYPE);
+        xhr.onload = () => resolve({
+            ok: xhr.status >= 200 && xhr.status < 300,
+            status: xhr.status,
+            url,
+            headers: {
+                get: name => xhr.getResponseHeader(name)
+            },
+            text: () => Promise.resolve(xhr.responseText || ''),
+            json: () => Promise.resolve(JSON.parse(xhr.responseText || 'null'))
+        });
+        xhr.onerror = () => reject(new TypeError('Failed to fetch'));
+        xhr.ontimeout = () => {
+            const error = new Error(`timed out after ${Math.round(timeoutMs / 1000)}s`);
+            error.isTimeout = true;
+            reject(error);
+        };
+        xhr.send(body);
+    });
+}
+
+// The ordered list of ways to deliver one auth POST. The plain JSON request is
+// tried (and retried, for a backend waking up from idle) first because it is
+// the normal path; the preflight-free variants only come into play on a device
+// whose browser or security software blocks the preflight.
+function buildAuthTransportPlan(attempts, options = {}) {
+    const jsonTransport = {
+        name: 'json',
+        label: 'standard request',
+        send: (url, body, timeoutMs) => fetchWithTimeout(url, {
+            method: 'POST',
+            headers: {'Content-Type': 'application/json'},
+            body,
+            cache: 'no-store'
+        }, timeoutMs)
+    };
+    const simpleTransport = {
+        name: 'simple',
+        label: 'compatibility mode (no CORS preflight)',
+        send: (url, body, timeoutMs) => fetchWithTimeout(url, {
+            method: 'POST',
+            headers: {'Content-Type': SIMPLE_REQUEST_CONTENT_TYPE},
+            body,
+            cache: 'no-store'
+        }, timeoutMs)
+    };
+    const xhrTransport = {
+        name: 'xhr',
+        label: 'compatibility mode (XMLHttpRequest)',
+        send: (url, body, timeoutMs) => postViaXhr(url, body, timeoutMs)
+    };
+
+    // A device already known to need the preflight-free path leads with it, so
+    // it does not have to sit through the failing standard request every time.
+    const available = isPreflightFallbackEnabled()
+        ? [simpleTransport, xhrTransport, jsonTransport]
+        : [jsonTransport, simpleTransport, xhrTransport];
+
+    const allowed = Array.isArray(options.transports) && options.transports.length
+        ? available.filter(transport => options.transports.includes(transport.name))
+        : available;
+
+    const plan = [];
+    allowed.forEach(transport => {
+        // Only the primary transport is worth repeating: the retries exist for a
+        // cold backend, and if a transport is blocked outright, repeating it
+        // just makes the user wait.
+        const repeats = transport === allowed[0] ? attempts : 1;
+        for (let i = 0; i < repeats; i++) {
+            plan.push(transport);
+        }
+    });
+    return plan;
+}
+
 // GET /api/health on a candidate server. Used by the "Test" button on the Set
 // Server popup so a device can be diagnosed without guessing at a login.
+// A plain GET is already a CORS simple request, so when it fails the follow-up
+// opaque ("no-cors") probe tells the two very different causes apart: nothing
+// reached the server at all, or the server answered but the browser refused to
+// hand the response to the page.
 async function checkSyncServerReachable(serverUrl, timeoutMs = AUTH_REQUEST_TIMEOUT_MS) {
     const base = String(serverUrl || '').trim().replace(/\/$/, '');
     if (!base) return {ok: false, url: '', detail: 'no server address set'};
@@ -1193,26 +1309,125 @@ async function checkSyncServerReachable(serverUrl, timeoutMs = AUTH_REQUEST_TIME
         return {ok: false, url: base, detail: 'blocked: this page is served over HTTPS and cannot call an http:// server'};
     }
     try {
-        const resp = await fetchWithTimeout(`${base}/api/health`, {method: 'GET'}, timeoutMs);
+        const resp = await fetchWithTimeout(`${base}/api/health`, {method: 'GET', cache: 'no-store'}, timeoutMs);
         return {ok: resp.ok, url: base, status: resp.status, detail: `answered HTTP ${resp.status}`};
     } catch (e) {
-        return {ok: false, url: base, detail: describeConnectionError(e)};
+        const detail = describeConnectionError(e);
+        const opaque = await probeServerOpaquely(base, timeoutMs);
+        if (opaque.reached) {
+            return {
+                ok: false,
+                url: base,
+                corsBlocked: true,
+                detail: `${detail}, but the server DID answer a plain browser request \u2014 something on this device (antivirus/web-shield HTTPS scanning, a browser extension, or a proxy) is blocking the app\u2019s cross-origin requests`
+            };
+        }
+        return {ok: false, url: base, detail};
+    }
+}
+
+// POST /api/auth/login with a deliberately empty body, in the shape whose
+// delivery is being tested. The server answers 400 ("Username and PIN are
+// required") without touching any account, so ANY HTTP status proves this
+// device can reach the server that way.
+async function probeAuthEndpoint(serverUrl, {simple = false, timeoutMs = AUTH_REQUEST_TIMEOUT_MS} = {}) {
+    const base = String(serverUrl || '').trim().replace(/\/$/, '');
+    if (!base) return {ok: false, detail: 'no server address set'};
+    try {
+        const resp = await fetchWithTimeout(`${base}/api/auth/login`, {
+            method: 'POST',
+            headers: {'Content-Type': simple ? SIMPLE_REQUEST_CONTENT_TYPE : 'application/json'},
+            body: '{}',
+            cache: 'no-store'
+        }, timeoutMs);
+        return {ok: true, status: resp.status, detail: `answered HTTP ${resp.status}`};
+    } catch (e) {
+        return {ok: false, detail: describeConnectionError(e)};
+    }
+}
+
+// Full diagnosis of one server address, written for the "Test" button.
+//
+// It matters WHICH request fails. A plain GET /api/health carries no custom
+// headers and no JSON content type, so the browser sends it without asking
+// permission first; the login POST does need that CORS preflight. When the
+// health check succeeds but the JSON POST does not, the preflight is what is
+// being blocked - and the preflight-free POST proving it can still get through
+// is exactly what the app falls back to.
+async function diagnoseSyncServerConnection(serverUrl, timeoutMs = AUTH_REQUEST_TIMEOUT_MS) {
+    const base = String(serverUrl || '').trim().replace(/\/$/, '');
+    const lines = [];
+    const health = await checkSyncServerReachable(base, timeoutMs);
+    lines.push(health.ok
+        ? `\u2713 the server is up and answering (${health.detail})`
+        : `\u2717 basic check failed: ${health.detail}`);
+
+    const standard = await probeAuthEndpoint(base, {timeoutMs});
+    lines.push(standard.ok
+        ? '\u2713 the app\u2019s normal login request gets through'
+        : `\u2717 the app\u2019s normal login request fails: ${standard.detail}`);
+
+    if (standard.ok) {
+        return {ok: true, preflightBlocked: false, serverReachable: true, lines};
+    }
+
+    const simple = await probeAuthEndpoint(base, {simple: true, timeoutMs});
+    if (simple.ok && simple.status >= 500) {
+        // The request itself arrived, but this server build cannot read a
+        // text/plain body yet.
+        lines.push(`\u2717 compatibility mode reaches the server but it answered HTTP ${simple.status} \u2014 the sync server needs to be updated/redeployed to accept it.`);
+        return {ok: false, preflightBlocked: false, serverReachable: true, lines};
+    }
+    if (simple.ok) {
+        lines.push('\u2713 compatibility mode (no CORS preflight) DOES get through \u2014 the app will use it on this device from now on.');
+        lines.push('Cause: something on this device (antivirus/internet-security HTTPS or "web shield" scanning, a browser extension, or a proxy) is blocking the browser\u2019s permission check for cross-site requests.');
+        return {ok: true, preflightBlocked: true, serverReachable: true, lines};
+    }
+
+    lines.push(`\u2717 compatibility mode also fails: ${simple.detail}`);
+    return {
+        ok: false,
+        preflightBlocked: false,
+        serverReachable: health.ok,
+        lines
+    };
+}
+
+// Fires a request the browser cannot read the response of ("no-cors"). It still
+// resolves when the server was actually contacted, which is why it can prove
+// that a failure was the browser's CORS/preflight check rather than the network.
+async function probeServerOpaquely(serverUrl, timeoutMs = AUTH_REQUEST_TIMEOUT_MS) {
+    const base = String(serverUrl || '').trim().replace(/\/$/, '');
+    if (!base) return {reached: false};
+    try {
+        await fetchWithTimeout(`${base}/api/health?_=${Date.now()}`, {
+            method: 'GET',
+            mode: 'no-cors',
+            cache: 'no-store'
+        }, timeoutMs);
+        return {reached: true};
+    } catch (e) {
+        return {reached: false, error: e};
     }
 }
 
 // POST to a pre-login auth endpoint (/api/auth/login, /api/auth/register),
-// retrying each address (a cold backend often misses the first attempt) and
-// moving on to the next candidate whenever the request never reached a server
-// at all. Resolves with the first response received, whatever its HTTP status,
-// and remembers the server that answered so every later data request goes to
-// the same place. When no candidate can be reached it throws an error naming
-// the addresses tried and what to do about it, instead of the opaque
-// "Failed to fetch" the browser produces.
+// retrying each address (a cold backend often misses the first attempt), then
+// falling back to the preflight-free transports (for a device whose security
+// software blocks the CORS preflight), and only then moving on to the next
+// candidate address. Resolves with the first response received, whatever its
+// HTTP status, and remembers both the server that answered and the transport
+// that got through so every later data request goes the same way. When no
+// candidate can be reached it throws an error naming the addresses tried and
+// what to do about it, instead of the opaque "Failed to fetch" the browser
+// produces.
 async function postAuthRequest(endpointPath, payload, options = {}) {
     const candidates = getAuthServerUrlCandidates();
     const attempts = Math.max(1, options.attempts || AUTH_REQUEST_ATTEMPTS);
     const timeoutMs = options.timeoutMs || AUTH_REQUEST_TIMEOUT_MS;
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const plan = buildAuthTransportPlan(attempts, options);
+    const body = JSON.stringify(payload);
     const failures = [];
 
     for (const serverUrl of candidates) {
@@ -1221,29 +1436,52 @@ async function postAuthRequest(endpointPath, payload, options = {}) {
             continue;
         }
         let lastError = null;
-        for (let attempt = 1; attempt <= attempts; attempt++) {
+        const blockedLabels = [];
+        for (let step = 0; step < plan.length; step++) {
+            const transport = plan[step];
             if (onProgress) {
-                onProgress({serverUrl, attempt, attempts});
+                onProgress({
+                    serverUrl,
+                    attempt: step + 1,
+                    attempts: plan.length,
+                    transport: transport.name,
+                    label: transport.label
+                });
             }
             try {
-                const resp = await fetchWithTimeout(`${serverUrl}${endpointPath}`, {
-                    method: 'POST',
-                    headers: {'Content-Type': 'application/json'},
-                    body: JSON.stringify(payload)
-                }, timeoutMs);
+                const resp = await transport.send(`${serverUrl}${endpointPath}`, body, timeoutMs);
+                // A backend that has not been updated with the compatibility
+                // middleware yet cannot read a text/plain body and answers 5xx.
+                // Treat that as "this transport does not work here" rather than
+                // as a login result, and above all do not remember it.
+                if (transport.name !== 'json' && resp.status >= 500) {
+                    lastError = new Error(`answered HTTP ${resp.status} (server does not support compatibility mode)`);
+                    if (!blockedLabels.includes(transport.label)) {
+                        blockedLabels.push(transport.label);
+                    }
+                    continue;
+                }
                 if (serverUrl !== getLocalSyncServerUrl().replace(/\/$/, '')) {
                     setLocalSyncServerUrl(serverUrl);
                 }
-                return {resp, serverUrl};
+                // Remember whether this device needs the preflight-free path, so
+                // the authenticated sync calls made after login use it as well.
+                setPreflightFallbackEnabled(transport.name !== 'json');
+                return {resp, serverUrl, transport: transport.name};
             } catch (e) {
+                if (e && e.isUnsupported) continue;
                 if (!isRetriableConnectionError(e)) throw e;
                 lastError = e;
-                if (attempt < attempts) {
-                    await delayMs(AUTH_RETRY_DELAY_MS * attempt);
+                if (!blockedLabels.includes(transport.label)) {
+                    blockedLabels.push(transport.label);
+                }
+                const nextTransport = plan[step + 1];
+                if (nextTransport && nextTransport === transport) {
+                    await delayMs(AUTH_RETRY_DELAY_MS * (step + 1));
                 }
             }
         }
-        failures.push(`${serverUrl} (${describeConnectionError(lastError)}, ${attempts} attempts)`);
+        failures.push(`${serverUrl} (${describeConnectionError(lastError)}; ${plan.length} attempts, incl. ${blockedLabels.join(' + ')})`);
     }
 
     const isOffline = typeof navigator !== 'undefined' && navigator && navigator.onLine === false;
@@ -1252,7 +1490,16 @@ async function postAuthRequest(endpointPath, payload, options = {}) {
         failures.length ? `Tried: ${failures.join('; ')}.` : '',
         isOffline
             ? 'This device reports that it is offline \u2014 connect it to Wi\u2011Fi or mobile data and try again.'
-            : 'This device can load the app but cannot open a connection to the server. Common causes: a network that blocks the server (guest/agency Wi\u2011Fi, a VPN, or content filtering \u2014 try mobile data instead), or a wrong address. Use "Set Server" on the login popup, then press "Test" to check the address.'
+            : [
+                'This device can load the app but no request of any kind reaches the server.',
+                'On a Windows laptop this is almost always software on the device itself:',
+                'antivirus / internet-security "web shield" or HTTPS scanning (ESET, Avast/AVG, Kaspersky, Bitdefender, McAfee, Norton),',
+                'a browser extension (ad/script blocker, privacy shield),',
+                'a VPN or corporate proxy, or Windows/browser certificate trust being out of date.',
+                'Try: an incognito/private window with extensions off, then temporarily disable the antivirus web/HTTPS scanning, then a different network (mobile hotspot).',
+                `To confirm the server is up, open ${DEFAULT_SYNC_SERVER_URL}/api/health directly in this browser \u2014 if that shows "status":"ok" while the app still cannot connect, the block is on this device.`,
+                'The "Set Server" popup also has a "Test" button that reports exactly what is failing.'
+            ].join(' ')
     ].filter(Boolean).join(' '));
 }
 
@@ -1315,10 +1562,14 @@ function showLoginPopup() {
         loginBtn.textContent = 'Connecting\u2026';
         try {
             const {resp} = await postAuthRequest('/api/auth/login', { username, pin }, {
-                onProgress: ({attempt, attempts}) => {
-                    loginBtn.textContent = attempt > 1
+                onProgress: ({attempt, attempts, transport}) => {
+                    if (attempt === 1) {
+                        loginBtn.textContent = 'Connecting\u2026';
+                        return;
+                    }
+                    loginBtn.textContent = transport === 'json'
                         ? `Connecting\u2026 (try ${attempt} of ${attempts})`
-                        : 'Connecting\u2026';
+                        : `Retrying\u2026 (${attempt} of ${attempts}, compatibility mode)`;
                 }
             });
             const data = await readJsonResponse(resp);
@@ -1547,22 +1798,38 @@ function showSetServerPopup() {
         testBtn.textContent = 'Testing\u2026';
         statusLine.textContent = `Testing ${url}\u2026`;
         try {
-            const result = await checkSyncServerReachable(url);
+            const result = await diagnoseSyncServerConnection(url);
+            // A device that only gets through without the CORS preflight is
+            // switched over here, so the very next login uses the path the test
+            // just proved works.
+            if (result.preflightBlocked) {
+                setPreflightFallbackEnabled(true);
+            }
+            let message = `${url}\n${result.lines.join('\n')}`;
             if (result.ok) {
-                statusLine.textContent = `\u2713 ${url} is reachable (${result.detail}).`;
+                statusLine.textContent = message;
                 return;
             }
-            let message = `\u2717 ${url}: ${result.detail}.`;
+
             const fallback = DEFAULT_SYNC_SERVER_URL.replace(/\/$/, '');
             if (url !== fallback) {
                 statusLine.textContent = `${message}\nTesting the built-in server ${fallback}\u2026`;
-                const fallbackResult = await checkSyncServerReachable(fallback);
+                const fallbackResult = await diagnoseSyncServerConnection(fallback);
+                if (fallbackResult.preflightBlocked) {
+                    setPreflightFallbackEnabled(true);
+                }
                 message += fallbackResult.ok
-                    ? `\nThe built-in server ${fallback} IS reachable \u2014 use that address instead.`
-                    : `\nThe built-in server ${fallback} also failed: ${fallbackResult.detail}. This device\u2019s network is blocking the connection \u2014 try mobile data or another Wi\u2011Fi.`;
-            } else {
-                message += '\nThis device\u2019s network is blocking the connection \u2014 try mobile data or another Wi\u2011Fi.';
+                    ? `\n\nThe built-in server ${fallback} DOES work \u2014 press "Use Default", then "Set".`
+                    : `\n\nThe built-in server ${fallback} also failed:\n${fallbackResult.lines.join('\n')}`;
+                if (fallbackResult.ok) {
+                    statusLine.textContent = message;
+                    return;
+                }
             }
+
+            message += result.serverReachable
+                ? '\n\nThe server itself answers, so the block is on this device: turn off the antivirus web/HTTPS scanning, or open the app in a private window with extensions disabled.'
+                : '\n\nNothing reaches the server from this device. Try a different network (mobile hotspot), turn off any VPN, and check that antivirus HTTPS scanning is not intercepting the connection.';
             statusLine.textContent = message;
         } finally {
             testBtn.disabled = false;
@@ -2757,7 +3024,7 @@ async function deleteCaseEverywhere(caseNumber) {
         // was written under.
         const bucket = caseNumberToBucket(clean);
         try {
-            const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}`, {
+            const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}`, {
                 method: 'DELETE',
                 headers: getAuthHeaders()
             });
@@ -15056,6 +15323,56 @@ function getAuthHeaders(extra = {}) {
     return { ...headers, ...extra };
 }
 
+// Rewrites an authenticated API request so it needs no CORS preflight. Every
+// data call normally identifies itself with X-User-... headers and sends
+// "application/json", and both of those force the browser to ask permission
+// with an OPTIONS request first. On a device where that OPTIONS request is
+// swallowed (Windows antivirus HTTPS/web scanning, an old proxy) the request
+// dies with "Failed to fetch" even though the server is perfectly reachable, so
+// the same information is moved into the query string and the body is sent as
+// text/plain - a CORS "simple request" the browser sends straight away. The
+// server understands both shapes (see sync-server.js).
+function buildNoPreflightRequest(url, options = {}) {
+    const headers = {...(options.headers || {})};
+    const params = [];
+
+    Object.keys(headers).forEach(name => {
+        if (!/^x-/i.test(name)) return;
+        const value = headers[name];
+        delete headers[name];
+        if (value === undefined || value === null || value === '') return;
+        params.push(`_h_${name.toLowerCase().replace(/-/g, '_')}=${encodeURIComponent(value)}`);
+    });
+
+    if (/^application\/json/i.test(headers['Content-Type'] || '')) {
+        headers['Content-Type'] = SIMPLE_REQUEST_CONTENT_TYPE;
+    }
+
+    // Only GET/HEAD/POST are simple methods; anything else is tunnelled through
+    // a POST that names the real method in the query string.
+    const method = String(options.method || 'GET').toUpperCase();
+    let effectiveMethod = method;
+    if (method !== 'GET' && method !== 'HEAD' && method !== 'POST') {
+        effectiveMethod = 'POST';
+        params.push(`_method=${encodeURIComponent(method)}`);
+    }
+
+    const separator = url.includes('?') ? '&' : '?';
+    const rewrittenUrl = params.length ? `${url}${separator}${params.join('&')}` : url;
+    return {url: rewrittenUrl, init: {...options, method: effectiveMethod, headers}};
+}
+
+// The single entry point for authenticated API calls: identical to fetch(),
+// except that on a device known to need it the request is rewritten into a
+// preflight-free form first.
+function apiFetch(url, options = {}) {
+    if (!isPreflightFallbackEnabled()) {
+        return fetch(url, options);
+    }
+    const rewritten = buildNoPreflightRequest(String(url), options);
+    return fetch(rewritten.url, rewritten.init);
+}
+
 // Await a promise but give up after `ms` milliseconds so a slow or unreachable
 // server can never hang page initialization. Resolves with undefined on timeout
 // (and swallows rejections) because callers only need a best-effort attempt and
@@ -15097,7 +15414,7 @@ async function syncWithServer() {
         const isNewDevice = !getStorageItem(BUNDLE_STORAGE_KEY);
         
         // 1. Sync entire file list
-        const listResp = await fetch(`${apiBase}/all-files?_=${Date.now()}`, {
+        const listResp = await apiFetch(`${apiBase}/all-files?_=${Date.now()}`, {
             headers: getAuthHeaders()
         });
         if (listResp.ok) {
@@ -15138,7 +15455,7 @@ async function syncWithServer() {
 
         // 2. Sync active bundle
         const endpoint = isNewDevice ? 'latest' : 'bundle';
-        const resp = await fetch(`${apiBase}/${endpoint}?_=${Date.now()}`, {
+        const resp = await apiFetch(`${apiBase}/${endpoint}?_=${Date.now()}`, {
             headers: getAuthHeaders()
         });
         if (resp.ok) {
@@ -15253,7 +15570,7 @@ async function pushBundleDelta(bundle) {
 
     const baseUrl = serverUrl.replace(/\/$/, '');
     try {
-        const resp = await fetch(`${baseUrl}/api/v1/${bucket}/rows`, {
+        const resp = await apiFetch(`${baseUrl}/api/v1/${bucket}/rows`, {
             method: 'POST',
             headers: getAuthHeaders({'X-Last-Modified': new Date().toISOString()}),
             body: JSON.stringify({fileName: bundle.fileName, changes}),
@@ -15288,7 +15605,7 @@ async function fetchServerPageData(pageName) {
     if (!serverUrl || !bucket || !getUserCredentials()) return null;
 
     try {
-        const resp = await fetch(
+        const resp = await apiFetch(
             `${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/page/${encodeURIComponent(pageName)}?_=${Date.now()}`,
             {headers: getAuthHeaders()}
         );
@@ -15346,7 +15663,7 @@ async function pushBundleToServer(bundle, isReconcileRetry = false) {
     try {
         const baseUrl = serverUrl.replace(/\/$/, '');
         // 1. Push to the general active bundle endpoint
-        const resp = await fetch(`${baseUrl}/api/v1/${bucket}/bundle`, {
+        const resp = await apiFetch(`${baseUrl}/api/v1/${bucket}/bundle`, {
             method: 'PUT',
             headers: headers,
             body: JSON.stringify(bundle),
@@ -15356,7 +15673,7 @@ async function pushBundleToServer(bundle, isReconcileRetry = false) {
         // 2. Also push to a file-specific endpoint to aid discovery and prevent truncation
         if (bundle.fileName) {
             const fileKey = bundle.fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-            await fetch(`${baseUrl}/api/v1/${bucket}/${fileKey}`, {
+            await apiFetch(`${baseUrl}/api/v1/${bucket}/${fileKey}`, {
                 method: 'PUT',
                 headers: headers,
                 body: JSON.stringify(bundle),
@@ -15381,7 +15698,7 @@ async function pushBundleToServer(bundle, isReconcileRetry = false) {
 
 async function reconcileAndRepushBundle(localBundle, baseUrl, bucket, headers) {
     try {
-        const resp = await fetch(`${baseUrl}/api/v1/${bucket}/bundle?_=${Date.now()}`, { headers });
+        const resp = await apiFetch(`${baseUrl}/api/v1/${bucket}/bundle?_=${Date.now()}`, { headers });
         if (!resp.ok) return;
         const serverBundle = await resp.json();
         if (!serverBundle || typeof serverBundle !== 'object') return;
@@ -15410,7 +15727,7 @@ async function pushFileListToServer(files) {
     });
     
     try {
-        const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/all-files`, {
+        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/all-files`, {
             method: 'PUT',
             headers: headers,
             body: JSON.stringify(files),
@@ -15436,7 +15753,7 @@ async function notifyActiveUser(user) {
     const headers = getAuthHeaders();
     
     try {
-        const resp = await fetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/user-${user.pin}`, {
+        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/user-${user.pin}`, {
             method: 'PUT',
             headers: headers,
             body: JSON.stringify({deviceId: getDeviceId(), lastModified: new Date().toISOString()}),
