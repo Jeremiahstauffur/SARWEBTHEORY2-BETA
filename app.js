@@ -12,9 +12,19 @@ const USER_PASSWORD_STORAGE_KEY = 'sar-user-password-v1';
 const CALTOPO_PROXY_STORAGE_KEY = 'sar-caltopo-proxy-v1';
 const CALTOPO_CREDS_STORAGE_KEY = 'sar-caltopo-creds-v1';
 const DEVICE_ID_STORAGE_KEY = 'sar-device-id-v1';
-// Snapshot of the search file as the server last confirmed it. Every save is
-// diffed against this so a device uploads only the rows it actually changed.
-const SYNC_SNAPSHOT_STORAGE_KEY = 'sar-sync-snapshot-v1';
+// Row changes this device has made but not yet delivered to the server. Every
+// save is diffed against the copy that was on this device just before it, and
+// only those rows are queued here and uploaded; the queue survives a reload or
+// a dropped connection and is retried until the server confirms it.
+const SYNC_OUTBOX_STORAGE_KEY = 'sar-sync-outbox-v1';
+// Which CASE # (sync bucket) the locally stored search file belongs to, so a
+// copy left over from another case is never mistaken for this one's.
+const BUNDLE_BUCKET_STORAGE_KEY = 'sar-bundle-bucket-v1';
+// Older builds kept a second full copy of the search file under this key.
+const LEGACY_SYNC_SNAPSHOT_STORAGE_KEY = 'sar-sync-snapshot-v1';
+// How often a page asks the database whether the other devices changed
+// anything. The answer is tiny when nothing changed.
+const SYNC_POLL_INTERVAL_MS = 4000;
 // const DEFAULT_BUCKET = 'MNSAR14';
 const SAVE_BUTTON_MIN_LOADING_MS = 1000;
 const SAVE_BUTTON_SUCCESS_MS = 3000;

@@ -939,15 +939,20 @@ const getFilePath = (bucket, key) => {
 // ----------------------------------------------------------------------------
 // Row-level sync
 //
-// A device never uploads a whole page any more. When a cell loses focus (or a
-// button is pressed) it posts ONLY the rows it changed to /rows, and it reads
-// back a single page from /page/:page. Because the merge happens here, two
-// devices editing two different rows of the same table no longer overwrite each
-// other. These routes are declared before the generic /:bucket/:key routes so
-// they are not swallowed by them.
+// A device never uploads a whole search file any more (except once, to seed a
+// CASE # the database has never seen). When a cell loses focus (or a button is
+// pressed) it posts ONLY the rows it changed to /rows, and it keeps its screen
+// current by polling /state, which answers with just the sections that changed
+// since the device last looked. Because the merge happens here, two devices
+// editing at the same time never overwrite each other. These routes are
+// declared before the generic /:bucket/:key routes so they are not swallowed
+// by them.
 // ----------------------------------------------------------------------------
 const STORE_BUNDLE_KEY = 'bundle';
-const MAX_ROW_CHANGES = 2000;
+const MAX_ROW_CHANGES = 5000;
+// How many recently applied batch ids to remember per CASE #, so a device that
+// lost the response and re-sends the same batch does not append its row twice.
+const MAX_REMEMBERED_BATCHES = 500;
 
 const storeFileKey = (fileName) => String(fileName || '').replace(/[^a-zA-Z0-9.\-_]/g, '_');
 
@@ -977,13 +982,64 @@ const readStoredBundle = async (bucket, userName) => {
     return {bundle: parsed, userPin: row.userPin};
 };
 
-// Apply a device's changed rows onto the stored search file.
+// The stored bundle's lastModified doubles as the version a device polls with,
+// so two writes in the same millisecond must still produce distinct values.
+const nextLastModified = (previousIso) => {
+    let ms = Date.now();
+    const previousMs = previousIso ? new Date(previousIso).getTime() : NaN;
+    if (Number.isFinite(previousMs) && ms <= previousMs) { ms = previousMs + 1; }
+    return new Date(ms).toISOString();
+};
+
+// Persist a bundle under both the shared "bundle" key and its file-name key.
+const writeStoredBundle = async (bucket, userName, userPin, bundle, nowIso) => {
+    const value = JSON.stringify(bundle);
+    await runAsync(
+        "INSERT OR REPLACE INTO store (bucket, `key`, value, userName, userPin, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+        [bucket, STORE_BUNDLE_KEY, value, userName, userPin, nowIso]
+    );
+    const fileKey = storeFileKey(bundle.fileName);
+    if (fileKey && fileKey !== STORE_BUNDLE_KEY) {
+        await runAsync(
+            "INSERT OR REPLACE INTO store (bucket, `key`, value, userName, userPin, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
+            [bucket, fileKey, value, userName, userPin, nowIso]
+        );
+    }
+};
+
+const recentBatchIds = new Map(); // bucket -> Set of batch ids already applied
+
+const wasBatchApplied = (bucket, batchId) => {
+    if (!batchId) { return false; }
+    const seen = recentBatchIds.get(bucket);
+    return !!(seen && seen.has(batchId));
+};
+
+const rememberBatch = (bucket, batchId) => {
+    if (!batchId) { return; }
+    let seen = recentBatchIds.get(bucket);
+    if (!seen) { seen = new Set(); recentBatchIds.set(bucket, seen); }
+    seen.add(batchId);
+    while (seen.size > MAX_REMEMBERED_BATCHES) {
+        seen.delete(seen.values().next().value);
+    }
+};
+
+const parseListParam = (value) => String(value || '')
+    .split(',')
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+// Apply a device's changed rows onto the stored search file. The response
+// echoes the sections those rows touched (minus the heavy ones) so the device
+// can put the merged result on screen without a second request.
 app.post('/api/v1/:bucket/rows', authMiddleware, async (req, res) => {
     const {bucket} = req.params;
     const userName = req.user.username || 'Unknown';
     const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
     const isSuperAdmin = userPin === '1976';
     const changes = req.body && Array.isArray(req.body.changes) ? req.body.changes : null;
+    const batchId = req.body && typeof req.body.batchId === 'string' ? req.body.batchId.slice(0, 128) : '';
 
     if (!changes) {
         return res.status(400).json({error: 'A changes array is required'});
@@ -1014,34 +1070,75 @@ app.post('/api/v1/:bucket/rows', authMiddleware, async (req, res) => {
                     }
                 };
             }
-
-            const {bundle, applied} = syncDelta.applyBundleChanges(stored.bundle, changes);
-            const nowIso = new Date().toISOString();
-            bundle.lastModified = nowIso;
-
-            const value = JSON.stringify(bundle);
-            await runAsync(
-                "INSERT OR REPLACE INTO store (bucket, `key`, value, userName, userPin, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
-                [bucket, STORE_BUNDLE_KEY, value, userName, userPin, nowIso]
-            );
-
-            const fileKey = storeFileKey(bundle.fileName);
-            if (fileKey && fileKey !== STORE_BUNDLE_KEY) {
-                await runAsync(
-                    "INSERT OR REPLACE INTO store (bucket, `key`, value, userName, userPin, updatedAt) VALUES (?, ?, ?, ?, ?, ?)",
-                    [bucket, fileKey, value, userName, userPin, nowIso]
-                );
+            // A retry of a batch that already landed (the device never saw the
+            // answer): report success without applying it a second time.
+            if (wasBatchApplied(bucket, batchId)) {
+                return {
+                    status: 200,
+                    body: {success: true, applied: 0, duplicate: true, lastModified: stored.bundle.lastModified || null}
+                };
             }
 
-            await applyChangesToTables(userName, bucket, bundle, applied);
+            const {bundle, applied} = syncDelta.applyBundleChanges(stored.bundle, changes);
+            const nowIso = nextLastModified(stored.bundle.lastModified);
+            bundle.lastModified = nowIso;
+            const touched = syncDelta.collectTouchedSections(applied);
+            syncDelta.stampSections(bundle, touched, nowIso);
 
-            return {status: 200, body: {success: true, applied: applied.length, lastModified: nowIso}};
+            await writeStoredBundle(bucket, userName, userPin, bundle, nowIso);
+            await applyChangesToTables(userName, bucket, bundle, applied);
+            rememberBatch(bucket, batchId);
+
+            const state = syncDelta.pickBundleSections(bundle, {
+                keys: Array.from(touched.keys),
+                pages: touched.allPages ? null : Array.from(touched.pages),
+                skip: syncDelta.HEAVY_KEYS
+            });
+
+            return {status: 200, body: {success: true, applied: applied.length, lastModified: nowIso, state}};
         });
 
         res.status(result.status).json(result.body);
     } catch (err) {
         console.error('[SYNC] row change failed:', err.message);
         res.status(500).json({error: 'Failed to apply row changes'});
+    }
+});
+
+// What a device polls to see the other devices' changes.
+//
+//   ?since=<lastModified>  the version the device already has. When nothing
+//                          changed the answer is just {modified:false}; otherwise
+//                          only the sections that changed since then are sent.
+//   ?skip=uploads,maps     heavy sections the current page does not display.
+//   ?pages=page2,page4     restrict the pages that are sent (default: all).
+app.get('/api/v1/:bucket/state', authMiddleware, async (req, res) => {
+    const {bucket} = req.params;
+    const since = typeof req.query.since === 'string' ? req.query.since : '';
+    const skip = parseListParam(req.query.skip);
+    const wantedPages = req.query.pages ? parseListParam(req.query.pages) : null;
+    if (!since) {
+        trackBucketAccess(req.user.username, bucket);
+    }
+    try {
+        const stored = await readStoredBundle(bucket, req.user.username);
+        if (!stored) {
+            return res.status(404).json({found: false, error: 'No stored search file for this CASE #'});
+        }
+        const lastModified = stored.bundle.lastModified || null;
+        if (since && lastModified && since === lastModified) {
+            return res.json({found: true, modified: false, lastModified});
+        }
+        const changed = syncDelta.sectionsChangedSince(stored.bundle, since);
+        let pages = changed.pages;
+        if (wantedPages) {
+            pages = pages ? pages.filter((page) => wantedPages.includes(page)) : wantedPages;
+        }
+        const bundle = syncDelta.pickBundleSections(stored.bundle, {keys: changed.keys, pages, skip});
+        res.json({found: true, modified: true, lastModified, bundle});
+    } catch (err) {
+        console.error('[SYNC] state read failed:', err.message);
+        res.status(500).json({error: 'Failed to read state'});
     }
 });
 
@@ -1201,8 +1298,81 @@ app.delete('/api/v1/:bucket', authMiddleware, async (req, res) => {
     }
 });
 
+// Whole-file upload of the active search file. With the row-level sync this is
+// only used to seed a CASE # the database has never seen (?seed=1), so it runs
+// under the same per-case lock as the row writes and refuses to replace a file
+// that already exists - two devices seeding at once cannot wipe each other out.
+// Without ?seed=1 it still accepts a whole file (imports, older clients), but
+// the stored copy is stamped with server time so state polls stay consistent.
+const putActiveBundle = async (req, res) => {
+    const {bucket} = req.params;
+    const userName = req.user.username || 'Unknown';
+    const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
+    const isSuperAdmin = userPin === '1976';
+    const seedOnly = String(req.query.seed || '') === '1';
+    const incoming = req.body;
+
+    if (!incoming || typeof incoming !== 'object' || Array.isArray(incoming)) {
+        return res.status(400).json({error: 'A search file object is required'});
+    }
+
+    trackBucketAccess(userName, bucket);
+
+    try {
+        const result = await withBucketLock(bucket, async () => {
+            const stored = await readStoredBundle(bucket, userName);
+            if (stored) {
+                if (stored.userPin === '1976' && !isSuperAdmin) {
+                    return {
+                        status: 403,
+                        body: {error: 'Conflict', message: 'Changes by Super-Admin cannot be overwritten by a regular user.'}
+                    };
+                }
+                if (seedOnly) {
+                    return {
+                        status: 409,
+                        body: {
+                            error: 'This CASE # already has a search file',
+                            alreadyExists: true,
+                            lastModified: stored.bundle.lastModified || null
+                        }
+                    };
+                }
+                // Legacy whole-file clients: never let an older copy replace a
+                // newer one (they reconcile and retry on this answer).
+                const incomingMs = new Date(req.headers['x-last-modified'] || incoming.lastModified || Date.now()).getTime();
+                const storedMs = new Date(stored.bundle.lastModified || 0).getTime();
+                if ((stored.userPin === '1976') === isSuperAdmin && Number.isFinite(incomingMs) && incomingMs < storedMs) {
+                    return {
+                        status: 403,
+                        body: {error: 'Conflict', message: 'Incoming data is older than server data.'}
+                    };
+                }
+            }
+
+            const bundle = JSON.parse(JSON.stringify(incoming));
+            const nowIso = nextLastModified(stored ? stored.bundle.lastModified : null);
+            bundle.lastModified = nowIso;
+            syncDelta.stampSections(bundle, null, nowIso);
+
+            await writeStoredBundle(bucket, userName, userPin, bundle, nowIso);
+            decomposeBundleToTables(userName, STORE_BUNDLE_KEY, bundle)
+                .catch((decomposeErr) => console.error('[DB] decompose error:', decomposeErr.message));
+
+            return {status: 200, body: {success: true, lastModified: nowIso}};
+        });
+        res.status(result.status).json(result.body);
+    } catch (err) {
+        console.error('[SYNC] bundle upload failed:', err.message);
+        res.status(500).json({error: 'Failed to save data'});
+    }
+};
+
 app.put('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
     const {bucket, key} = req.params;
+    if (key === STORE_BUNDLE_KEY) {
+        return putActiveBundle(req, res);
+    }
     const userName = req.user.username || 'Unknown';
     trackBucketAccess(req.user.username, bucket);
     const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
