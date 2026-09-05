@@ -2062,7 +2062,12 @@ tr.log-sweeps-due::after {
     height: 180px;
 }
 
-/* IC Report (Search Log page, between the charts and the Search Log table) */
+/* IC Report (Forms page, "IC Report" button; drawn in the interactive form shell) */
+.ic-report-panel {
+  max-width: 900px;
+  margin: 0 auto;
+}
+
 .ic-report-panel .ic-report-heading {
   margin: 0 0 2px;
   font-size: 1.25rem;
@@ -2085,7 +2090,7 @@ tr.log-sweeps-due::after {
 }
 
 .ic-report-textarea {
-  min-height: 220px;
+  min-height: 320px;
   resize: vertical;
   line-height: 1.5;
   box-sizing: border-box;

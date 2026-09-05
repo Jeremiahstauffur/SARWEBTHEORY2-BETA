@@ -4,8 +4,9 @@
 // free-text field and a "form completed" checkbox next to a small name field.
 // Ticking the checkbox tags whatever name was typed into the small field (or
 // the signed-in user when it is blank) with the completion date/time. The form
-// lives on the Search Log page between the two charts and the Search Log
-// table, and the Case # Printout prints it in the same spot.
+// lives on the Forms page under its own "IC Report" button (next to Incident
+// Times), has a "Print Report" button that prints just that report, and the
+// Case # Printout still includes it after the charts.
 //
 // Run with: node test_ic_report.js
 
@@ -32,7 +33,7 @@ function makeElement(depth = 0) {
             toggle(c, force) { if (force === undefined ? !classes.has(c) : force) classes.add(c); else classes.delete(c); }
         },
         children: [],
-        appendChild(child) { el.children.push(child); return child; },
+        appendChild(child) { el.children.push(child); if (child && typeof child === 'object') child._parentEl = el; return child; },
         append() {},
         remove() {},
         addEventListener() {},
@@ -46,20 +47,28 @@ function makeElement(depth = 0) {
         focus() {},
         scrollIntoView() {},
         textContent: '',
-        innerHTML: '',
         value: '',
         checked: false,
         readOnly: false,
         clientWidth: 300,
         clientHeight: 150
     };
+    // Setting innerHTML detaches the current children, as in a real DOM.
+    Object.defineProperty(el, 'innerHTML', {
+        get: () => el._innerHTML || '',
+        set: (value) => {
+            el._innerHTML = String(value);
+            el.children.forEach(child => { if (child && typeof child === 'object') child._parentEl = null; });
+            el.children = [];
+        }
+    });
     Object.defineProperty(el, 'parentElement', {
-        get: () => (depth >= 3 ? null : (el._parent = el._parent || makeElement(depth + 1)))
+        get: () => el._parentEl || (depth >= 3 ? null : (el._parent = el._parent || makeElement(depth + 1)))
     });
     return el;
 }
 
-function createSandbox(store, page = 'page4') {
+function createSandbox(store, page = 'page5') {
     const localStorage = {
         getItem: (k) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
         setItem: (k, v) => { store[k] = String(v); },
@@ -86,7 +95,16 @@ function createSandbox(store, page = 'page4') {
         activeElement: null,
         hidden: false,
         visibilityState: 'visible',
-        createElement: () => makeElement(),
+        // Elements created by the app register themselves under their id, like
+        // a real DOM, so getElementById finds the form fields the app built.
+        createElement: () => {
+            const el = makeElement();
+            Object.defineProperty(el, 'id', {
+                get: () => el._id || '',
+                set: (value) => { el._id = String(value); byId[el._id] = el; }
+            });
+            return el;
+        },
         createElementNS: () => makeElement(),
         createTextNode: () => makeElement(),
         getElementById: (id) => (byId[id] = byId[id] || makeElement()),
@@ -192,10 +210,32 @@ const app = createSandbox(store);
     app.saveBundle(bundle);
 }
 
-// --- 3. The Search Log page form: title, case # subtitle, text, checkbox+name -
+// --- 3. The Forms page: an "IC Report" button next to Incident Times showing
+//        just the form (title, case # subtitle, text, checkbox + name) --------
 {
-    app.buildSearchLogTable();
     const byId = app.__byId;
+    const container = app.document.getElementById('interactive-form-container');
+    app.buildFormsPage();
+    const btnIcReport = byId['btn-ic-report'];
+    assert.strictEqual(typeof btnIcReport.onclick, 'function', 'the Forms page wires the IC Report button');
+    assert.strictEqual(btnIcReport.classList.contains('active'), false, 'Task Assignment is the default subpage');
+
+    btnIcReport.onclick();
+    assert.strictEqual(btnIcReport.classList.contains('active'), true, 'the IC Report button becomes the active form button');
+    assert.strictEqual(byId['btn-task-assignment'].classList.contains('active'), false);
+    assert.strictEqual(byId['btn-incident-times'].classList.contains('active'), false);
+    assert.strictEqual(byId['btn-manage-forms'].classList.contains('active'), false);
+    assert.strictEqual(byId['task-view-title'].textContent, 'IC Report Form');
+    assert.strictEqual(byId['task-pills-container'].style.display, 'none', 'the task # pills are hidden; only the IC Report is shown');
+    assert.strictEqual(byId['manage-forms-view'].style.display, 'none');
+    assert.strictEqual(container.children.length, 1, 'the form shell holds just the IC Report');
+    assert.strictEqual(container.children[0].id, 'ic-report-panel');
+    assert.strictEqual(container.children[0].children[0].textContent, 'IC Report', 'the form is titled IC Report');
+
+    // The header offers Download All Forms plus a Print Report for just this report.
+    const headerButtons = byId['print-btn-container'].children.map(b => String(b.innerHTML).replace(/<[^>]*>/g, ''));
+    assert.deepStrictEqual(headerButtons, ['Download All Forms', 'Print Report']);
+
     const caseEl = byId['ic-report-case'];
     const textArea = byId['ic-report-text'];
     const check = byId['ic-report-completed'];
@@ -253,9 +293,67 @@ const app = createSandbox(store);
     check.checked = true;
     check.onchange();
     assert.strictEqual(app.loadBundle().icReport.completedBy, 'Chris Ray');
+
+    // A full page rebuild (e.g. another device's edit) keeps the same form.
+    app.buildFormsPage();
+    assert.strictEqual(container.children.length, 1, 'a rebuild does not duplicate the form');
+    assert.strictEqual(byId['ic-report-text'], textArea, 'a rebuild keeps the existing fields');
+    assert.strictEqual(byId['task-view-title'].textContent, 'IC Report Form', 'the IC Report stays selected across rebuilds');
+
+    // Switching to another form button removes the IC Report from the shell.
+    byId['btn-incident-times'].onclick();
+    assert.strictEqual(byId['btn-incident-times'].classList.contains('active'), true);
+    assert.strictEqual(btnIcReport.classList.contains('active'), false);
+    assert.strictEqual(byId['task-view-title'].textContent, 'Incident Times Report');
+    assert.ok(!container.children.some(child => child.id === 'ic-report-panel'), 'the IC Report is gone once another form is chosen');
+    btnIcReport.onclick();
+    assert.strictEqual(byId['ic-report-text'].value, 'Search concluded. Debrief at 1500.', 'coming back shows the saved report again');
 }
 
-// --- 4. The Case # Printout prints it after the charts, before the log table --
+// --- 4. "Print Report" prints only the IC Report ----------------------------
+{
+    let written = '';
+    app.window.open = () => ({document: {write(html) { written += html; }, close() {}}});
+    const printBtn = app.__byId['print-btn-container'].children.find(b => String(b.innerHTML).includes('Print Report'));
+    printBtn.onclick();
+    assert.ok(written.includes('<title>IC Report - Case-7</title>'), 'the print window is the IC Report of this case');
+    assert.ok(written.includes('<h2 class="ic-report-title">IC Report</h2>'), 'titled IC Report');
+    assert.ok(written.includes('<div class="ic-report-case">Case # Case-7</div>'), 'subtitled with the case #');
+    assert.ok(written.includes('Search concluded. Debrief at 1500.'), 'the report text is printed');
+    assert.ok(written.includes('Completed by Chris Ray at '), 'the completion tag is printed');
+    assert.ok(written.includes('.ic-report-text {'), 'the print styles of the report are included');
+    assert.ok(!written.includes('search-log-table'), 'no Search Log table in the IC Report printout');
+    assert.ok(!written.includes('Activity Log'), 'no activity log in the IC Report printout');
+    assert.ok(!written.includes('class="task-form"'), 'no task assignment forms in the IC Report printout');
+
+    // No popup allowed -> a message, not a crash.
+    let alerted = '';
+    app.window.open = () => null;
+    app.alert = (msg) => { alerted = msg; };
+    app.printIcReport();
+    assert.ok(alerted.includes('popups'), alerted);
+}
+
+// --- 5. The Search Log page no longer carries the form ------------------------
+{
+    const page4 = fs.readFileSync(path.join(__dirname, 'page4.html'), 'utf8');
+    assert.ok(!page4.includes('ic-report-panel'), 'page4.html has no IC Report panel');
+    const page5 = fs.readFileSync(path.join(__dirname, 'page5.html'), 'utf8');
+    const incidentAt = page5.indexOf('id="btn-incident-times"');
+    const icAt = page5.indexOf('id="btn-ic-report"');
+    const manageAt = page5.indexOf('id="btn-manage-forms"');
+    assert.ok(incidentAt > -1 && icAt > -1 && manageAt > -1, 'page5.html has the three form buttons');
+    assert.ok(incidentAt < icAt && icAt < manageAt, 'the IC Report button sits right next to Incident Times');
+    assert.ok(/id="btn-ic-report">IC Report</.test(page5), 'the button is labelled IC Report');
+
+    // Building the Search Log page must not touch the form (it lives elsewhere).
+    const logStore = {...store};
+    const logApp = createSandbox(logStore, 'page4');
+    logApp.buildSearchLogTable();
+    assert.strictEqual(logApp.__byId['ic-report-text'], undefined, 'the Search Log page never renders the IC Report fields');
+}
+
+// --- 6. The Case # Printout still prints it after the charts, before the table -
 {
     let written = '';
     app.window.open = () => ({document: {write(html) { written += html; }, close() {}}});
@@ -287,7 +385,7 @@ const app = createSandbox(store);
     assert.ok(blank.includes('Form not yet completed'));
 }
 
-// --- 5. Row-level sync carries the report field by field --------------------
+// --- 7. Row-level sync carries the report field by field --------------------
 {
     const utils = app.SARSyncDelta;
     const before = app.loadBundle();

@@ -3241,8 +3241,9 @@ function defaultRegionsData() {
 // the Incident Commander plus a "form completed" checkbox. The name typed into
 // the small field next to the checkbox is tagged onto the completion (with the
 // date/time) the moment the checkbox is ticked; when nobody typed a name the
-// signed-in user is tagged instead. It is edited on the Search Log page, right
-// below the two charts, and printed in the Case # Printout in the same spot.
+// signed-in user is tagged instead. It is edited under the "IC Report" button
+// of the Forms page (next to Incident Times), printed on its own from there,
+// and also included in the Case # Printout.
 // ---------------------------------------------------------------------------
 
 function defaultIcReport() {
@@ -3333,7 +3334,19 @@ function escapeIcReportHtml(value) {
     .replace(/'/g, '&#39;');
 }
 
-// Static markup of the report for the Case # Printout.
+// Print styles of the report block; shared by the stand-alone "Print Report"
+// of the Forms page and the Case # Printout.
+const IC_REPORT_PRINT_STYLES = `
+        .ic-report { border: 2px solid #000; padding: 12px 15px; margin-bottom: 20px; page-break-inside: avoid; }
+        .ic-report-title { font-size: 16pt; border-bottom: 2px solid #000; margin: 0 0 4px 0; padding-bottom: 3px; }
+        .ic-report-case { font-size: 11pt; font-weight: bold; color: #444; margin-bottom: 10px; }
+        .ic-report-text { min-height: 1.5in; border: 1px solid #999; padding: 8px; font-size: 11pt; white-space: pre-wrap; word-wrap: break-word; margin-bottom: 10px; }
+        .ic-report-empty { font-style: italic; color: #888; }
+        .ic-report-completion { font-size: 10pt; font-weight: bold; display: flex; align-items: center; gap: 6px; }
+        .ic-report-check { font-size: 14pt; line-height: 1; }
+`;
+
+// Static markup of the report for the printouts.
 function getIcReportPrintHTML(bundle) {
   const report = sanitizeIcReport(bundle && bundle.icReport);
   const caseLabel = escapeIcReportHtml(getIcReportCaseLabel(bundle));
@@ -3352,10 +3365,120 @@ function getIcReportPrintHTML(bundle) {
             </div>`;
 }
 
-// The editable form on the Search Log page (page4.html, between the charts
-// and the Search Log table). Re-run on every table rebuild, including the
-// ones triggered by another device's edits, so a field the user is typing in
-// right now is left alone.
+// Prints only the IC Report (the "Print Report" button of the IC Report form).
+function printIcReport() {
+    const bundle = loadBundle();
+    const caseLabel = getIcReportCaseLabel(bundle);
+
+    const printWindow = window.open('', '_blank');
+    if (!printWindow) {
+        alert("Please allow popups to view the printout.");
+        return;
+    }
+
+    printWindow.document.write(`
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <title>IC Report - ${escapeIcReportHtml(caseLabel)}</title>
+    <style>
+        ${TASK_FORM_PRINT_STYLES}
+        ${IC_REPORT_PRINT_STYLES}
+    </style>
+</head>
+<body>
+    <div class="no-print">
+        <button onclick="window.print()" style="padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 999px;">Print PDF</button>
+        <p style="font-size: 12px; color: #666;">Note: Use "Save as PDF" in the print dialog for a digital copy.</p>
+    </div>
+    <div class="print-container">
+        <div class="print-section">
+            ${getIcReportPrintHTML(bundle)}
+        </div>
+    </div>
+    <script>
+        setTimeout(() => { window.print(); }, 500);
+    </script>
+</body>
+</html>
+    `);
+    printWindow.document.close();
+}
+
+// Creates the (empty) IC Report form markup inside `container` unless it is
+// already there, and returns the panel element.
+function ensureIcReportPanel(container) {
+  const existing = document.getElementById('ic-report-panel');
+  if (existing && existing.parentElement === container) return existing;
+  container.innerHTML = '';
+
+  const panel = document.createElement('div');
+  panel.className = 'ic-report-panel';
+  panel.id = 'ic-report-panel';
+
+  const heading = document.createElement('h2');
+  heading.className = 'ic-report-heading';
+  heading.textContent = 'IC Report';
+  panel.appendChild(heading);
+
+  const subtitle = document.createElement('div');
+  subtitle.className = 'ic-report-subtitle';
+  subtitle.id = 'ic-report-case';
+  subtitle.textContent = 'Case #';
+  panel.appendChild(subtitle);
+
+  const label = document.createElement('label');
+  label.className = 'ic-report-label';
+  label.htmlFor = 'ic-report-text';
+  label.textContent = 'Report';
+  panel.appendChild(label);
+
+  const textArea = document.createElement('textarea');
+  textArea.id = 'ic-report-text';
+  textArea.className = 'form-input ic-report-textarea';
+  textArea.placeholder = 'Incident Commander report for this case...';
+  panel.appendChild(textArea);
+
+  const row = document.createElement('div');
+  row.className = 'ic-report-completion-row';
+
+  const check = document.createElement('input');
+  check.type = 'checkbox';
+  check.id = 'ic-report-completed';
+  check.className = 'pill-checkbox';
+  check.setAttribute('aria-label', 'Mark IC Report as completed');
+  row.appendChild(check);
+
+  const nameInput = document.createElement('input');
+  nameInput.type = 'text';
+  nameInput.id = 'ic-report-name';
+  nameInput.className = 'form-input ic-report-name';
+  nameInput.placeholder = 'Completed by (name)';
+  nameInput.setAttribute('aria-label', 'Name to tag with the completion');
+  row.appendChild(nameInput);
+
+  const status = document.createElement('span');
+  status.className = 'ic-report-status';
+  status.id = 'ic-report-status';
+  status.textContent = 'Mark IC Report as Completed';
+  row.appendChild(status);
+
+  panel.appendChild(row);
+  container.appendChild(panel);
+  return panel;
+}
+
+// The editable form shown under the "IC Report" button of the Forms page
+// (page5.html, inside the interactive form container). Re-run on every page
+// rebuild, including the ones triggered by another device's edits, so a field
+// the user is typing in right now is left alone.
+function buildIcReportForm() {
+  const container = document.getElementById('interactive-form-container');
+  if (!container) return;
+  ensureIcReportPanel(container);
+  renderIcReportForm();
+}
+
 function renderIcReportForm() {
   const panel = document.getElementById('ic-report-panel');
   if (!panel) return;
@@ -3458,7 +3581,7 @@ function defaultBundle() {
     // automatically. Missing = on.
     mapFeatureTypeFilters: {marker: true, shape: true, assignment: true, route: true, other: true},
     permanentPersonnel: {},
-    // The one IC Report of this CASE # (Search Log page, below the charts).
+    // The one IC Report of this CASE # (Forms page, "IC Report" button).
     icReport: defaultIcReport(),
     accounts: [
       { username: 'Super Admin', pin: '1976', color: 'none', handle: 'Super-Admin', isFileManager: true, theme: 'dark', visiblePages: ['index', 'page2', 'page3', 'page4', 'page5', 'page6', 'page7', 'settings', 'home', 'page8', 'page9', 'page10'] }
@@ -9682,7 +9805,6 @@ function buildSearchLogTable() {
   }
   
   initCharts();
-  renderIcReportForm();
 }
 
 function getLocalISOString(date) {
@@ -11558,11 +11680,14 @@ function buildFormsPage() {
 
   const btnTask = document.getElementById('btn-task-assignment');
   const btnIncidentTimes = document.getElementById('btn-incident-times');
+  const btnIcReport = document.getElementById('btn-ic-report');
   const btnManage = document.getElementById('btn-manage-forms');
   const taskView = document.getElementById('task-assignment-view');
   const incidentTimesView = document.getElementById('incident-times-view');
   const manageView = document.getElementById('manage-forms-view');
   const printContainer = document.getElementById('print-btn-container');
+  const subNavButtons = [btnTask, btnIncidentTimes, btnIcReport, btnManage].filter(Boolean);
+  const setActiveSubNav = activeBtn => subNavButtons.forEach(btn => btn.classList.toggle('active', btn === activeBtn));
 
   if (btnTask) {
     btnTask.onclick = () => {
@@ -11577,6 +11702,13 @@ function buildFormsPage() {
       buildFormsPage();
     };
   }
+  if (btnIcReport) {
+    btnIcReport.onclick = () => {
+      currentFormsSubpage = 'ic-report';
+      currentTaskNumber = null; // Clear task selection when going to the IC Report
+      buildFormsPage();
+    };
+  }
   if (btnManage) {
     btnManage.onclick = () => {
       currentFormsSubpage = 'manage-forms';
@@ -11586,9 +11718,7 @@ function buildFormsPage() {
 
   // Set visibility and active classes based on state
   if (currentFormsSubpage === 'task-assignment') {
-    if (btnTask) btnTask.classList.add('active');
-    if (btnIncidentTimes) btnIncidentTimes.classList.remove('active');
-    if (btnManage) btnManage.classList.remove('active');
+    setActiveSubNav(btnTask);
     if (taskView) taskView.style.display = 'block';
     if (manageView) manageView.style.display = 'none';
 
@@ -11597,15 +11727,15 @@ function buildFormsPage() {
     const taskTitle = document.getElementById('task-view-title');
     if (taskTitle) taskTitle.textContent = 'Task Assignment Form';
   } else if (currentFormsSubpage === 'incident-times') {
-    if (btnIncidentTimes) btnIncidentTimes.classList.add('active');
-    if (btnTask) btnTask.classList.remove('active');
-    if (btnManage) btnManage.classList.remove('active');
+    setActiveSubNav(btnIncidentTimes);
     if (taskView) taskView.style.display = 'block'; // Keep taskView visible because it contains the interactive-form-container
     if (manageView) manageView.style.display = 'none';
+  } else if (currentFormsSubpage === 'ic-report') {
+    setActiveSubNav(btnIcReport);
+    if (taskView) taskView.style.display = 'block'; // The IC Report is drawn in the interactive-form-container too
+    if (manageView) manageView.style.display = 'none';
   } else {
-    if (btnManage) btnManage.classList.add('active');
-    if (btnTask) btnTask.classList.remove('active');
-    if (btnIncidentTimes) btnIncidentTimes.classList.remove('active');
+    setActiveSubNav(btnManage);
     if (taskView) taskView.style.display = 'none';
     if (manageView) manageView.style.display = 'block';
   }
@@ -11657,6 +11787,20 @@ function buildFormsPage() {
     if (taskTitle) taskTitle.textContent = 'Incident Times Report';
 
     buildIncidentTimesReport();
+  } else if (currentFormsSubpage === 'ic-report') {
+    if (printContainer) {
+      const printBtn = document.createElement('button');
+      printBtn.className = 'sub-nav-btn active';
+      printBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px; vertical-align: middle;"><polyline points="6 9 6 2 18 2 18 9"></polyline><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect x="6" y="14" width="12" height="8"></rect></svg>Print Report';
+      printBtn.onclick = () => printIcReport();
+      printContainer.appendChild(printBtn);
+    }
+    const taskPills = document.getElementById('task-pills-container');
+    if (taskPills) taskPills.style.display = 'none';
+    const taskTitle = document.getElementById('task-view-title');
+    if (taskTitle) taskTitle.textContent = 'IC Report Form';
+
+    buildIcReportForm();
   } else {
     const taskPills = document.getElementById('task-pills-container');
     if (taskPills) taskPills.style.display = 'none';
@@ -13643,15 +13787,7 @@ function printSearchFile() {
         .chart-item { flex: 1; display: flex; flex-direction: column; border: 1px solid #ddd; padding: 10px; border-radius: 8px; }
         .chart-label { font-size: 9pt; font-weight: bold; margin-bottom: 5px; color: #555; text-align: center; }
         .chart-svg-wrap { flex: 1; min-height: 140px; }
-
-        .ic-report { border: 2px solid #000; padding: 12px 15px; margin-bottom: 20px; page-break-inside: avoid; }
-        .ic-report-title { font-size: 16pt; border-bottom: 2px solid #000; margin: 0 0 4px 0; padding-bottom: 3px; }
-        .ic-report-case { font-size: 11pt; font-weight: bold; color: #444; margin-bottom: 10px; }
-        .ic-report-text { min-height: 1.5in; border: 1px solid #999; padding: 8px; font-size: 11pt; white-space: pre-wrap; word-wrap: break-word; margin-bottom: 10px; }
-        .ic-report-empty { font-style: italic; color: #888; }
-        .ic-report-completion { font-size: 10pt; font-weight: bold; display: flex; align-items: center; gap: 6px; }
-        .ic-report-check { font-size: 14pt; line-height: 1; }
-
+        ${IC_REPORT_PRINT_STYLES}
         .task-form { border: 2px solid #000; padding: 15px; margin-bottom: 20px; position: relative; }
         .form-header { display: flex; justify-content: space-between; border-bottom: 2px solid #000; margin-bottom: 15px; padding-bottom: 5px; }
         .form-section { margin-bottom: 12px; }
