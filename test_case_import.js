@@ -7,9 +7,10 @@
 // mirrored into the structured tables tagged with that username + CASE #, and
 // the page must show every imported row after the reload.
 //
-// The real app.js runs in a sandbox (fake DOM/localStorage/FileReader) and
-// talks over HTTP to the real sync-server.js, whose MySQL pool is replaced by
-// an in-memory stand-in.
+// The real app.js runs in a sandbox (fake DOM/FileReader, its in-memory store
+// handed in as window.SAR_MEMORY_STORAGE, localStorage a tripwire it must never
+// touch) and talks over HTTP to the real sync-server.js, whose MySQL pool is
+// replaced by an in-memory stand-in.
 //
 // Run with: node test_case_import.js
 
@@ -177,11 +178,18 @@ function makeElement(depth = 0) {
     return el;
 }
 
+const localStorageAccess = [];
 function createSandbox({store: local, baseUrl, page = 'home'}) {
     const localStorage = {
-        getItem: (k) => (Object.prototype.hasOwnProperty.call(local, k) ? local[k] : null),
-        setItem: (k, v) => { local[k] = String(v); },
-        removeItem: (k) => { delete local[k]; }
+        getItem: (k) => { localStorageAccess.push(`getItem ${k}`); return null; },
+        setItem: (k) => { localStorageAccess.push(`setItem ${k}`); },
+        removeItem: () => {}
+    };
+    const sessionData = {};
+    const sessionStorage = {
+        getItem: (k) => (Object.prototype.hasOwnProperty.call(sessionData, k) ? sessionData[k] : null),
+        setItem: (k, v) => { sessionData[k] = String(v); },
+        removeItem: (k) => { delete sessionData[k]; }
     };
     const cookieJar = {
         'sar-user-name-v1': USER,
@@ -242,7 +250,8 @@ function createSandbox({store: local, baseUrl, page = 'home'}) {
         setInterval: () => 0,
         clearInterval() {},
         localStorage,
-        sessionStorage: localStorage,
+        sessionStorage,
+        SAR_MEMORY_STORAGE: local,
         document,
         navigator: {userAgent: 'node', onLine: true},
         addEventListener() {},

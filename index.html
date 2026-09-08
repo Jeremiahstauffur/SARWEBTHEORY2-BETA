@@ -5,21 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Regions | Search & Rescue Theory Software</title>
-  <script>
-    (function () {
-      try {
-        var t = localStorage.getItem('sar-theme-cache');
-        if (t === 'light') document.documentElement.classList.add('light-mode');
-        if (localStorage.getItem('sar-geek-mode-cache') === 'on') document.documentElement.classList.add('geek-mode');
-        var a = localStorage.getItem('sar-accent-cache');
-        if (a) {
-          var p = a.split('|');
-          document.documentElement.style.setProperty('--accent', p[0]);
-          document.documentElement.style.setProperty('--accent-rgb', p[1]);
-        }
-      } catch (e) {}
-    })();
-  </script>
+  <!-- Theme, accent and other preferences are read from the server-side search file after login; nothing is cached on the device. -->
   <link rel="stylesheet" href="styles.css?v=20260904" />
 </head>
 <body data-page="index">
@@ -29,7 +15,7 @@
         <img class="header-logo" data-header-logo alt="Logo" style="display:none;">
         <div>
           <div class="brand">Search & Rescue Theory Software</div>
-          <div class="file-badge">Case #: <span data-file-name>us-pill-data.json</span></div>
+          <div class="file-badge">Case #: <span data-file-name>No case selected</span></div>
           <div class="file-badge" data-user-badge style="display: none;"><span data-username></span></div>
         </div>
                                                                 <nav>

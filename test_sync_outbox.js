@@ -1,5 +1,5 @@
 // Regression tests for the sync outbox: the rows a device changed are queued
-// in localStorage and delivered to POST /rows as a batch with a stable id.
+// in the page's memory and delivered to POST /rows as a batch with a stable id.
 //
 // The bug: segments imported on the Maps page (which loads CalTopo features and
 // so pushes the search file past 64 KiB) vanished from the Segments page a
@@ -8,8 +8,11 @@
 // the server kept a stale copy - and the page then replaced its freshly
 // imported rows with that stale copy.
 //
-// These tests drive the real app.js in a sandbox with a fake localStorage and a
-// scripted fetch() that records every request the website makes.
+// These tests drive the real app.js in a sandbox whose in-memory store is
+// handed in (window.SAR_MEMORY_STORAGE), with a scripted fetch() that records
+// every request the website makes. The sandbox's localStorage is a tripwire:
+// the website must never read or write it (the only allowed call is the
+// removeItem() that clears what an older build left behind).
 //
 // Run with: node test_sync_outbox.js
 
@@ -63,12 +66,20 @@ function makeElement(depth = 0) {
 }
 
 // Loads sync-delta.js + app.js over `store` (a plain object standing in for
-// localStorage). Creating a second sandbox over the same store is a "reload".
+// the page's in-memory storage). A second sandbox over the same store is a
+// page that still holds the same memory (a retry within the same page).
+const localStorageAccess = [];
 function createSandbox({store, fetch, page = 'page2', bucketTag} = {}) {
     const localStorage = {
-        getItem: (k) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
-        setItem: (k, v) => { store[k] = String(v); },
-        removeItem: (k) => { delete store[k]; }
+        getItem: (k) => { localStorageAccess.push(`getItem ${k}`); return null; },
+        setItem: (k) => { localStorageAccess.push(`setItem ${k}`); },
+        removeItem: () => {}
+    };
+    const sessionData = {};
+    const sessionStorage = {
+        getItem: (k) => (Object.prototype.hasOwnProperty.call(sessionData, k) ? sessionData[k] : null),
+        setItem: (k, v) => { sessionData[k] = String(v); },
+        removeItem: (k) => { delete sessionData[k]; }
     };
 
     const cookieJar = {'sar-user-name-v1': 'tester', 'sar-user-password-v1': '1234'};
@@ -120,7 +131,8 @@ function createSandbox({store, fetch, page = 'page2', bucketTag} = {}) {
         setInterval: () => 0,
         clearInterval() {},
         localStorage,
-        sessionStorage: localStorage,
+        sessionStorage,
+        SAR_MEMORY_STORAGE: store,
         document,
         navigator: {userAgent: 'node', onLine: true},
         addEventListener() {},
@@ -244,6 +256,23 @@ const check = (name, fn) => checks.push({name, fn});
 
 // --- Static guards --------------------------------------------------------------
 
+check('the website keeps no case data on the device: localStorage is never read or written', () => {
+    // Direct uses of localStorage in the source are limited to the one-time
+    // purge of what older builds left behind; at run time nothing reads it.
+    const direct = [...appSource.matchAll(/localStorage\.(getItem|setItem)\(/g)];
+    assert.deepStrictEqual(direct.map(m => m[0]), [], 'app.js must not call localStorage.getItem/setItem');
+    assert.ok(/function purgeLegacyLocalData/.test(appSource), 'older data is purged on start-up');
+    assert.ok(!/localStorage/.test(deltaSource), 'sync-delta.js must not touch localStorage');
+    const store = seedStore();
+    const server = createServer(() => ({status: 200, body: {success: true, applied: 1}}));
+    const app = createSandbox({store, fetch: server.fetch});
+    const bundle = app.loadBundle();
+    bundle.pages.page2[0][2] = 'Team 1';
+    return app.saveBundle(bundle).then(() => {
+        assert.deepStrictEqual(localStorageAccess, [], `localStorage was touched: ${localStorageAccess.join(', ')}`);
+    });
+});
+
 check('every *_STORAGE_KEY / *_INTERVAL_MS identifier app.js uses is declared', () => {
     // The regression that lost the imported segments was a renamed constant:
     // readSyncSnapshot() threw a ReferenceError that its try/catch swallowed.
@@ -324,7 +353,7 @@ check('an unchanged save makes no request at all', async () => {
 
 // --- Persistence and retries --------------------------------------------------
 
-check('an edit made offline survives a reload and is re-sent with the same batch id', async () => {
+check('an edit made offline stays queued and is re-sent with the same batch id once the connection is back', async () => {
     const store = seedStore();
     const down = createServer(() => offline());
     const app1 = createSandbox({store, fetch: down.fetch});
@@ -342,7 +371,7 @@ check('an edit made offline survives a reload and is re-sent with the same batch
     assert.ok(pending.inFlight && pending.inFlight.batchId, 'the attempt keeps its batch id');
     assert.strictEqual(pending.inFlight.batchId, down.requests[0].json.batchId);
 
-    // Reload: a fresh page over the same storage, and the connection is back.
+    // The connection is back (same page memory, so the queue is still there).
     // The server already applied the first attempt, so it reports a duplicate.
     const up = createServer((req) => {
         if (req.path === `${API}/rows`) return {status: 200, body: {success: true, applied: 0, duplicate: true}};
@@ -626,11 +655,11 @@ check('a device without a local copy reads the file once and needs no whole-file
     assert.strictEqual(store[BUCKET_TAG_KEY], BUCKET);
 });
 
-check('an upgraded device delivers the rows the old build stranded, but never a differing existing cell', async () => {
-    // The previous build left the local copy untagged. It holds two segments
-    // the server never received (one typed into a blank row, one appended) and
-    // one cell that differs from the server - which may well be another
-    // device's newer edit, so it must not be pushed back.
+check('a copy of the file that is not tagged with this CASE # is dropped: the database copy wins and nothing is uploaded', async () => {
+    // Nothing is kept on the device between page loads any more, so there is
+    // no "stranded local copy" to migrate: a copy without a CASE # tag can
+    // only be a stale leftover and must never be pushed back over the
+    // database. The database copy is read and shown as-is.
     const store = seedStore({big: false, bucketTag: null});
     const scratch = createSandbox({store, fetch: () => Promise.reject(offline())});
     const local = scratch.loadBundle();
@@ -650,16 +679,11 @@ check('an upgraded device delivers the rows the old build stranded, but never a 
 
     await fireDomReady(app);
 
-    assert.deepStrictEqual(dataWrites(server), [`POST ${API}/rows`], 'only the stranded rows travel, as a row batch');
-    const rows = server.writes().filter(r => r.path === `${API}/rows`);
-    assert.deepStrictEqual(rows[0].json.changes, [
-        {path: ['pages', 'page2', '1'], value: segmentRow('R1', 'Seg B'), previous: BLANK_ROW},
-        {path: ['pages', 'page2'], append: [segmentRow('R1', 'Seg C')]}
-    ]);
-    assert.deepStrictEqual(plain(app.loadBundle().pages.page2), [serverSegA, segmentRow('R1', 'Seg B'), segmentRow('R1', 'Seg C')],
-        'the server cell wins, the stranded rows stay');
+    assert.deepStrictEqual(dataWrites(server), [], 'the stale copy is never uploaded');
+    assert.deepStrictEqual(plain(app.loadBundle().pages.page2), [serverSegA, BLANK_ROW], 'the database copy is shown');
     assert.deepStrictEqual(outboxRecord(store).changes, []);
-    assert.strictEqual(store[BUCKET_TAG_KEY], BUCKET, 'the copy is tagged, so the migration runs only once');
+    assert.strictEqual(store[BUCKET_TAG_KEY], BUCKET, 'the copy read from the database is tagged with its CASE #');
+    assert.ok(!/function queueLegacyLocalRows/.test(appSource), 'no on-device copy is ever migrated');
 });
 
 check('a seed refused because another device got there first adopts that copy', async () => {
@@ -765,11 +789,12 @@ check('a server without a copy of the CASE # is seeded once with PUT /bundle?see
     const ok = await app.saveBundle(bundle);
     assert.strictEqual(ok, true);
 
+    // One upload only: the server stores the file under "bundle" and under its
+    // own name in the same write, so no second PUT to /Case-1 is needed.
     const writes = server.writes();
     assert.deepStrictEqual(writes.map(r => `${r.method} ${r.path}${r.query.has('seed') ? '?seed=1' : ''}`), [
         `POST ${API}/rows`,
-        `PUT ${API}/bundle?seed=1`,
-        `PUT ${API}/Case-1`
+        `PUT ${API}/bundle?seed=1`
     ]);
     const seed = writes[1];
     assert.ok(seed.bodyLength > 64 * 1024, 'the seed carries the whole file');
@@ -819,7 +844,7 @@ check('a backend without the row endpoint still receives the edit as a whole fil
     assert.strictEqual(await app.saveBundle(bundle), true);
 
     const writes = server.writes();
-    assert.deepStrictEqual(writes.map(r => `${r.method} ${r.path}`), [`POST ${API}/rows`, `PUT ${API}/bundle`, `PUT ${API}/Case-1`]);
+    assert.deepStrictEqual(writes.map(r => `${r.method} ${r.path}`), [`POST ${API}/rows`, `PUT ${API}/bundle`]);
     assert.ok(!writes[1].query.has('seed'), 'the legacy fallback is a plain whole-file upload');
     assert.strictEqual(writes[1].keepalive, false);
     assert.strictEqual(writes[1].json.pages.page2[0][2], 'legacy');
@@ -839,7 +864,7 @@ check('switching to another search file uploads it whole instead of diffing', as
     other.pages.page2 = [segmentRow('R9', 'Other')];
     assert.strictEqual(await app.saveBundle(other), true);
 
-    assert.deepStrictEqual(server.writes().map(r => `${r.method} ${r.path}`), [`PUT ${API}/bundle`, `PUT ${API}/Case-2`]);
+    assert.deepStrictEqual(server.writes().map(r => `${r.method} ${r.path}`), [`PUT ${API}/bundle`]);
     assert.strictEqual(server.writes()[0].keepalive, false);
     const record = outboxRecord(store, 'Case-2');
     assert.strictEqual(record.needsFullUpload, false);

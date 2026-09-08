@@ -5,21 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Mobile Status Update | Search & Rescue Theory Software</title>
-  <script>
-    (function () {
-      try {
-        var t = localStorage.getItem('sar-theme-cache');
-        if (t === 'light') document.documentElement.classList.add('light-mode');
-        if (localStorage.getItem('sar-geek-mode-cache') === 'on') document.documentElement.classList.add('geek-mode');
-        var a = localStorage.getItem('sar-accent-cache');
-        if (a) {
-          var p = a.split('|');
-          document.documentElement.style.setProperty('--accent', p[0]);
-          document.documentElement.style.setProperty('--accent-rgb', p[1]);
-        }
-      } catch (e) {}
-    })();
-  </script>
+  <!-- Theme, accent and other preferences are read from the server-side search file after login; nothing is cached on the device. -->
   <link rel="stylesheet" href="styles.css?v=20260904" />
   <style>
     .mobile-status-container {
@@ -174,8 +160,10 @@
   <script src="sync-delta.js?v=20260904"></script>
   <script src="app.js?v=20260904"></script>
   <script>
-    // Local script for mobile-status page logic
-    document.addEventListener('DOMContentLoaded', () => {
+    // Local script for mobile-status page logic. The case is read from the
+    // server on every page load (nothing is kept on the device), so this waits
+    // for app.js to signal that the data is in memory before rendering.
+    document.addEventListener('DOMContentLoaded', () => whenDataReady(() => {
       const dropdown = document.getElementById('member-dropdown');
       const statusList = document.getElementById('status-list');
 
@@ -206,13 +194,14 @@
         dropdown.appendChild(opt);
       });
 
-      // Select preselected member or current user by default if they are in the list
-      const preselected = sessionStorage.getItem('mobile-status-member');
+      // Select the member named in the address (?member=...), else the current
+      // user, if they are in the list.
+      let preselected = '';
+      try { preselected = new URLSearchParams(window.location.search).get('member') || ''; } catch (e) {}
       if (preselected) {
         let match = memberNames.find(n => n === preselected);
         if (match) {
           dropdown.value = match;
-          sessionStorage.removeItem('mobile-status-member');
           renderIncidentTimes(match);
           renderHistory(match);
         }
@@ -338,7 +327,7 @@
         };
         btnContainer.appendChild(saveBtn);
       }
-    });
+    }));
   </script>
 </body>
 </html>

@@ -357,7 +357,9 @@ check('row changes for one CASE # are applied one at a time', () => {
 
 check('the server writes single table rows instead of wiping the table', () => {
     assert.ok(/const upsertCollectionRow = /.test(serverSource));
-    assert.ok(/applyChangesToTables\(userName, bucket, bundle, applied\)/.test(serverSource));
+    // The structured rows are keyed by the clean CASE # behind the bucket
+    // (never the raw per-login bucket id or an internal store key).
+    assert.ok(/applyChangesToTables\(userName, caseNumberFromBucket\(bucket, userName\), bundle, applied\)/.test(serverSource));
 });
 
 console.log(`\nAll ${passed} checks passed.`);

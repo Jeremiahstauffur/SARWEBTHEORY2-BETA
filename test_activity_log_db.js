@@ -169,11 +169,18 @@ function makeElement(depth = 0) {
     return el;
 }
 
+const localStorageAccess = [];
 function createSandbox({store, fetch, page = 'page3'}) {
     const localStorage = {
-        getItem: (k) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
-        setItem: (k, v) => { store[k] = String(v); },
-        removeItem: (k) => { delete store[k]; }
+        getItem: (k) => { localStorageAccess.push(`getItem ${k}`); return null; },
+        setItem: (k) => { localStorageAccess.push(`setItem ${k}`); },
+        removeItem: () => {}
+    };
+    const sessionData = {};
+    const sessionStorage = {
+        getItem: (k) => (Object.prototype.hasOwnProperty.call(sessionData, k) ? sessionData[k] : null),
+        setItem: (k, v) => { sessionData[k] = String(v); },
+        removeItem: (k) => { delete sessionData[k]; }
     };
     const cookieJar = {'sar-user-name-v1': LOGIN, 'sar-user-password-v1': '1234'};
     const byId = {};
@@ -208,7 +215,8 @@ function createSandbox({store, fetch, page = 'page3'}) {
         setInterval: () => 0,
         clearInterval() {},
         localStorage,
-        sessionStorage: localStorage,
+        sessionStorage,
+        SAR_MEMORY_STORAGE: store,
         document,
         navigator: {userAgent: 'node', onLine: true},
         addEventListener() {},

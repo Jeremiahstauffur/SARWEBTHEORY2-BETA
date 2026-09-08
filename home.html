@@ -5,21 +5,7 @@
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Home | Search & Rescue Theory Software</title>
-  <script>
-    (function () {
-      try {
-        var t = localStorage.getItem('sar-theme-cache');
-        if (t === 'light') document.documentElement.classList.add('light-mode');
-        if (localStorage.getItem('sar-geek-mode-cache') === 'on') document.documentElement.classList.add('geek-mode');
-        var a = localStorage.getItem('sar-accent-cache');
-        if (a) {
-          var p = a.split('|');
-          document.documentElement.style.setProperty('--accent', p[0]);
-          document.documentElement.style.setProperty('--accent-rgb', p[1]);
-        }
-      } catch (e) {}
-    })();
-  </script>
+  <!-- Theme, accent and other preferences are read from the server-side search file after login; nothing is cached on the device. -->
   <link rel="stylesheet" href="styles.css?v=20260904" />
   <script src="https://cdn.jsdelivr.net/npm/jszip@3.10.1/dist/jszip.min.js"></script>
 </head>
@@ -30,7 +16,7 @@
         <img class="header-logo" data-header-logo alt="Logo" style="display:none;">
         <div>
           <div class="brand">Search & Rescue Theory Software</div>
-          <div class="file-badge">Case #: <span data-file-name>us-pill-data.json</span></div>
+          <div class="file-badge">Case #: <span data-file-name>No case selected</span></div>
           <div class="file-badge" data-user-badge style="display: none;"><span data-username></span></div>
         </div>
                                                                 <nav>
@@ -58,7 +44,7 @@
           <div class="hero-columns">
             <div class="hero-col-left">
               <h1>Home</h1>
-              <p>All table data across the site is stored together as one exportable file. Export it anytime, rename it, import it back later, or reset to a blank file.</p>
+              <p>All table data across the site is stored together as one case on the server - nothing is kept on this device. Export a case anytime, rename it, import it back later, or start a new one.</p>
             </div>
             <div class="hero-col-right" style="display: flex; justify-content: flex-end; align-items: center;">
               <button id="print-search-file-btn" class="clear-btn" style="white-space: nowrap;">Case # Printout</button>
@@ -72,7 +58,7 @@
           <div class="home-panel full-width">
             <h2>Project Overview</h2>
             <p style="color: var(--muted); font-size: 0.95rem; line-height: 1.5;">
-              Welcome to the Search & Rescue Theory Software dashboard. All table data across the site?including regions, segments, personnel rosters, and search logs?is stored within a single exportable JSON file. Use this dashboard to manage your project data, track operational statistics, and ensure data persistence.
+              Welcome to the Search & Rescue Theory Software dashboard. All table data across the site - regions, segments, personnel rosters, and search logs - is stored per case in the team database on the server; this device keeps nothing between page loads. Use this dashboard to manage your cases, track operational statistics, and export backups.
             </p>
           </div>
 
@@ -168,8 +154,8 @@
               <button id="backup-all-zip-btn" class="clear-btn" type="button" style="font-size: 0.8rem; padding: calc(5px * var(--space-scale, 1)) calc(10px * var(--space-scale, 1));">Backup All (ZIP)</button>
             </div>
             <div class="home-row saved-cases-toolbar" style="margin-top: calc(15px * var(--space-scale, 1)); flex-wrap: wrap; gap: 10px; align-items: center;">
-              <label for="bundle-file-name" style="font-weight: 600;">CASE #</label>
-              <input id="bundle-file-name" class="pill-input" type="text" placeholder="CASE #" aria-label="CASE #" style="min-width: 150px; flex-grow: 1;" />
+              <label for="bundle-file-name" style="font-weight: 600;">Current Case #</label>
+              <input id="bundle-file-name" class="pill-input" type="text" placeholder="Current Case #" aria-label="Current Case #" style="min-width: 150px; flex-grow: 1;" />
               <button id="save-file-name" class="clear-btn" type="button">Save</button>
               <button id="create-new-search-btn" class="clear-btn" type="button">New</button>
               <button id="import-search-btn" class="clear-btn" type="button">Import</button>

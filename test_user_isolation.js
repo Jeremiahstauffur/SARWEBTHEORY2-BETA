@@ -26,6 +26,7 @@ const USERS = [
 const store = new Map();   // "bucket\u0000key" -> {value, userName, userPin, updatedAt}
 const tables = new Map();  // table -> array of row objects
 const singles = new Map(); // "table\u0000username\u0000case" -> row
+const userBuckets = new Map(); // "username\u0000bucket" -> {lastAccessed} (the Saved Cases list)
 
 const tableRows = (table) => {
     if (!tables.has(table)) tables.set(table, []);
@@ -44,7 +45,15 @@ const query = (rawSql, params, cb) => {
         return cb(null, u ? [{...u}] : []);
     }
     if (/^REPLACE INTO user_buckets/.test(sql)) {
+        userBuckets.set(`${p[0]}\u0000${p[1]}`, {lastAccessed: p[2]});
         return cb(null, {affectedRows: 1});
+    }
+    if (/^SELECT bucket, lastAccessed FROM user_buckets WHERE username = \? ORDER BY lastAccessed DESC$/.test(sql)) {
+        const rows = [...userBuckets.entries()]
+            .filter(([k]) => k.split('\u0000')[0] === p[0])
+            .map(([k, v]) => ({bucket: k.split('\u0000')[1], lastAccessed: v.lastAccessed}))
+            .sort((a, b) => String(b.lastAccessed).localeCompare(String(a.lastAccessed)));
+        return cb(null, rows);
     }
 
     // ---- store reads, all scoped to the authenticated login (userName) ----
@@ -59,6 +68,12 @@ const query = (rawSql, params, cb) => {
     if (/^SELECT value FROM store WHERE bucket = \? AND `key` = \? AND userName = \?$/.test(sql)) {
         const row = store.get(`${p[0]}\u0000${p[1]}`);
         return cb(null, (row && row.userName === p[2]) ? [{value: row.value}] : []);
+    }
+    if (/^SELECT `key`, updatedAt FROM store WHERE bucket = \? AND userName = \?$/.test(sql)) {
+        const rows = [...store.entries()]
+            .filter(([k, v]) => k.split('\u0000')[0] === p[0] && v.userName === p[1])
+            .map(([k, v]) => ({key: k.split('\u0000')[1], updatedAt: v.updatedAt}));
+        return cb(null, rows);
     }
     if (/^SELECT value FROM store WHERE bucket = \? AND userName = \? ORDER BY updatedAt DESC LIMIT 1$/.test(sql)) {
         const matches = [...store.entries()]
@@ -209,6 +224,44 @@ const run = async () => {
         const a = await call('alice', 'GET', '/api/v1/SHARED/page/index');
         assert.strictEqual(a.body.found, true);
         assert.deepStrictEqual(a.body.data.rows[0], ['alice', 'secret-alice']);
+    });
+
+    console.log('\nSaved Cases (/api/auth/history) show only the caller\'s own cases');
+
+    await check('each login sees its own cases only, with the stored file\'s row counts', async () => {
+        const a = await call('alice', 'GET', '/api/auth/history');
+        const b = await call('bob', 'GET', '/api/auth/history');
+        assert.strictEqual(a.status, 200);
+        assert.strictEqual(b.status, 200);
+        assert.deepStrictEqual(a.body.map(r => r.bucket).sort(), ['CASE-1_alice', 'SHARED']);
+        assert.deepStrictEqual(b.body.map(r => r.bucket).sort(), ['CASE-1_bob', 'SHARED']);
+        const aliceCase1 = a.body.find(r => r.bucket === 'CASE-1_alice');
+        assert.strictEqual(aliceCase1.caseNumber, 'CASE-1');
+        assert.strictEqual(aliceCase1.hasFile, true);
+        assert.deepStrictEqual(aliceCase1.stats, {regions: 1, segments: 0, personnel: 0, tasks: 0});
+        // bob opened SHARED (his /rows attempt) but never got a file of his own
+        // there: his row is his own empty case - alice's file, rows and counts
+        // are never his to see - and shows as deletable, not as alice's data.
+        const bobShared = b.body.find(r => r.bucket === 'SHARED');
+        assert.strictEqual(bobShared.hasFile, false, 'bob has no file under SHARED');
+        assert.strictEqual(bobShared.stats, null, 'alice\'s counts never leak to bob');
+        const aliceShared = a.body.find(r => r.bucket === 'SHARED');
+        assert.strictEqual(aliceShared.hasFile, true);
+    });
+
+    await check('the internal store keys never show up as cases', async () => {
+        // A presence ping and a stale "all-files" write are bookkeeping, not cases.
+        await call('alice', 'PUT', '/api/v1/CASE-1_alice/user-1234', {deviceId: 'd', lastModified: '2026-01-01T00:00:00.000Z'});
+        await call('alice', 'PUT', '/api/v1/CASE-1_alice/all-files', {});
+        await call('alice', 'PUT', '/api/v1/bundle/bundle', bundleFor('bundle', 'alice'));
+        await call('alice', 'PUT', '/api/v1/user-1234/bundle', bundleFor('user-1234', 'alice'));
+        const a = await call('alice', 'GET', '/api/auth/history');
+        assert.deepStrictEqual(a.body.map(r => r.bucket).sort(), ['CASE-1_alice', 'SHARED']);
+        // The per-bucket file list (older clients) lists the search file only,
+        // never the bookkeeping rows that used to show up as cases.
+        const files = await call('alice', 'GET', '/api/v1/CASE-1_alice/all-files');
+        assert.strictEqual(files.status, 200);
+        assert.deepStrictEqual(Object.keys(files.body).sort(), ['CASE-1']);
     });
 
     console.log(`\nAll ${passed} isolation checks passed.`);

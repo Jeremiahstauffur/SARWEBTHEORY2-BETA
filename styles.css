@@ -448,6 +448,12 @@ body[data-page="index"] .grid-table .header-pill {
   border-color: rgba(235, 87, 87, 0.45);
 }
 
+/* Saved Cases: the row of the case this device is working in */
+#saved-files-body tr.active-case-row {
+  background: rgba(var(--accent-rgb), 0.08);
+  box-shadow: inset 3px 0 0 var(--accent);
+}
+
 /* Delete Mode Toggle */
 .password-style {
   -webkit-text-security: disc;

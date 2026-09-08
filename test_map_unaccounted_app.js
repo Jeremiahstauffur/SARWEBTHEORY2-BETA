@@ -1,4 +1,5 @@
-// Drives the real app.js in a sandbox (fake localStorage / DOM / fetch) to check
+// Drives the real app.js in a sandbox (in-memory store handed in as
+// window.SAR_MEMORY_STORAGE, tripwire localStorage, fake DOM / fetch) to check
 // the Maps page "unaccounted map features" flow end to end:
 //   - the hidden unwanted list and the automatic-check toggle survive a save,
 //   - an import started from Fetch Shapes marks everything left out as unwanted,
@@ -68,11 +69,18 @@ function makeElement(depth = 0) {
     return el;
 }
 
+const localStorageAccess = [];
 function createSandbox({store, fetch, page = 'page10', withUtils = true} = {}) {
     const localStorage = {
-        getItem: (k) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
-        setItem: (k, v) => { store[k] = String(v); },
-        removeItem: (k) => { delete store[k]; }
+        getItem: (k) => { localStorageAccess.push(`getItem ${k}`); return null; },
+        setItem: (k) => { localStorageAccess.push(`setItem ${k}`); },
+        removeItem: () => {}
+    };
+    const sessionData = {};
+    const sessionStorage = {
+        getItem: (k) => (Object.prototype.hasOwnProperty.call(sessionData, k) ? sessionData[k] : null),
+        setItem: (k, v) => { sessionData[k] = String(v); },
+        removeItem: (k) => { delete sessionData[k]; }
     };
     const cookieJar = {'sar-user-name-v1': 'tester', 'sar-user-password-v1': '1234'};
     const byId = {};
@@ -116,7 +124,8 @@ function createSandbox({store, fetch, page = 'page10', withUtils = true} = {}) {
         setInterval: (fn, ms) => { intervals.push({fn, ms}); return intervals.length; },
         clearInterval() {},
         localStorage,
-        sessionStorage: localStorage,
+        sessionStorage,
+        SAR_MEMORY_STORAGE: store,
         document,
         navigator: {userAgent: 'node', onLine: true},
         addEventListener() {},

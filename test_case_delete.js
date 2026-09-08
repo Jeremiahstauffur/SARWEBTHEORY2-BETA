@@ -7,9 +7,13 @@
 //   * every structured-table row for (username, search_case = CASE #),
 //     targeting the specific CASE # (never a sibling case).
 // It also confirms the Super-Admin (PIN 1976) protection, that a case which
-// exists only on the server (never cached) or has no store rows at all (a
-// corrupt/orphaned case) can still be deleted, and that a percent-encoded
-// username in the URL round-trips to the decoded bucket the data lives under.
+// exists only on the server (never cached), has no store rows at all (a
+// corrupt/orphaned case) or holds an unreadable search file can still be
+// deleted, that structured rows an older build keyed by the file name (with
+// ".json") are cleared too, that a percent-encoded username in the URL
+// round-trips to the decoded bucket the data lives under, and that
+// /api/auth/history lists only real CASE #s (never the internal "bundle",
+// "all-files" or "user-<pin>" keys) together with each case's row counts.
 //
 // The MySQL pool is replaced with a tiny in-memory stand-in so the test runs
 // without a database. Data is pre-seeded directly into the stand-in (rather
@@ -54,6 +58,40 @@ const query = (rawSql, params, cb) => {
         const hit = [...store.entries()].find(([k, v]) =>
             k.split('\u0000')[0] === p[0] && v.userName === p[1] && v.userPin === p[2]);
         return cb(null, hit ? [{userPin: hit[1].userPin}] : []);
+    }
+
+    // ---- readStoredBundle (DELETE /:bucket and GET /api/auth/history) ----
+    if (/^SELECT value, userPin FROM store WHERE bucket = \? AND `key` = \? AND userName = \?$/.test(sql)) {
+        const hit = store.get(`${p[0]}\u0000${p[1]}`);
+        return cb(null, hit && hit.userName === p[2] ? [{value: hit.value, userPin: hit.userPin}] : []);
+    }
+
+    // ---- PUT /:bucket/:key (generic store write) ----
+    if (/^SELECT userPin, updatedAt FROM store WHERE bucket = \? AND `key` = \? AND userName = \?$/.test(sql)) {
+        const hit = store.get(`${p[0]}\u0000${p[1]}`);
+        return cb(null, hit && hit.userName === p[2] ? [{userPin: hit.userPin, updatedAt: hit.updatedAt}] : []);
+    }
+    if (/^REPLACE INTO store \(bucket, `key`, value, userName, userPin, updatedAt\) VALUES \(\?, \?, \?, \?, \?, \?\)$/.test(sql)) {
+        store.set(`${p[0]}\u0000${p[1]}`, {value: p[2], userName: p[3], userPin: p[4], updatedAt: p[5]});
+        return cb(null, {affectedRows: 1});
+    }
+    if (/^REPLACE INTO user_buckets \(username, bucket, lastAccessed\) VALUES \(\?, \?, \?\)$/.test(sql)) {
+        userBuckets.set(`${p[0]}\u0000${p[1]}`, {lastAccessed: p[2]});
+        return cb(null, {affectedRows: 1});
+    }
+    // Structured-table writes performed by the decompose after a PUT.
+    if ((m = sql.match(/^INSERT INTO `(\w+)` \(username, search_case, row_index, label, data, updatedAt\) VALUES/))) {
+        tableRows(m[1]).push({username: p[0], search_case: p[1], row_index: p[2], label: p[3], data: p[4], updatedAt: p[5]});
+        return cb(null, {affectedRows: 1});
+    }
+    if ((m = sql.match(/^REPLACE INTO `(\w+)` \(username, search_case, data, updatedAt\) VALUES/))) {
+        const rows = tableRows(m[1]).filter(r => !(r.username === p[0] && r.search_case === p[1]));
+        rows.push({username: p[0], search_case: p[1], data: p[2], updatedAt: p[3]});
+        tables.set(m[1], rows);
+        return cb(null, {affectedRows: 1});
+    }
+    if (/^REPLACE INTO login_info/.test(sql)) {
+        return cb(null, {affectedRows: 1});
     }
 
     // ---- DELETE /:bucket: three-way cleanup ----
@@ -218,6 +256,96 @@ const run = async () => {
         assert.strictEqual(res.status, 200);
         assert.ok(!userBuckets.has('ranger\u0000CORRUPT_ranger'), 'history row removed');
         assert.strictEqual(structuredRowsFor('ranger', 'CORRUPT'), 0, 'structured rows removed');
+    });
+
+    await check('case whose stored search file is unreadable (not JSON) is deleted like any other', async () => {
+        const now = new Date().toISOString();
+        store.set('BROKEN_ranger\u0000bundle', {value: '{not json', userName: 'ranger', userPin: '1234', updatedAt: now});
+        userBuckets.set('ranger\u0000BROKEN_ranger', {lastAccessed: now});
+        tableRows('segments').push({username: 'ranger', search_case: 'BROKEN', row_index: 0, label: 's', data: '["s"]', updatedAt: now});
+        // Listed (so it can be deleted) but flagged as having no readable file.
+        const before = await call('ranger', '1234', 'GET', '/api/auth/history');
+        const listed = (before.body || []).find(r => r.bucket === 'BROKEN_ranger');
+        assert.ok(listed, 'unreadable case is still listed');
+        assert.strictEqual(listed.hasFile, false, 'flagged as having no readable file');
+        const res = await call('ranger', '1234', 'DELETE', '/api/v1/BROKEN_ranger');
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(storeKeysFor('BROKEN_ranger', 'ranger').length, 0, 'store row removed');
+        assert.ok(!userBuckets.has('ranger\u0000BROKEN_ranger'), 'history row removed');
+        assert.strictEqual(structuredRowsFor('ranger', 'BROKEN'), 0, 'structured rows removed');
+    });
+
+    await check('structured rows keyed by the file name ("<CASE>.json", older builds) are cleared too', async () => {
+        const now = new Date().toISOString();
+        store.set('OLD_ranger\u0000bundle', {value: JSON.stringify({fileName: 'OLD.json', pages: {}}), userName: 'ranger', userPin: '1234', updatedAt: now});
+        userBuckets.set('ranger\u0000OLD_ranger', {lastAccessed: now});
+        tableRows('regions').push({username: 'ranger', search_case: 'OLD.json', row_index: 0, label: 'r', data: '["r"]', updatedAt: now});
+        tableRows('regions').push({username: 'ranger', search_case: 'OLD', row_index: 0, label: 'r', data: '["r"]', updatedAt: now});
+        const res = await call('ranger', '1234', 'DELETE', '/api/v1/OLD_ranger');
+        assert.strictEqual(res.status, 200);
+        assert.strictEqual(structuredRowsFor('ranger', 'OLD.json'), 0, '".json" keyed rows removed');
+        assert.strictEqual(structuredRowsFor('ranger', 'OLD'), 0, 'clean keyed rows removed');
+    });
+
+    await check('a delete never touches rows keyed by the shared internal "bundle" name', async () => {
+        const now = new Date().toISOString();
+        // Rows an older build mis-filed under search_case = "bundle" belong to no
+        // single case; a delete of one case must leave them alone.
+        tableRows('regions').push({username: 'ranger', search_case: 'bundle', row_index: 0, label: 'shared', data: '["shared"]', updatedAt: now});
+        seedCase('ranger', '1234', 'CASE-3', 'CASE-3_ranger');
+        const res = await call('ranger', '1234', 'DELETE', '/api/v1/CASE-3_ranger');
+        assert.strictEqual(res.status, 200);
+        assert.ok(!res.body.deleted.searchCases.includes('bundle'), 'internal key never targeted');
+        assert.strictEqual(structuredRowsFor('ranger', 'bundle'), 1, 'rows under "bundle" untouched');
+        tables.set('regions', tableRows('regions').filter(r => r.search_case !== 'bundle'));
+    });
+
+    await check('/api/auth/history lists only real cases, with hasFile + row counts', async () => {
+        const now = new Date().toISOString();
+        // Internal bookkeeping names an older build registered as "cases".
+        ['bundle', 'all-files', 'user-1967', 'user-Finders3!', 'bundle_ranger', 'all-files_ranger', 'user-1400_ranger']
+            .forEach(b => userBuckets.set(`ranger\u0000${b}`, {lastAccessed: now}));
+        const bundle = {
+            fileName: 'CASE-2',
+            pages: {
+                index: {rows: [['Region A', '', ''], ['', '', ''], ['Region B', '', '']]},
+                page2: [['', 'Seg 1'], ['', 'Seg 2'], ['', '']],
+                page3: [['Alice'], ['Bob'], ['Carol'], ['']],
+                page4: [['Task 1', 'x'], ['', '']]
+            }
+        };
+        store.set('CASE-2_ranger\u0000bundle', {value: JSON.stringify(bundle), userName: 'ranger', userPin: '1234', updatedAt: now});
+        const hist = await call('ranger', '1234', 'GET', '/api/auth/history');
+        assert.strictEqual(hist.status, 200);
+        const buckets = (hist.body || []).map(r => r.bucket);
+        ['bundle', 'all-files', 'user-1967', 'user-Finders3!', 'bundle_ranger', 'all-files_ranger', 'user-1400_ranger']
+            .forEach(b => assert.ok(!buckets.includes(b), `${b} is not listed as a case`));
+        const case2 = hist.body.find(r => r.bucket === 'CASE-2_ranger');
+        assert.ok(case2, 'CASE-2 listed');
+        assert.strictEqual(case2.caseNumber, 'CASE-2');
+        assert.strictEqual(case2.hasFile, true);
+        assert.deepStrictEqual(case2.stats, {regions: 2, segments: 2, personnel: 3, tasks: 1});
+        const protectedCase = hist.body.find(r => r.bucket === 'PROTECTED_ranger');
+        assert.ok(protectedCase, 'PROTECTED listed');
+        assert.strictEqual(protectedCase.hasFile, false, 'a stored "{}" (no pages) is not a readable search file');
+    });
+
+    await check('PUT of an internal key never registers a case or writes structured rows', async () => {
+        const put = async (path, body) => {
+            const resp = await fetch(`${baseUrl}${path}`, {method: 'PUT', headers: headersFor('ranger', '1234'), body: JSON.stringify(body)});
+            return resp.status;
+        };
+        const fileBody = {fileName: 'bundle', pages: {index: {rows: [['R']]}}};
+        assert.strictEqual(await put('/api/v1/CASE-2_ranger/all-files', {'CASE-2': {bundle: fileBody}}), 200);
+        assert.strictEqual(await put('/api/v1/CASE-2_ranger/user-1234', {deviceId: 'd', lastModified: new Date().toISOString()}), 200);
+        assert.strictEqual(await put('/api/v1/bundle/bundle', fileBody), 200);
+        await new Promise(r => setTimeout(r, 50));
+        const hist = await call('ranger', '1234', 'GET', '/api/auth/history');
+        const buckets = (hist.body || []).map(r => r.bucket);
+        assert.ok(!buckets.includes('bundle'), 'PUT /bundle/bundle did not register a case called "bundle"');
+        assert.strictEqual(structuredRowsFor('ranger', 'bundle'), 0, 'no structured rows under "bundle"');
+        assert.strictEqual(structuredRowsFor('ranger', 'all-files'), 0, 'no structured rows under "all-files"');
+        assert.strictEqual(structuredRowsFor('ranger', 'user-1234'), 0, 'no structured rows under "user-1234"');
     });
 
     await check('percent-encoded username round-trips to the decoded bucket + CASE #', async () => {

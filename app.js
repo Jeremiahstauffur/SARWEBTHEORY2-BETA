@@ -1,9 +1,25 @@
 const ROWS = 1;
 const COLS = 5;
 const DEFAULT_DYNAMIC_COLS = 3;
+// ---------------------------------------------------------------------------
+// Where the data lives
+//
+// Every search file (case) is stored ONLY in the database behind the sync
+// server (Railway). The browser keeps the case it is working on in memory for
+// as long as the page is open - never in localStorage, IndexedDB or any other
+// on-device store - so nothing is ever left on the computer and every page load
+// reads the current copy from the server. The only things a device remembers
+// between page loads are the login (cookies + sessionStorage) and the address
+// of the sync server to talk to.
+// ---------------------------------------------------------------------------
 const BUNDLE_STORAGE_KEY = 'pill-table-bundle-v1';
+// Older builds kept a copy of every case under this key; the Saved Cases table
+// is now read from the server and nothing is cached on the device any more.
 const FILE_LIST_STORAGE_KEY = 'sar-saved-files-v1';
-const DEFAULT_FILE_NAME = 'us-pill-data.json';
+// Stand-in shown while no CASE # is selected. A search file is never created
+// under this name: its name always follows the CASE # it was created for.
+const DEFAULT_FILE_NAME = '';
+const NO_CASE_LABEL = 'No case selected';
 const SYNC_URL_STORAGE_KEY = 'sar-sync-url-v1';
 const SYNC_URL_LOCAL_STORAGE_KEY = 'sar-sync-url-local-v1';
 const SYNC_BUCKET_STORAGE_KEY = 'sar-sync-bucket-v1';
@@ -14,14 +30,37 @@ const CALTOPO_CREDS_STORAGE_KEY = 'sar-caltopo-creds-v1';
 const DEVICE_ID_STORAGE_KEY = 'sar-device-id-v1';
 // Row changes this device has made but not yet delivered to the server. Every
 // save is diffed against the copy that was on this device just before it, and
-// only those rows are queued here and uploaded; the queue survives a reload or
-// a dropped connection and is retried until the server confirms it.
+// only those rows are queued here and uploaded. The queue lives in memory for
+// the lifetime of the page and is retried until the server confirms it.
 const SYNC_OUTBOX_STORAGE_KEY = 'sar-sync-outbox-v1';
-// Which CASE # (sync bucket) the locally stored search file belongs to, so a
-// copy left over from another case is never mistaken for this one's.
+// Which CASE # (sync bucket) the in-memory search file belongs to, so a copy
+// of another case is never mistaken for this one's.
 const BUNDLE_BUCKET_STORAGE_KEY = 'sar-bundle-bucket-v1';
 // Older builds kept a second full copy of the search file under this key.
 const LEGACY_SYNC_SNAPSHOT_STORAGE_KEY = 'sar-sync-snapshot-v1';
+// Everything an older build may have left in the browser's localStorage. It is
+// removed once on start-up so no case data stays on the computer.
+const LEGACY_LOCAL_STORAGE_KEYS = [
+    BUNDLE_STORAGE_KEY,
+    FILE_LIST_STORAGE_KEY,
+    SYNC_OUTBOX_STORAGE_KEY,
+    BUNDLE_BUCKET_STORAGE_KEY,
+    LEGACY_SYNC_SNAPSHOT_STORAGE_KEY,
+    'sar-server-settings-cache-v1',
+    'sar-map-unaccounted-last-check-v1',
+    'sar-sync-url-v1',
+    'sar-sync-bucket-v1',
+    'sar-caltopo-proxy-v1',
+    'sar-caltopo-creds-v1',
+    'sar-device-id-v1',
+    'sar-map-psrc-overlay-v1',
+    'sar-caltopo-assignment-overlay-v1',
+    'sar-segments-psrc-sort-v1',
+    'sar-chart-range-v1',
+    'sar-theme-cache',
+    'sar-accent-cache',
+    'sar-geek-mode-cache'
+];
 // How often a page asks the database whether the other devices changed
 // anything. The answer is tiny when nothing changed.
 const SYNC_POLL_INTERVAL_MS = 4000;
@@ -43,8 +82,9 @@ const CHART_RANGE_STORAGE_KEY = 'sar-chart-range-v1';
 // How often the app re-fetches the CalTopo map to look for shapes that are
 // neither imported as segments nor marked unwanted ("unaccounted" features).
 const MAP_UNACCOUNTED_CHECK_INTERVAL_MS = 5 * 60 * 1000;
-// When the last automatic check ran on this device. Kept in localStorage so
-// navigating between pages does not restart the 5-minute clock.
+// When the last automatic check ran. Kept in the per-user server settings
+// (keyed by sync bucket) so navigating between pages - or devices - does not
+// restart the 5-minute clock, without anything being stored on the device.
 const MAP_UNACCOUNTED_LAST_CHECK_STORAGE_KEY = 'sar-map-unaccounted-last-check-v1';
 const UNACCOUNTED_FEATURES_NOTIFICATION_TITLE = 'Unaccounted Map Features';
 const UNACCOUNTED_FEATURES_NOTIFICATION_CLASS = 'map-features-unaccounted';
@@ -1459,35 +1499,41 @@ function getSyncServerUrl() {
     return DEFAULT_SYNC_SERVER_URL;
 }
 
-const _memoryStorage = {};
+// The working copy of the open case, the rows still queued for the server and
+// the copy of the per-user settings all live here, in memory, for as long as
+// the page is open. Nothing below ever touches localStorage: closing or
+// reloading the page forgets everything and the next load reads the database.
+// (A test harness may hand in the object to use as window.SAR_MEMORY_STORAGE so
+// it can seed and inspect a page's memory; a browser never sets it.)
+const _memoryStorage = (typeof window !== 'undefined' && window.SAR_MEMORY_STORAGE && typeof window.SAR_MEMORY_STORAGE === 'object')
+    ? window.SAR_MEMORY_STORAGE
+    : {};
 
 function getStorageItem(key) {
-  try {
-    if (typeof localStorage !== 'undefined' && localStorage !== null) {
-      const val = localStorage.getItem(key);
-      if (val !== null && val !== undefined) return val;
-    }
-  } catch (e) {}
-  return _memoryStorage[key] || null;
+  return Object.prototype.hasOwnProperty.call(_memoryStorage, key) ? _memoryStorage[key] : null;
 }
 
 function setStorageItem(key, value) {
-  _memoryStorage[key] = value;
-  try {
-    if (typeof localStorage !== 'undefined' && localStorage !== null) {
-      localStorage.setItem(key, value);
-    }
-  } catch (e) {}
+  _memoryStorage[key] = String(value);
 }
 
 function removeStorageItem(key) {
   delete _memoryStorage[key];
+}
+
+// Remove whatever an older build of this site left in the browser's
+// localStorage (whole search files, the saved-cases list, queued rows, cached
+// settings). Runs once per page load; harmless when there is nothing to remove.
+function purgeLegacyLocalData() {
   try {
-    if (typeof localStorage !== 'undefined' && localStorage !== null) {
-      localStorage.removeItem(key);
-    }
+    if (typeof localStorage === 'undefined' || localStorage === null) return;
+    LEGACY_LOCAL_STORAGE_KEYS.forEach((key) => {
+      try { localStorage.removeItem(key); } catch (e) {}
+    });
   } catch (e) {}
 }
+
+purgeLegacyLocalData();
 
 const SERVER_SETTINGS_CACHE_KEY = 'sar-server-settings-cache-v1';
 
@@ -1503,6 +1549,17 @@ function getUserBucketSuffix() {
     return encodeURIComponent(creds.name);
 }
 
+// Names the website uses for its own bookkeeping on the server ("bundle",
+// "all-files", "user-<pin>"). They are never a CASE #: a stored case number
+// that reads like one is ignored, so a mis-saved setting can never make the
+// site work inside - or list - a case called "bundle".
+function isInternalCaseName(name) {
+    const value = String(name || '').trim().replace(/\.json$/i, '');
+    if (!value) return true;
+    if (value === 'bundle' || value === 'all-files') return true;
+    return /^user-/i.test(value);
+}
+
 function getSyncBucket() {
     let bucket = _serverSettings && _serverSettings[SYNC_BUCKET_STORAGE_KEY] ? _serverSettings[SYNC_BUCKET_STORAGE_KEY] : '';
     if (!bucket) {
@@ -1516,6 +1573,7 @@ function getSyncBucket() {
             }
         } catch (e) {}
     }
+    if (isInternalCaseName(bucket)) return '';
     const suffix = getUserBucketSuffix();
     if (bucket && suffix) {
         return `${bucket}_${suffix}`;
@@ -1566,6 +1624,22 @@ function caseNumberToBucket(caseNumber) {
     return suffix ? `${caseNumber}_${suffix}` : caseNumber;
 }
 
+// The clean CASE # this device is working in ('' while none is selected). A
+// search file's own name always follows it, so a file is never created under a
+// stand-in name and the structured tables on the server are always keyed by
+// the real CASE #.
+function getActiveCaseNumber() {
+    const bucket = getSyncBucket();
+    return bucket ? String(bucketToCaseNumber(bucket) || '').replace(/\.json$/i, '') : '';
+}
+
+// The CASE # to show for a search file: its own name, else the active CASE #,
+// else the "no case" stand-in.
+function getCaseDisplayName(bundle) {
+    const own = bundle && typeof bundle.fileName === 'string' ? bundle.fileName.trim() : '';
+    return own || getActiveCaseNumber() || NO_CASE_LABEL;
+}
+
 // True when a bucket id returned by /api/auth/history belongs to the current
 // login. Pre-existing "_<pin>" buckets from before per-user namespacing stay in
 // the database but must not be surfaced, so history-derived lists filter on this
@@ -1612,7 +1686,8 @@ function getUserCredentials() {
     return { name, password };
 }
 
-// Server-side settings cache (cached in localStorage + memory, loaded from server on login)
+// Per-user settings, stored on the server (/api/auth/settings) and mirrored in
+// memory for the lifetime of the page. Loaded once on start-up, right after login.
 let _serverSettings = null;
 let _serverSettingsLoading = false;
 
@@ -1689,6 +1764,10 @@ async function setServerSetting(key, value) {
     await saveServerSettings(settings);
 }
 
+// This login's cases as the server lists them (see GET /api/auth/history).
+// The request must carry the full credentials: the server authenticates every
+// read, and a name-only request was answered with 401, which left the Saved
+// Cases table showing whatever happened to be cached on the device instead.
 async function fetchUserHistory() {
     const creds = getUserCredentials();
     if (!creds) return [];
@@ -1696,13 +1775,12 @@ async function fetchUserHistory() {
     if (!serverUrl) return [];
 
     try {
-        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/auth/history`, {
-            headers: {
-                'X-User-Name': creds.name
-            }
+        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/auth/history?_=${Date.now()}`, {
+            headers: getAuthHeaders()
         });
         if (resp.ok) {
-            return await resp.json();
+            const list = await resp.json();
+            return Array.isArray(list) ? list : [];
         }
     } catch (e) {
         console.warn("Failed to fetch history:", e);
@@ -3163,12 +3241,23 @@ function setCurrentUser(user) {
     sessionStorage.setItem('sar-current-user', JSON.stringify(user));
     notifyActiveUser(user);
   } else {
+    // Logging out: forget the login AND everything of this user's that the
+    // page holds in memory (the open case, queued rows, the settings copy),
+    // so the next login on this device starts from the database alone.
     sessionStorage.removeItem('sar-current-user');
     eraseCookie(USER_NAME_STORAGE_KEY);
     eraseCookie(USER_PASSWORD_STORAGE_KEY);
     eraseCookie(SYNC_BUCKET_STORAGE_KEY);
+    clearInMemoryUserData();
   }
     syncMobileBottomNav();
+}
+
+// Drop every piece of the logged-in user's data the page holds in memory.
+function clearInMemoryUserData() {
+  [BUNDLE_STORAGE_KEY, BUNDLE_BUCKET_STORAGE_KEY, SYNC_OUTBOX_STORAGE_KEY, SERVER_SETTINGS_CACHE_KEY]
+    .forEach((key) => removeStorageItem(key));
+  _serverSettings = null;
 }
 
 function checkAccess() {
@@ -3321,8 +3410,7 @@ function getIcReportCompletionLabel(report) {
 
 // The CASE # shown under the "IC Report" title (the file name without .json).
 function getIcReportCaseLabel(bundle) {
-  const name = String((bundle && bundle.fileName) || DEFAULT_FILE_NAME).replace(/\.json$/i, '');
-  return name;
+  return getCaseDisplayName(bundle).replace(/\.json$/i, '');
 }
 
 function escapeIcReportHtml(value) {
@@ -3545,7 +3633,8 @@ function renderIcReportForm() {
 
 function defaultBundle() {
   return {
-    fileName: DEFAULT_FILE_NAME,
+    // A new search file is named after the CASE # it is created for.
+    fileName: getActiveCaseNumber() || DEFAULT_FILE_NAME,
     lastModified: new Date(0).toISOString(),
     deleteMode: false,
     theme: 'dark',
@@ -3681,7 +3770,7 @@ function sanitizeBundle(bundle) {
 
   const fileName = typeof bundle.fileName === 'string' && bundle.fileName.trim()
     ? bundle.fileName.trim()
-    : DEFAULT_FILE_NAME;
+    : (getActiveCaseNumber() || DEFAULT_FILE_NAME);
 
   const deleteMode = typeof bundle.deleteMode === 'boolean' ? bundle.deleteMode : false;
   const background = typeof bundle.background === 'string' && bundle.background.trim()
@@ -4003,9 +4092,10 @@ function restoreActivityLogEntriesAddedMeanwhile(bundle, stored, loadedVersion) 
 // Every save is diffed against the copy that was on this device just before it
 // (SARSyncDelta.computeBundleChanges) and only the rows that differ are queued
 // here, under "<CASE #>::<file name>", until the server confirms them. The
-// queue lives in localStorage so a reload, a closed tab or a dropped connection
-// never loses an edit; a batch keeps its id across retries so the server can
-// recognise one it already applied.
+// queue lives in memory for as long as the page is open (nothing is stored on
+// the device); a dropped connection is retried by the next save or poll, and a
+// batch keeps its id across retries so the server can recognise one it already
+// applied.
 // ----------------------------------------------------------------------------
 
 function getSyncDeltaUtils() {
@@ -4135,7 +4225,7 @@ function createBatchId() {
     return `${Date.now().toString(36)}-${Math.random().toString(36).slice(2, 12)}`;
 }
 
-// Remember which CASE # the locally stored search file belongs to.
+// Remember which CASE # the in-memory search file belongs to.
 function tagLocalBundleBucket() {
     const bucket = getSyncBucket();
     if (bucket) {
@@ -4145,14 +4235,13 @@ function tagLocalBundleBucket() {
     }
 }
 
-// A stored search file tagged with another CASE # must never be shown here,
-// let alone uploaded into this case: drop it so the case is read from the
-// database instead. A copy without a tag (left by the previous build) is kept
-// for the one-time migration in syncWithServer(). Returns true when dropped.
+// A search file in memory that belongs to another CASE # must never be shown
+// here, let alone uploaded into this case: drop it so the case is read from
+// the database instead. Returns true when dropped.
 function discardForeignLocalCopy() {
     const bucket = getSyncBucket();
     const tag = getStorageItem(BUNDLE_BUCKET_STORAGE_KEY);
-    if (!bucket || !tag || tag === bucket || !getStorageItem(BUNDLE_STORAGE_KEY)) return false;
+    if (!bucket || !getStorageItem(BUNDLE_STORAGE_KEY) || tag === bucket) return false;
     removeStorageItem(BUNDLE_STORAGE_KEY);
     removeStorageItem(BUNDLE_BUCKET_STORAGE_KEY);
     return true;
@@ -4184,9 +4273,6 @@ function fetchInitWithKeepalive(body, init = {}) {
     return out;
 }
 
-// Older builds kept a second full copy of the search file; it is not needed
-// any more and only takes up storage.
-removeStorageItem(LEGACY_SYNC_SNAPSHOT_STORAGE_KEY);
 
 // The parts of the search file that decide how the CalTopo assignment overlay
 // draws a segment (active-search vs resting style) and what the finished-task
@@ -4219,9 +4305,9 @@ function didSearchActivityChange(previous, next) {
   }
 }
 
-// Store the search file locally, queue the rows that changed and (unless the
-// caller flushes later itself) send them. Returns the flush promise so callers
-// that reload or wait can await the write.
+// Keep the search file in memory, queue the rows that changed and (unless the
+// caller flushes later itself) send them to the database. Returns the flush
+// promise so callers that reload or wait can await the write.
 //
 // A team reporting "Finished Assignment" (or any other status / assignment /
 // task-form change, see buildSearchActivitySignature) must reach CalTopo too:
@@ -4235,44 +4321,23 @@ function saveBundle(bundle, deferFlush = false) {
   queueBundleChanges(previous, sanitized);
   setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
   tagLocalBundleBucket();
-  // Ensure the current file is always in the saved files list
-  saveFileToList(sanitized.fileName, sanitized);
   updateFileNameDisplay();
   const flush = deferFlush ? Promise.resolve(false) : pushBundleDelta(sanitized);
   if (didSearchActivityChange(previous, sanitized)) refreshCalTopoAssignmentOverlayIfEnabled();
   return flush;
 }
 
+// The Saved Cases table is the server's list of this login's cases
+// (/api/auth/history); no copy of any case is kept on the device. These stay
+// as the (empty) local view of that list for the callers that still ask.
 function getSavedFiles() {
-    const raw = getStorageItem(FILE_LIST_STORAGE_KEY);
-    if (!raw) return {};
-    try {
-        return JSON.parse(raw);
-    } catch {
-        return {};
-    }
+    return {};
 }
 
-function saveFileToList(fileName, bundle) {
-    const files = getSavedFiles();
-    if (!files[fileName]) {
-        logCreation('File', fileName, bundle);
-    }
-    files[fileName] = {
-        bundle: sanitizeBundle(bundle),
-        lastModified: new Date().toISOString()
-    };
-    setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
-    // No longer push to server immediately to prevent race conditions during sync.
-    // Background sync loop will handle pushing merged updates.
-}
+function saveFileToList() {}
 
 function deleteFileFromList(fileName) {
-    const files = getSavedFiles();
     logDeletion('File', fileName);
-    delete files[fileName];
-    setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
-    // No longer push to server immediately to prevent race conditions during sync.
 }
 
 // Import a case (.json) file exported from the Saved Cases table.
@@ -4348,84 +4413,186 @@ async function importCaseFromJson(text) {
     setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(bundle));
     tagLocalBundleBucket();
     writeOutboxRecord(bundle, {cursor: bundle.lastModified, changes: [], inFlight: null, needsFullUpload: false});
-    const files = getSavedFiles();
-    files[caseNumber] = {bundle, lastModified: bundle.lastModified};
-    setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
     updateFileNameDisplay();
     return caseNumber;
 }
 
-// Permanently delete a whole case everywhere it lives. The server side (store
-// rows, case history, and structured tables) is removed via DELETE
-// /api/v1/:bucket, then the local cache is dropped. This keys off the CASE #
-// rather than a loadable bundle, so a corrupt or never-cached case can still be
-// deleted and, because the server copy is gone, it will not resync back.
+// Read another case's search file straight from the database (the Saved Cases
+// table's Export and Edit work on cases that are not open). Resolves to the
+// sanitized file, or null when the server has none for this login and CASE #.
+// Throws with a user-facing message when the server cannot be reached.
+async function fetchCaseFromServer(caseNumber) {
+    const clean = String(caseNumber || '').replace(/\.json$/i, '');
+    const serverUrl = getSyncServerUrl();
+    if (!clean || !serverUrl || !getUserCredentials()) {
+        throw new Error('Log in and connect to the sync server first.');
+    }
+    const bucket = caseNumberToBucket(clean);
+    let resp;
+    try {
+        resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/bundle?_=${Date.now()}`, {
+            headers: getAuthHeaders()
+        });
+    } catch (e) {
+        throw new Error('Could not reach the server. Please try again when online.');
+    }
+    if (resp.status === 404) return null;
+    if (!resp.ok) throw new Error(`The server refused the request (HTTP ${resp.status}).`);
+    const body = await resp.json().catch(() => null);
+    if (!body || typeof body !== 'object' || Array.isArray(body) || !body.pages) return null;
+    return sanitizeBundle({...body, fileName: clean});
+}
+
+// Rename a case on the server: its search file is stored again under the new
+// CASE # (the server rewrites the structured tables from it), then every row
+// of the old CASE # is deleted. If the renamed case is the open one, this
+// device switches to the new CASE #. Resolves to true when renamed; alerts and
+// resolves to false otherwise, leaving the old case untouched.
+async function renameCaseOnServer(oldCaseNumber, newCaseNumber) {
+    const oldClean = String(oldCaseNumber || '').replace(/\.json$/i, '');
+    // The CASE # is kept in the same URL-safe form the New-case popup uses, so
+    // the file name, the bucket and the Saved Cases row all read the same.
+    const newClean = String(newCaseNumber || '').replace(/\.json$/i, '').trim().replace(/[^a-zA-Z0-9_-]/g, '_');
+    const newBucketId = newClean;
+    if (!oldClean || !newClean || isInternalCaseName(newClean)) {
+        if (newClean && isInternalCaseName(newClean)) alert(`"${newClean}" is reserved and cannot be used as a case number.`);
+        return false;
+    }
+    if (oldClean === newClean) return true;
+
+    let bundle;
+    try {
+        bundle = await fetchCaseFromServer(oldClean);
+    } catch (e) {
+        alert(e.message);
+        return false;
+    }
+    if (!bundle) {
+        alert(`The server has no search file for "${oldClean}", so it cannot be renamed. You can still delete it.`);
+        return false;
+    }
+
+    const wasActive = getActiveCaseNumber() === oldClean;
+    // A rename of the open case must carry this device's latest rows.
+    if (wasActive) {
+        const active = loadBundle();
+        if (String(active.fileName || '').replace(/\.json$/i, '') === oldClean) bundle = sanitizeBundle(active);
+    }
+    bundle.fileName = newClean;
+    delete bundle._sectionUpdatedAt;
+    addActivityLogEntry('System', `Case # ${oldClean} renamed to ${newClean}`, bundle);
+    bundle.lastModified = new Date().toISOString();
+
+    const serverUrl = getSyncServerUrl();
+    let resp;
+    try {
+        resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${caseNumberToBucket(newBucketId)}/bundle?import=1`, {
+            method: 'PUT',
+            headers: getAuthHeaders(),
+            body: JSON.stringify(bundle)
+        });
+    } catch (e) {
+        alert('Could not reach the server to rename this case. Please try again when online.');
+        return false;
+    }
+    if (!resp.ok) {
+        let message = `The server refused the rename (HTTP ${resp.status}).`;
+        try {
+            const body = await resp.json();
+            if (body && (body.message || body.error)) message = body.message || body.error;
+        } catch (e) {}
+        alert(message);
+        return false;
+    }
+    const result = await resp.json().catch(() => ({}));
+    if (result && typeof result.lastModified === 'string' && result.lastModified) {
+        bundle.lastModified = result.lastModified;
+    }
+
+    if (wasActive) {
+        // Switch before the old case is deleted, so the delete below never
+        // resets the bucket of the case that is now open.
+        await setSyncBucket(newBucketId);
+        removeOutboxRecordsForBucket(getSyncBucket());
+        setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(bundle));
+        tagLocalBundleBucket();
+        writeOutboxRecord(bundle, {cursor: bundle.lastModified, changes: [], inFlight: null, needsFullUpload: false});
+        updateFileNameDisplay();
+    }
+    await deleteCaseEverywhere(oldClean);
+    return true;
+}
+
+// Permanently delete a whole case from the database: DELETE /api/v1/:bucket
+// removes every row the server holds for (this login, CASE #) - the stored
+// search file, the case history entry and every structured-table row - in one
+// go. This keys off the CASE # alone, never off a loadable search file, so a
+// case that cannot be opened (corrupt, half-written, never downloaded) is
+// deleted exactly like any other and, because the server copy is gone, it can
+// never come back through a sync.
 //
-// If the deleted case is the one currently open, the active bundle and sync
-// bucket are reset so the app stops showing (and re-pushing) a case that no
-// longer exists. Local removal only happens after the server confirms the
-// delete, so an offline/refused delete never leaves a half-deleted case.
-// Returns true when the case was removed, false when the server refused it
-// (e.g. Super-Admin protection) or could not be reached.
+// If the deleted case is the one currently open, the in-memory copy and the
+// sync bucket are reset so the app stops showing (and re-pushing) a case that
+// no longer exists. Nothing is touched until the server confirms the delete,
+// so an offline/refused delete never leaves a half-deleted case. Returns true
+// when the case was removed, false when the server refused it (e.g. Super-Admin
+// protection) or could not be reached.
 async function deleteCaseEverywhere(caseNumber) {
     const clean = String(caseNumber || '').replace(/\.json$/i, '');
     if (!clean) return false;
 
     const serverUrl = getSyncServerUrl();
-    if (serverUrl) {
-        // Build and interpolate the bucket exactly like syncWithServer() does
-        // (getSyncBucket()-style) so the DELETE targets the same bucket the data
-        // was written under.
-        const bucket = caseNumberToBucket(clean);
-        try {
-            const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}`, {
-                method: 'DELETE',
-                headers: getAuthHeaders()
-            });
-            if (!resp.ok) {
-                // Surface the server's reason (e.g. Super-Admin protection) and
-                // leave the case in place so nothing is half-deleted.
-                let message = 'Failed to delete this case on the server. Please try again.';
-                try {
-                    const body = await resp.json();
-                    if (body && body.message) message = body.message;
-                } catch (e) {}
-                alert(message);
-                return false;
-            }
-        } catch (e) {
-            alert('Could not reach the server to delete this case. Please try again when online.');
-            return false;
-        }
+    if (!serverUrl || !getUserCredentials()) {
+        alert('Log in and connect to the sync server before deleting a case.');
+        return false;
     }
 
-    // Local cleanup. If the deleted case is the one currently open, drop the
-    // active copy first so nothing below can save it again (a save would queue
-    // rows and re-seed the case the server just removed). Rows still queued
-    // for the case are forgotten too, so nothing is re-sent for it.
-    let deletingActive = false;
+    // Build and interpolate the bucket exactly like syncWithServer() does
+    // (getSyncBucket()-style) so the DELETE targets the same bucket the data
+    // was written under.
+    const bucket = caseNumberToBucket(clean);
     try {
-        const active = loadBundle();
-        deletingActive = !!active && String(active.fileName || '').replace(/\.json$/i, '') === clean;
-    } catch (e) {}
+        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}`, {
+            method: 'DELETE',
+            headers: getAuthHeaders()
+        });
+        if (!resp.ok) {
+            // Surface the server's reason (e.g. Super-Admin protection) and
+            // leave the case in place so nothing is half-deleted.
+            let message = 'Failed to delete this case on the server. Please try again.';
+            try {
+                const body = await resp.json();
+                if (body && body.message) message = body.message;
+            } catch (e) {}
+            alert(message);
+            return false;
+        }
+    } catch (e) {
+        alert('Could not reach the server to delete this case. Please try again when online.');
+        return false;
+    }
+
+    // If the deleted case is the one currently open, drop the working copy so
+    // nothing below can save it again (a save would queue rows and re-seed the
+    // case the server just removed). Rows still queued for the case are
+    // forgotten too, so nothing is re-sent for it. Whether a case is "open" is
+    // decided by the active CASE #, not by whether its file could be parsed, so
+    // a defective open case is reset as well.
+    let deletingActive = getActiveCaseNumber() === clean;
+    if (!deletingActive) {
+        try {
+            const active = loadBundle();
+            deletingActive = !!active && String(active.fileName || '').replace(/\.json$/i, '') === clean;
+        } catch (e) {}
+    }
     if (deletingActive) {
         removeStorageItem(BUNDLE_STORAGE_KEY);
         removeStorageItem(BUNDLE_BUCKET_STORAGE_KEY);
+    } else if (getActiveCaseNumber()) {
+        // The deletion is logged into the activity log of the case that stays open.
+        deleteFileFromList(clean);
     }
-    removeOutboxRecordsForBucket(caseNumberToBucket(clean));
-
-    // Drop any cached copy (keyed by the CASE # or "<CASE>.json"). The deletion
-    // is logged into the activity log of the case that stays open, if any.
-    const files = getSavedFiles();
-    Object.keys(files).forEach((key) => {
-        if (String(key).replace(/\.json$/i, '') !== clean) return;
-        if (deletingActive) {
-            delete files[key];
-            setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
-        } else {
-            deleteFileFromList(key);
-        }
-    });
+    removeOutboxRecordsForBucket(bucket);
 
     // Reset the sync bucket of a deleted active case. Await the setSyncBucket('')
     // write so a caller that reloads cannot abort it, and refresh the file-name
@@ -4748,8 +4915,9 @@ function updateFileNameDisplay() {
   if (brandEl) brandEl.textContent = BRAND_NAME;
 
   const bundle = loadBundle();
+  const displayName = getCaseDisplayName(bundle);
   document.querySelectorAll('[data-file-name]').forEach((el) => {
-    el.textContent = bundle.fileName;
+    el.textContent = displayName;
   });
 
   const creds = getUserCredentials();
@@ -6386,9 +6554,9 @@ function buildPersonnelAllMembersTable() {
           statusBtn.textContent = statusLabel === 'false' ? 'Off Duty' : statusLabel;
           
           statusBtn.onclick = () => {
+            // The member travels in the address, not in browser storage.
             const memberName = data[originalRowIndex][0] || '';
-            sessionStorage.setItem('mobile-status-member', memberName);
-            navigateToPage('mobile-status.html');
+            navigateToPage(`mobile-status.html?member=${encodeURIComponent(memberName)}`);
           };
           cellContainer.appendChild(statusBtn);
         } else { // GPS, Radio, Medic columns
@@ -6562,7 +6730,9 @@ function calculatePSRAfter(row, bundle, segDataOverride = null) {
   return isFinite(psrAfter) ? psrAfter.toFixed(4) : '';
 }
 
-let lastKnownProgress = JSON.parse(sessionStorage.getItem('lastKnownProgress') || '{}');
+// Progress-bar levels of the current page (for the fill animation). In memory
+// only: the values come from the case data, which never stays on the device.
+let lastKnownProgress = {};
 const updatedTasks = new Set();
 
 function markTaskUpdated(teamName) {
@@ -6609,7 +6779,6 @@ function createProgressBar(progress, keyRaw) {
                         progFill.style.width = '0%';
                         progFill.classList.remove('animate-progress', 'filling', 'completed-green', 'fade-out');
                         lastKnownProgress[key] = 0;
-                        sessionStorage.setItem('lastKnownProgress', JSON.stringify(lastKnownProgress));
                     }, 1000);
                 }, 3000);
             }, 600);
@@ -6624,7 +6793,6 @@ function createProgressBar(progress, keyRaw) {
   
   if (progress < 100) {
       lastKnownProgress[key] = progress;
-      sessionStorage.setItem('lastKnownProgress', JSON.stringify(lastKnownProgress));
   }
 
   return progFill;
@@ -10401,72 +10569,84 @@ function showRenameCasePopup(currentName, originElement, onConfirm) {
     setTimeout(() => { input.focus(); input.select(); }, 100);
 }
 
-// Saved Cases table. Rows come from the current user's server-side case history
-// (/api/auth/history via fetchUserHistory) merged with any locally-cached
-// bundles (getSavedFiles), keyed by the clean CASE #. Per-case metric columns
-// are computed only when the bundle is cached locally; otherwise a "—"
-// placeholder is shown until the case is opened.
-async function buildSavedFilesTable() {
-    const tbody = document.getElementById('saved-files-body');
-    if (!tbody) return;
-
-    const files = getSavedFiles();
-    const currentUser = getCurrentUser();
-    const isAdmin = isUserAdmin(currentUser);
-    const isFileManager = currentUser && (currentUser.isFileManager === true || currentUser.isFileManager === 'true');
-
-    // Normalize a case-number/file-name for merge/dedup (drop any .json suffix).
+// The Saved Cases rows for the logged-in user, straight from the server
+// (/api/auth/history). Only this login's own cases are listed - the server
+// filters by the authenticated username and the internal store keys ("bundle",
+// "all-files", "user-<pin>") are never cases - and a stale "_<pin>" bucket from
+// before per-user namespacing is dropped too. Each row carries the CASE #,
+// when it was last opened, whether the server holds a readable search file for
+// it (`hasFile`) and, if so, the Regions / Segments / Personnel / Tasks counts
+// (`stats`). Nothing is read from, or kept on, the device.
+async function fetchSavedCases() {
     const normalizeCase = (name) => String(name || '').replace(/\.json$/i, '');
-
-    // Ordered, de-duplicated list of case numbers plus per-case metadata.
-    const order = [];
-    const seen = new Set();
-    const meta = {};
-    const addCase = (caseNumber) => {
-        if (!caseNumber) return;
-        if (!seen.has(caseNumber)) { seen.add(caseNumber); order.push(caseNumber); meta[caseNumber] = {}; }
-    };
-
-    // 1) Server case history first (preserves lastAccessed ordering).
     let history = [];
     try {
         history = await fetchUserHistory();
     } catch (e) {
         history = [];
     }
-    (history || []).forEach(item => {
-        // Fresh start: skip legacy "_<pin>" buckets from before per-user
-        // namespacing so another login's (or the old shared) cases never show.
-        if (!bucketBelongsToCurrentUser(item.bucket)) return;
+    const seen = new Set();
+    const cases = [];
+    (history || []).forEach((item) => {
+        if (!item || !item.bucket || !bucketBelongsToCurrentUser(item.bucket)) return;
         const caseNumber = normalizeCase(bucketToCaseNumber(item.bucket));
-        if (!caseNumber) return;
-        addCase(caseNumber);
-        meta[caseNumber].lastAccessed = item.lastAccessed;
+        if (!caseNumber || isInternalCaseName(caseNumber) || seen.has(caseNumber)) return;
+        seen.add(caseNumber);
+        cases.push({
+            caseNumber,
+            lastAccessed: item.lastAccessed || null,
+            lastModified: item.lastModified || null,
+            hasFile: item.hasFile === true,
+            stats: item.stats && typeof item.stats === 'object' ? item.stats : null
+        });
     });
+    return cases;
+}
 
-    // 2) Merge in any locally-cached cases (provide the bundle for metrics).
-    Object.keys(files).forEach(name => {
-        const caseNumber = normalizeCase(name);
-        addCase(caseNumber);
-        meta[caseNumber].localKey = name;
-        meta[caseNumber].localInfo = files[name];
-    });
+// Saved Cases table. Every row is one of the logged-in user's cases as the
+// server lists them (fetchSavedCases). Load, Edit (rename), Export and Delete
+// all act on the server copy of that case directly, so none of them needs the
+// case to be open first - in particular Delete works on a case whose file
+// cannot be loaded, which is exactly when a user most needs to get rid of it.
+async function buildSavedFilesTable() {
+    const tbody = document.getElementById('saved-files-body');
+    if (!tbody) return;
 
-    if (order.length === 0) {
+    // Whether the person at the keyboard may delete cases. Decided when Delete
+    // is pressed, not when the table is drawn: the table is often drawn before
+    // the profile popup has been answered, and a permission frozen at that
+    // moment made Delete refuse ("no permission") until the page was rebuilt.
+    const canDeleteNow = () => {
+        const currentUser = getCurrentUser();
+        const isAdmin = isUserAdmin(currentUser);
+        const isFileManager = currentUser && (currentUser.isFileManager === true || currentUser.isFileManager === 'true');
+        return !!(isAdmin || isFileManager);
+    };
+
+    // Normalize a case-number/file-name for comparisons (drop any .json suffix).
+    const normalizeCase = (name) => String(name || '').replace(/\.json$/i, '');
+
+    const cases = await fetchSavedCases();
+    // The table may have been rebuilt meanwhile (a sync refresh); only the
+    // newest build may write into it.
+    if (!document.getElementById('saved-files-body')) return;
+
+    if (cases.length === 0) {
         tbody.innerHTML = '<tr><td colspan="6" style="text-align: center; color: var(--muted); padding: 20px;">No saved cases yet.</td></tr>';
         return;
     }
 
     tbody.innerHTML = '';
+    const activeCase = getActiveCaseNumber();
 
-    order.forEach(caseNumber => {
-        const info = meta[caseNumber] || {};
-        const localInfo = info.localInfo;
-        const hasLocal = !!(localInfo && localInfo.bundle);
-        const stats = hasLocal ? computeBundleStats(localInfo.bundle) : null;
+    cases.forEach((info) => {
+        const caseNumber = info.caseNumber;
+        const stats = info.stats;
+        const isActive = !!activeCase && activeCase === caseNumber;
 
         const tr = document.createElement('tr');
         tr.style.borderBottom = '1px solid rgba(255,255,255,0.05)';
+        if (isActive) tr.classList.add('active-case-row');
 
         // Case #
         const tdCase = document.createElement('td');
@@ -10474,6 +10654,17 @@ async function buildSavedFilesTable() {
         tdCase.style.padding = '12px 15px';
         tdCase.style.fontWeight = 'bold';
         tdCase.textContent = caseNumber;
+        if (!info.hasFile) {
+            // Listed but without a readable search file on the server: it can
+            // be deleted (or re-created by opening it), and the user is told why
+            // its numbers are blank.
+            const note = document.createElement('div');
+            note.style.fontSize = '0.75rem';
+            note.style.fontWeight = 'normal';
+            note.style.color = 'var(--muted)';
+            note.textContent = 'No search file stored for this case';
+            tdCase.appendChild(note);
+        }
         tr.appendChild(tdCase);
 
         // Metric columns (Regions / Segments / Personnel / Tasks Logged)
@@ -10483,7 +10674,7 @@ async function buildSavedFilesTable() {
             td.style.padding = '12px 15px';
             td.style.textAlign = 'center';
             td.style.color = 'var(--muted)';
-            td.textContent = stats ? String(stats[key]) : '\u2014';
+            td.textContent = stats && Number.isFinite(Number(stats[key])) ? String(stats[key]) : '\u2014';
             tr.appendChild(td);
         });
 
@@ -10498,99 +10689,102 @@ async function buildSavedFilesTable() {
         btnCont.style.justifyContent = 'center';
         btnCont.style.gap = '10px';
 
-        // Edit (rename the case number). Works on locally-cached cases; a
-        // non-cached case must be opened first so its data can be re-keyed.
+        // Edit (rename the case number) - re-keys the server copy, no load needed.
         const editBtn = document.createElement('button');
         editBtn.className = 'mini-pill';
         editBtn.textContent = 'Edit';
         editBtn.onclick = () => {
-            if (!hasLocal) {
-                alert('Open this case (Load) before renaming it.');
+            if (!info.hasFile) {
+                alert('The server has no search file for this case, so it cannot be renamed. You can delete it, or open it to start a new file under this Case #.');
                 return;
             }
-            showRenameCasePopup(caseNumber, editBtn, (newName) => {
+            showRenameCasePopup(caseNumber, editBtn, async (newName) => {
                 const cleanNew = normalizeCase(newName);
                 if (!cleanNew || cleanNew === caseNumber) return;
-                const files2 = getSavedFiles();
-                const collisionKey = Object.keys(files2).find(k => normalizeCase(k) === cleanNew);
-                if (collisionKey) {
+                if (cases.some((c) => c.caseNumber === cleanNew)) {
                     if (!confirm(`A case named "${cleanNew}" already exists. Overwrite it?`)) return;
                 }
-                const localKey = info.localKey;
-                const targetBundle = (files2[localKey] && files2[localKey].bundle) || localInfo.bundle;
-                targetBundle.fileName = cleanNew;
-
-                const active = loadBundle();
-                const wasActive = active && normalizeCase(active.fileName) === caseNumber;
-
-                saveFileToList(cleanNew, targetBundle);
-                if (localKey && normalizeCase(localKey) !== cleanNew) {
-                    deleteFileFromList(localKey);
-                }
-                if (wasActive) {
-                    active.fileName = cleanNew;
-                    saveBundle(active);
-                    setSyncBucket(cleanNew);
-                    updateFileNameDisplay();
+                beginUserAction();
+                try {
+                    if (await renameCaseOnServer(caseNumber, cleanNew)) {
+                        setHomeStatus(`Case # ${caseNumber} renamed to ${cleanNew}.`);
+                    }
+                } finally {
+                    endUserAction();
                 }
                 buildSavedFilesTable();
             });
         };
         btnCont.appendChild(editBtn);
 
-        // Load (open the case).
+        // Load (open the case): the CASE # is remembered server-side and the
+        // reload reads the case from the database.
         const loadBtn = document.createElement('button');
         loadBtn.className = 'mini-pill';
         loadBtn.style.fontWeight = 'bold';
-        loadBtn.textContent = 'Load';
+        loadBtn.textContent = isActive ? 'Reload' : 'Load';
         loadBtn.onclick = async () => {
-            if (hasLocal) {
-                saveBundle(localInfo.bundle);
-            } else {
-                await setSyncBucket(caseNumber);
-            }
+            await setSyncBucket(caseNumber);
             window.location.reload();
         };
         btnCont.appendChild(loadBtn);
 
-        // Delete (existing admin / file-manager permission rules).
+        // Delete: clears every database row tied to this login and CASE #.
+        // Never needs the case to be loaded (or even loadable).
         const delBtn = document.createElement('button');
         delBtn.className = 'row-delete-btn';
         delBtn.textContent = 'Delete';
+        delBtn.title = 'Delete this case and every row stored for it on the server';
         delBtn.onclick = () => {
-            if (!(isAdmin || isFileManager)) {
+            if (!canDeleteNow()) {
                 alert('You do not have permission to delete files. Contact Super Admin or a File Manager.');
                 return;
             }
-            const b = loadBundle();
-            // Permanently remove the case everywhere (server + local). No local
-            // copy is required, so a corrupt or never-cached case can still be
-            // deleted; deleteCaseEverywhere() also resets the active bundle/sync
-            // bucket when the deleted case is the one currently open. Super-Admin
-            // protection and any server error are surfaced from inside the helper.
+            let quickDelete = false;
+            try { quickDelete = loadBundle().deleteMode === true; } catch (e) {}
             const doDelete = async () => {
-                const ok = await deleteCaseEverywhere(caseNumber);
-                if (!ok) return;
+                delBtn.disabled = true;
+                beginUserAction();
+                let ok = false;
+                try {
+                    ok = await deleteCaseEverywhere(caseNumber);
+                } finally {
+                    endUserAction();
+                }
+                if (!ok) { delBtn.disabled = false; return; }
+                setHomeStatus(`Case # ${caseNumber} and all of its data were deleted from the server.`);
                 buildSavedFilesTable();
             };
-            if (b.deleteMode) {
+            if (quickDelete) {
                 doDelete();
-            } else if (confirm(`Are you sure you want to delete "${caseNumber}"?`)) {
+            } else if (confirm(`Delete case "${caseNumber}" and every row stored for it on the server? This cannot be undone.`)) {
                 doDelete();
             }
         };
         btnCont.appendChild(delBtn);
 
-        // Export (download the case JSON).
+        // Export (download the case JSON as the server holds it).
         const exportBtn = document.createElement('button');
         exportBtn.className = 'mini-pill';
         exportBtn.textContent = 'Export';
-        exportBtn.onclick = () => {
-            if (!hasLocal) {
-                alert('Open this case (Load) before exporting it.');
+        exportBtn.onclick = async () => {
+            if (!info.hasFile) {
+                alert('The server has no search file for this case, so there is nothing to export.');
                 return;
             }
-            downloadTextFile(caseNumber + '.json', JSON.stringify(localInfo.bundle, null, 2));
+            exportBtn.disabled = true;
+            try {
+                const bundle = await fetchCaseFromServer(caseNumber);
+                if (!bundle) {
+                    alert('The server has no search file for this case, so there is nothing to export.');
+                    return;
+                }
+                downloadTextFile(caseNumber + '.json', JSON.stringify(bundle, null, 2));
+            } catch (e) {
+                alert(e && e.message ? e.message : 'Could not read this case from the server.');
+            } finally {
+                exportBtn.disabled = false;
+            }
         };
         btnCont.appendChild(exportBtn);
 
@@ -10601,12 +10795,18 @@ async function buildSavedFilesTable() {
     });
 }
 
+// One-line status under the Saved Cases toolbar on the home page.
+function setHomeStatus(message) {
+    const el = document.getElementById('home-status');
+    if (el) el.textContent = message || '';
+}
+
 async function populateSearchHistory() {
     const historyPanel = document.getElementById('search-history-panel');
     const historyList = document.getElementById('search-history-list');
     if (!historyPanel || !historyList) return;
 
-    const history = await fetchUserHistory();
+    const history = await fetchSavedCases();
     if (history && history.length > 0) {
         historyPanel.style.display = 'block';
         historyList.innerHTML = '';
@@ -10619,7 +10819,7 @@ async function populateSearchHistory() {
             btn.style.flexDirection = 'column';
             btn.style.gap = '4px';
 
-            const caseNumber = bucketToCaseNumber(item.bucket);
+            const caseNumber = item.caseNumber;
 
             const nameSpan = document.createElement('span');
             nameSpan.style.fontWeight = 'bold';
@@ -10690,7 +10890,7 @@ function showCaseNumberPopup(originElement = null) {
 
     content.insertBefore(inputs, btnContainer);
 
-    // Cache of existing case numbers (sync buckets) for this account. Populated
+    // This account's existing CASE #s (from the server). Populated
     // asynchronously so the popup renders immediately even if the server is slow.
     let existingCases = [];
 
@@ -10699,10 +10899,9 @@ function showCaseNumberPopup(originElement = null) {
     const normalizeBucket = (name) =>
         name.replace(/\.json$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_');
 
-    // The unique, clean CASE #s for this account (buckets carry an internal
-    // per-user suffix that must not be shown or reused directly).
+    // The unique, clean CASE #s for this account - only this login's own cases.
     const getCaseNumbers = () =>
-        [...new Set(existingCases.map(item => bucketToCaseNumber(item.bucket)).filter(Boolean))];
+        [...new Set(existingCases.map(item => item.caseNumber).filter(Boolean))];
 
     const updateList = () => {
         listContainer.innerHTML = '';
@@ -10737,7 +10936,7 @@ function showCaseNumberPopup(originElement = null) {
     updateList();
 
     // Fetch existing case numbers without blocking popup rendering.
-    fetchUserHistory().then(history => {
+    fetchSavedCases().then(history => {
         existingCases = Array.isArray(history) ? history : [];
         updateList();
     }).catch(() => {
@@ -10754,6 +10953,9 @@ function showCaseNumberPopup(originElement = null) {
 
         const newBucket = normalizeBucket(typed);
         if (!newBucket) return alert('Please enter a valid case number.');
+        // "bundle", "all-files" and "user-..." are the website's own store
+        // keys on the server, never a case.
+        if (isInternalCaseName(newBucket)) return alert(`"${newBucket}" is reserved and cannot be used as a case number.`);
 
         // Reject exact duplicates (case-insensitive) against the clean CASE #s
         // already associated with this account.
@@ -10765,9 +10967,10 @@ function showCaseNumberPopup(originElement = null) {
         }
 
         // Build the new search, preserving personnel/accounts (same as the old
-        // New-search flow).
-        let nextName = typed;
-        if (!nextName.toLowerCase().endsWith('.json')) nextName += '.json';
+        // New-search flow). The search file is named exactly after the CASE #
+        // it is created for (the same clean form the Saved Cases table shows),
+        // so every row the server stores for it is keyed by that CASE #.
+        const nextName = newBucket;
 
         const currentBundle = loadBundle();
         const newBundle = defaultBundle();
@@ -10791,11 +10994,16 @@ function showCaseNumberPopup(originElement = null) {
 
         // Await the server writes before reloading: the reload would otherwise
         // abort the in-flight case-number PUT and bundle push, so nothing would
-        // reach the database and the case number would be lost on refresh.
+        // reach the database and the case number would be lost on refresh. The
+        // new file is written whole (the device holds nothing else for this
+        // CASE #), under the new bucket, before this device switches to it.
         saveBtn.disabled = true;
         saveBtn.textContent = 'Saving…';
         try {
             await setSyncBucket(newBucket);
+            removeOutboxRecordsForBucket(getSyncBucket());
+            removeStorageItem(BUNDLE_STORAGE_KEY);
+            removeStorageItem(BUNDLE_BUCKET_STORAGE_KEY);
             await saveBundle(newBundle);
         } catch (e) {
             console.warn('Failed to persist new case number:', e);
@@ -10821,8 +11029,13 @@ function buildHomePage() {
   const saveNameBtn = document.getElementById('save-file-name');
   const homeStatus = document.getElementById('home-status');
 
-  const bundle = loadBundle();
-  fileNameInput.value = bundle.fileName;
+  // "Current Case #": the CASE # this device is working in (empty while none
+  // is selected). Typing a new value and pressing Save renames the open case.
+  const activeCase = getActiveCaseNumber();
+  if (fileNameInput) {
+    fileNameInput.value = activeCase;
+    fileNameInput.placeholder = activeCase ? 'Current Case #' : 'No case selected - use New or Load';
+  }
 
   buildSavedFilesTable();
 
@@ -10839,24 +11052,37 @@ function buildHomePage() {
   const backupZipBtn = document.getElementById('backup-all-zip-btn');
   if (backupZipBtn) {
     backupZipBtn.onclick = async () => {
-      // Ensure current file is saved to list before backing up
-      const currentBundle = loadBundle();
-      saveFileToList(currentBundle.fileName, currentBundle);
-
-      const files = getSavedFiles();
-      const fileNames = Object.keys(files);
-      if (fileNames.length === 0) {
-        alert("No saved cases to backup.");
-        return;
-      }
-
+      // Every case is read from the server (the device keeps no copies): one
+      // .json per case that has a stored search file.
+      backupZipBtn.disabled = true;
       try {
+        // The open case's newest rows may still be on their way; send them first.
+        if (getActiveCaseNumber()) {
+          try { await pushBundleDelta(loadBundle()); } catch (e) {}
+        }
+        const cases = (await fetchSavedCases()).filter((c) => c.hasFile);
+        if (cases.length === 0) {
+          alert("No saved cases to backup.");
+          return;
+        }
+
         const zip = new JSZip();
-        fileNames.forEach(name => {
-          const fileInfo = files[name];
-          const content = JSON.stringify(fileInfo.bundle, null, 2);
-          zip.file(name, content);
-        });
+        let added = 0;
+        const skipped = [];
+        for (const info of cases) {
+          try {
+            const bundle = await fetchCaseFromServer(info.caseNumber);
+            if (!bundle) { skipped.push(info.caseNumber); continue; }
+            zip.file(`${info.caseNumber}.json`, JSON.stringify(bundle, null, 2));
+            added++;
+          } catch (e) {
+            skipped.push(info.caseNumber);
+          }
+        }
+        if (!added) {
+          alert('None of the saved cases could be read from the server. Please try again when online.');
+          return;
+        }
 
         const blob = await zip.generateAsync({ type: "blob" });
         const url = URL.createObjectURL(blob);
@@ -10867,9 +11093,14 @@ function buildHomePage() {
         anchor.click();
         anchor.remove();
         setTimeout(() => URL.revokeObjectURL(url), 500);
+        setHomeStatus(skipped.length
+          ? `Backed up ${added} case(s); could not read: ${skipped.join(', ')}.`
+          : `Backed up ${added} case(s) from the server.`);
       } catch (err) {
         console.error("Failed to create ZIP:", err);
         alert("An error occurred while creating the ZIP backup.");
+      } finally {
+        backupZipBtn.disabled = false;
       }
     };
   }
@@ -10940,32 +11171,50 @@ function buildHomePage() {
     };
   }
 
-  saveNameBtn.onclick = () => {
-    const currentBundle = loadBundle();
-    // CASE #: store exactly what the user typed (letters, numbers and symbols
-    // are all allowed). No ".json" suffix is forced onto the value anymore.
-    let nextName = fileNameInput.value.trim() || DEFAULT_FILE_NAME;
-    
-    // Check if we are renaming an existing file list entry
-    const files = getSavedFiles();
-    const oldName = currentBundle.fileName;
-    
-    if (oldName !== nextName && files[nextName]) {
-        if (!confirm(`A file named "${nextName}" already exists. Overwrite it?`)) {
-            return;
-        }
+  if (saveNameBtn && fileNameInput) saveNameBtn.onclick = async () => {
+    // Current Case #: the typed value is kept in the same URL-safe form the
+    // New-case popup uses (letters, digits, "-" and "_"; no ".json" suffix).
+    // Saving a different value renames the open case on the server.
+    const nextName = fileNameInput.value.trim().replace(/\.json$/i, '').replace(/[^a-zA-Z0-9_-]/g, '_');
+    const oldName = getActiveCaseNumber();
+    if (!nextName || isInternalCaseName(nextName)) {
+      alert(nextName ? `"${nextName}" is reserved and cannot be used as a case number.` : 'Enter a case number.');
+      fileNameInput.value = oldName;
+      return;
     }
-    
-    if (oldName !== nextName && files[oldName]) {
-        deleteFileFromList(oldName);
+    if (!oldName) {
+      // Nothing is open: create / open the typed CASE # instead of renaming.
+      await setSyncBucket(nextName);
+      window.location.reload();
+      return;
     }
-    
-    currentBundle.fileName = nextName;
-    saveBundle(currentBundle);
+    if (oldName === nextName) {
+      if (homeStatus) homeStatus.textContent = `Current Case # is ${nextName}.`;
+      return;
+    }
 
-    fileNameInput.value = nextName;
-    homeStatus.textContent = `CASE # updated to ${nextName} and saved to list.`;
-    updateFileNameDisplay();
+    const cases = await fetchSavedCases();
+    if (cases.some((c) => c.caseNumber === nextName)) {
+      if (!confirm(`A case named "${nextName}" already exists. Overwrite it?`)) {
+        fileNameInput.value = oldName;
+        return;
+      }
+    }
+
+    saveNameBtn.disabled = true;
+    beginUserAction();
+    try {
+      if (await renameCaseOnServer(oldName, nextName)) {
+        fileNameInput.value = nextName;
+        if (homeStatus) homeStatus.textContent = `Current Case # renamed from ${oldName} to ${nextName}.`;
+        updateFileNameDisplay();
+      } else {
+        fileNameInput.value = oldName;
+      }
+    } finally {
+      endUserAction();
+      saveNameBtn.disabled = false;
+    }
     buildSavedFilesTable();
   };
 
@@ -11003,15 +11252,13 @@ function applyTheme(bundle) {
     }
   }
 
+  // The preference comes from the search file on the server (read after login),
+  // so nothing is cached on the device.
   if (theme === 'light') {
     document.documentElement.classList.add('light-mode');
   } else {
     document.documentElement.classList.remove('light-mode');
   }
-
-  try {
-    localStorage.setItem('sar-theme-cache', theme === 'light' ? 'light' : 'dark');
-  } catch (e) {}
 }
 
 function hexToRgbTriple(hex) {
@@ -11032,9 +11279,6 @@ function applyAccentColor(bundle) {
   const clear = () => {
     root.style.removeProperty('--accent');
     root.style.removeProperty('--accent-rgb');
-    try {
-      localStorage.removeItem('sar-accent-cache');
-    } catch (e) {}
   };
 
   const user = getCurrentUser();
@@ -11067,9 +11311,6 @@ function applyAccentColor(bundle) {
 
   root.style.setProperty('--accent', hex);
   root.style.setProperty('--accent-rgb', triple);
-  try {
-    localStorage.setItem('sar-accent-cache', `${hex}|${triple}`);
-  } catch (e) {}
 }
 
 function applyBackground(bundle) {
@@ -14803,6 +15044,17 @@ function initPageTransitions() {
     });
 }
 
+// True once the open case has been read from the database on this page load
+// (see the 'sar-data-ready' event below).
+let _sarDataReady = false;
+
+// Run `callback` as soon as the case data is in memory: at once when it already
+// is, otherwise when the initial read finishes.
+function whenDataReady(callback) {
+    if (_sarDataReady) { callback(); return; }
+    document.addEventListener('sar-data-ready', () => callback(), {once: true});
+}
+
 document.addEventListener('DOMContentLoaded', async () => {
     initPageTransitions();
     
@@ -14828,13 +15080,13 @@ document.addEventListener('DOMContentLoaded', async () => {
         return;
     }
     
-    // Bring the local copy in step with the database BEFORE rendering, so a
-    // reload shows the current rows instead of an empty default and no empty
-    // bundle is pushed before the real data has been read back. A device that
-    // already holds this CASE #'s file only sends what it still has queued and
-    // asks for what changed; a device without one (or whose copy is not tagged
-    // with a CASE # yet) reads the file once. Bounded by a timeout so a slow or
-    // down server still lets the page finish loading (the poll catches up).
+    // Read the open case from the database BEFORE rendering, so the page shows
+    // the current rows instead of an empty default and no empty file is pushed
+    // before the real data has been read back. The browser keeps nothing
+    // between page loads, so this is always the one full read (a page that
+    // still holds the file - a reload from within the page - only sends what
+    // it has queued and asks for what changed). Bounded by a timeout so a slow
+    // or down server still lets the page finish loading (the poll catches up).
     if (getSyncBucket()) {
         discardForeignLocalCopy();
         const needsFullRead = !getStorageItem(BUNDLE_STORAGE_KEY)
@@ -14852,6 +15104,11 @@ document.addEventListener('DOMContentLoaded', async () => {
     updateFileNameDisplay();
     updateHeaderProfile();
     syncMobileBottomNav();
+
+    // Pages with their own inline script (mobile-status.html) render from this
+    // event: the case is in memory only from here on, never before.
+    _sarDataReady = true;
+    try { document.dispatchEvent(new CustomEvent('sar-data-ready')); } catch (e) {}
 
     const currentUser = getCurrentUser();
     if (!currentUser) {
@@ -18331,11 +18588,11 @@ function withTimeout(promise, ms) {
     ]);
 }
 
-// The one-time full read of the search file: for a device that has no local
-// copy of this CASE # yet (or one left by the previous build), the home page
-// (which shows the file list) and a CASE # the server has never seen (seeded
-// from the local copy). Otherwise pages stay in step through the row batches
-// and the /state poll, and never re-read or re-upload the whole file.
+// The one-time full read of the search file from the database: on every page
+// load (the browser keeps no copy between loads), and for a CASE # the server
+// has never seen (seeded from the in-memory copy). Afterwards pages stay in
+// step through the row batches and the /state poll, and never re-read or
+// re-upload the whole file.
 async function syncWithServer() {
     if (isSyncing) return;
     const bucket = getSyncBucket();
@@ -18363,63 +18620,29 @@ async function syncWithServer() {
     
     isSyncing = true;
     try {
-        const isNewDevice = !getStorageItem(BUNDLE_STORAGE_KEY);
-        
-        // 1. Sync entire file list
-        const listResp = await apiFetch(`${apiBase}/all-files?_=${Date.now()}`, {
-            headers: getAuthHeaders()
-        });
-        if (listResp.ok) {
-            const serverFiles = await listResp.json();
-            const localFiles = getSavedFiles();
-            let localChanged = false;
-            let serverNeedsUpdate = false;
-
-            for (const [name, sInfo] of Object.entries(serverFiles)) {
-                const lInfo = localFiles[name];
-                if (!lInfo || (new Date(sInfo.lastModified) > new Date(lInfo.lastModified))) {
-                    localFiles[name] = sInfo;
-                    localChanged = true;
-                } else if (new Date(sInfo.lastModified) < new Date(lInfo.lastModified)) {
-                    serverNeedsUpdate = true;
-                }
-            }
-
-            for (const name of Object.keys(localFiles)) {
-                if (!serverFiles[name]) {
-                    serverNeedsUpdate = true;
-                }
-            }
-
-            if (localChanged) {
-                setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(localFiles));
-                refreshSyncUI();
-            }
-            if (serverNeedsUpdate) {
-                pushFileListToServer(localFiles);
-            }
-        } else if (listResp.status === 404) {
-            const localFiles = getSavedFiles();
-            if (Object.keys(localFiles).length > 0) {
-                pushFileListToServer(localFiles);
-            }
-        }
-
-        // 2. Read the search file. The server copy is the base; the rows this
-        // device still has queued are put back on top of it and sent.
+        // Read the search file. The server copy is the base; the rows this
+        // device still has queued are put back on top of it and sent. (The
+        // Saved Cases table reads /api/auth/history; the old "all-files" list
+        // that copied every case onto the device is gone.)
         const resp = await apiFetch(`${apiBase}/bundle?_=${Date.now()}`, {
             headers: getAuthHeaders()
         });
         if (resp.ok) {
             const serverBundle = await resp.json();
             if (serverBundle && typeof serverBundle === 'object' && !Array.isArray(serverBundle)) {
-                if (!isNewDevice) queueLegacyLocalRows(loadBundle(), serverBundle);
                 applyServerSections(serverBundle, serverBundle.lastModified, {advanceCursor: true});
                 await pushBundleDelta(loadBundle());
             }
         } else if (resp.status === 404) {
-            // No search file on the server yet, so seed it once.
+            // No search file on the server yet: seed it once, and only with a
+            // file that carries this CASE # as its name (never a stand-in).
             const localBundle = loadBundle();
+            const caseNumber = getActiveCaseNumber();
+            if (caseNumber && String(localBundle.fileName || '').replace(/\.json$/i, '') !== caseNumber) {
+                localBundle.fileName = caseNumber;
+                setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitizeBundle(localBundle)));
+                tagLocalBundleBucket();
+            }
             if (await pushBundleToServer(localBundle, {seed: true})) {
                 settleOutboxAfterFullUpload(localBundle, readOutboxRecord(localBundle).changes.length);
             }
@@ -18431,46 +18654,6 @@ async function syncWithServer() {
     }
 }
 
-// A device upgrading from the previous build has a local copy that is not
-// tagged with its CASE # yet. Rows it added that never reached the server (the
-// whole-file uploads of that build failed silently once the file grew large)
-// are queued now, so they are delivered instead of being lost when the server
-// copy is adopted. Only additions travel - new rows and rows typed into blank
-// ones - never a differing existing cell, which may well be another device's
-// newer edit.
-function isBlankRow(row) {
-    if (row === undefined || row === null || row === '') return true;
-    if (Array.isArray(row)) return row.every(isBlankRow);
-    if (typeof row === 'object') return Object.keys(row).every((key) => isBlankRow(row[key]));
-    return false;
-}
-
-function queueLegacyLocalRows(localBundle, serverBundle) {
-    const utils = getSyncDeltaUtils();
-    if (!utils || getStorageItem(BUNDLE_BUCKET_STORAGE_KEY)) return [];
-    if (!localBundle || !serverBundle || localBundle.fileName !== serverBundle.fileName) return [];
-
-    const additive = utils.computeBundleChanges(sanitizeBundle(serverBundle), localBundle).filter((change) => {
-        if (Array.isArray(change.append) || Array.isArray(change.prepend)) return true;
-        if (change.deleted === true || Object.prototype.hasOwnProperty.call(change, 'length')) return false;
-        if (!Object.prototype.hasOwnProperty.call(change, 'value')) return false;
-        if (!Object.prototype.hasOwnProperty.call(change, 'previous')) return false;
-        // Top-level settings and single records are not rows; leave them.
-        return change.path[0] === 'pages' && isBlankRow(change.previous) && !isBlankRow(change.value);
-    });
-    if (!additive.length) return additive;
-
-    const record = readOutboxRecord(localBundle);
-    if (record.needsFullUpload) return [];
-    const locked = record.inFlight ? record.inFlight.count : 0;
-    let open = record.changes.slice(locked);
-    additive.forEach((change) => {
-        open = utils.coalesceChange(open, change);
-    });
-    record.changes = record.changes.slice(0, locked).concat(open);
-    writeOutboxRecord(localBundle, record);
-    return additive;
-}
 
 // Deliver the rows queued in the outbox (see saveBundle / queueBundleChanges).
 //
@@ -18478,10 +18661,28 @@ function queueLegacyLocalRows(localBundle, serverBundle) {
 // last writer wipe out every row the others had just typed. Instead only the
 // rows this device changed travel, as one batch with a stable id, and the
 // server merges them into the stored file row by row. A batch stays queued
-// until the server confirms it, so a dropped connection or a closed tab never
-// loses an edit. Flushes run one at a time; the promise resolves to true when
-// the outbox is empty afterwards.
+// until the server confirms it, so a dropped connection is retried as long as
+// the page stays open. Flushes run one at a time; the promise resolves to true
+// when the outbox is empty afterwards.
 let _outboxFlushPromise = null;
+// True after a row batch could not be delivered (offline, server down) until
+// one gets through again.
+let _outboxDeliveryFailed = false;
+
+// Rows still waiting to reach the database. The queue lives in memory only, so
+// closing the page while something is queued would lose it; beforeunload asks
+// the user to stay while that is the case (see below).
+function hasUndeliveredChanges() {
+    try {
+        const store = readOutboxStore();
+        return Object.keys(store).some((key) => {
+            const record = store[key];
+            return !!record && ((Array.isArray(record.changes) && record.changes.length > 0) || record.needsFullUpload === true);
+        });
+    } catch (e) {
+        return false;
+    }
+}
 
 async function pushBundleDelta(bundle) {
     const bucket = getSyncBucket();
@@ -18532,11 +18733,13 @@ async function pushBundleDelta(bundle) {
         } catch (err) {
             // Offline or interrupted: the batch stays queued and is retried by
             // the next save, poll or reconnect.
+            _outboxDeliveryFailed = true;
             console.warn("Push row changes failed:", err);
             return false;
         }
 
         if (resp.ok) {
+            _outboxDeliveryFailed = false;
             const result = await resp.json().catch(() => ({}));
             confirmOutboxBatch(bundle, batchId);
             // The answer echoes the sections the batch touched, merged with
@@ -18650,14 +18853,8 @@ function applyServerSections(sections, lastModified, {advanceCursor = false} = {
 
     if (changed || !hadCopy) {
         setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
-        const files = getSavedFiles();
-        if (sanitized.fileName) {
-            files[sanitized.fileName] = {bundle: sanitized, lastModified: sanitized.lastModified};
-            setStorageItem(FILE_LIST_STORAGE_KEY, JSON.stringify(files));
-        }
     }
-    // The stored copy now reflects this CASE #'s file (a copy from the previous
-    // build had no tag yet).
+    // The in-memory copy now reflects this CASE #'s file.
     tagLocalBundleBucket();
 
     if (advanceCursor && typeof lastModified === 'string' && lastModified) {
@@ -18794,15 +18991,8 @@ async function pushBundleToServer(bundle, {seed = false, isReconcileRetry = fals
             return false;
         }
 
-        // 2. Also push to a file-specific endpoint to aid discovery and prevent truncation
-        if (bundle.fileName) {
-            const fileKey = bundle.fileName.replace(/[^a-zA-Z0-9.\-_]/g, '_');
-            await apiFetch(`${baseUrl}/api/v1/${bucket}/${fileKey}`, {
-                method: 'PUT',
-                headers: headers,
-                body
-            }).catch(() => {});
-        }
+        // The server stores the file under the shared "bundle" key and under
+        // its own file name in one go, so no second upload is needed.
         return true;
     } catch (err) {
         console.error("Push bundle failed:", err);
@@ -18833,38 +19023,13 @@ async function reconcileAndRepushBundle(localBundle, baseUrl, bucket, headers) {
     }
 }
 
-async function pushFileListToServer(files) {
-    const bucket = getSyncBucket();
-    const serverUrl = getSyncServerUrl();
-    if (!serverUrl) return;
-    
-    const headers = getAuthHeaders({
-        'X-Last-Modified': new Date().toISOString()
-    });
-    
-    try {
-        // The list carries whole search files, so it is usually far too large
-        // for a keepalive request.
-        const resp = await apiFetch(`${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/all-files`, fetchInitWithKeepalive(
-            JSON.stringify(files),
-            {method: 'PUT', headers: headers}
-        ));
-        if (!resp.ok) {
-            const errorData = await resp.json().catch(() => ({}));
-            if (resp.status === 403 && (errorData.message || '').includes('older than server data')) {
-                return;
-            }
-            console.error("Push file list failed:", resp.status, errorData.message || '');
-        }
-    } catch (err) {
-        console.error("Push file list failed:", err);
-    }
-}
-
+// Presence ping: tells the server which account is working in the open case.
+// It is bookkeeping (key "user-<pin>"), never a search file, and is only sent
+// while a CASE # is open so it can never be recorded as a case of its own.
 async function notifyActiveUser(user) {
     const bucket = getSyncBucket();
     const serverUrl = getSyncServerUrl();
-    if (!serverUrl || !user || !user.pin) return;
+    if (!serverUrl || !bucket || !user || !user.pin) return;
 
     const headers = getAuthHeaders();
     
@@ -18997,13 +19162,21 @@ document.addEventListener('click', (e) => {
     }
 }, true);
 
-// Save and sync when leaving or switching away from the page
-window.addEventListener('beforeunload', () => {
+// Save and sync when leaving or switching away from the page. Nothing is kept
+// on the device between page loads, so a row that has not reached the database
+// yet (the server is unreachable) would be lost: the browser's "leave page?"
+// prompt gives the user the chance to wait for the connection instead.
+window.addEventListener('beforeunload', (event) => {
     if (isEditingActive()) {
         const el = document.activeElement;
         if (el && typeof el.blur === 'function') {
             el.blur();
         }
+    }
+    if (hasUndeliveredChanges() && (_outboxDeliveryFailed || (typeof navigator !== 'undefined' && navigator.onLine === false))) {
+        event.preventDefault();
+        event.returnValue = 'Some of your changes have not reached the server yet.';
+        return event.returnValue;
     }
 });
 
@@ -19033,10 +19206,10 @@ document.addEventListener('visibilitychange', () => {
     }
 });
 
-// Arriving on a page: send anything still queued and ask the database what the
-// other devices changed. A device that has no local copy of the search file
-// yet still needs the one-time full read to learn the file list and the other
-// pages.
+// Arriving on a page: the browser keeps no copy of the search file between
+// page loads, so read the open case from the database once (syncWithServer);
+// should the page already hold it (a reload triggered from within the page),
+// just send anything still queued and ask what the other devices changed.
 setTimeout(() => {
     if (!getSyncBucket() || !getUserCredentials()) return;
     discardForeignLocalCopy();

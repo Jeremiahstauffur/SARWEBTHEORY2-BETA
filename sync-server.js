@@ -454,6 +454,33 @@ const safeJsonParse = (value) => {
 
 const toLabel = (value) => value == null ? null : String(value).slice(0, 255);
 
+// Store keys the website uses for its own bookkeeping rather than for a search
+// file: the shared "bundle" slot every case is saved under, the old "all-files"
+// list and the "user-<pin>" presence pings. None of them is a CASE #, so none
+// of them may ever name the structured-table rows (search_case) or show up in
+// a user's Saved Cases. Anything else that reaches the store is a real file.
+const INTERNAL_STORE_KEYS = ['bundle', 'all-files'];
+const PRESENCE_KEY_PREFIX = 'user-';
+
+const isInternalStoreKey = (key) => {
+    const value = String(key || '').trim();
+    if (!value) { return true; }
+    if (INTERNAL_STORE_KEYS.includes(value)) { return true; }
+    return value.startsWith(PRESENCE_KEY_PREFIX);
+};
+
+// The CASE # a stored search file belongs to: the bundle's own file name when
+// it carries one, else the caller's fallback - but never one of the internal
+// store keys, which would otherwise leak into the structured tables as cases
+// called "bundle", "all-files" or "user-1234".
+const searchCaseForBundle = (bundle, fallbackCase) => {
+    const own = bundle && typeof bundle.fileName === 'string' ? bundle.fileName.trim() : '';
+    if (own && !isInternalStoreKey(own)) { return own.replace(/\.json$/i, ''); }
+    const fallback = String(fallbackCase || '').trim();
+    if (fallback && !isInternalStoreKey(fallback)) { return fallback.replace(/\.json$/i, ''); }
+    return '';
+};
+
 // Pure transform: turn a saved bundle into the structured rows that belong in
 // each table. Returns null for payloads that are not real save bundles (file
 // lists, presence pings, ...). Kept side-effect free so it can be unit tested
@@ -464,10 +491,9 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
 
     // The CASE # is the bundle's own file/case name. Some pushes use a fixed
     // store key ("bundle"), so prefer the name inside the payload and only fall
-    // back to the store key when the bundle does not carry one.
-    const searchCase = (typeof bundle.fileName === 'string' && bundle.fileName.trim())
-        ? bundle.fileName.trim()
-        : (fallbackCase || '');
+    // back to the store key when the bundle does not carry one - and never to
+    // an internal key (see searchCaseForBundle).
+    const searchCase = searchCaseForBundle(bundle, fallbackCase);
     if (!searchCase) { return null; }
 
     const collection = (items, mapFn) => {
@@ -650,11 +676,8 @@ const applyChangesToTables = async (username, fallbackCase, bundle, changes) => 
 // the bundle, else the clean CASE # behind the bucket id (never the raw
 // per-login bucket).
 const resolveSearchCase = (bundle, bucket, username) => {
-    if (bundle && typeof bundle.fileName === 'string' && bundle.fileName.trim()) {
-        return bundle.fileName.trim();
-    }
-    const fallback = bucket && bucket !== STORE_BUNDLE_KEY ? caseNumberFromBucket(bucket, username) : '';
-    return fallback || '';
+    const fallback = bucket && !isInternalStoreKey(bucket) ? caseNumberFromBucket(bucket, username) : '';
+    return searchCaseForBundle(bundle, fallback);
 };
 
 // Every entry the website writes carries an id ('log-<ms>-<n>'). Entries from
@@ -798,6 +821,8 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports.ACTIVITY_ENTRIES_TABLE = ACTIVITY_ENTRIES_TABLE;
     module.exports.activityEntryId = activityEntryId;
     module.exports.collectActivityEntryChanges = collectActivityEntryChanges;
+    module.exports.isInternalStoreKey = isInternalStoreKey;
+    module.exports.searchCaseForBundle = searchCaseForBundle;
     // Exposed so an integration test can drive the endpoints over HTTP without
     // the server having to bind a fixed port on its own.
     module.exports.app = app;
@@ -936,12 +961,40 @@ const authMiddleware = (req, res, next) => {
     });
 };
 
+// The Saved Cases list: every CASE # this login has opened, newest first, each
+// with the Regions / Segments / Personnel / Tasks counts of the stored search
+// file and whether such a file exists at all (`hasFile`). The website shows
+// this list as-is - it keeps no copy of any case - and a case without a
+// readable file is still listed so it can be deleted.
 app.get('/api/auth/history', authMiddleware, (req, res) => {
-    db.all("SELECT bucket, lastAccessed FROM user_buckets WHERE username = ? ORDER BY lastAccessed DESC", [req.user.username], (err, rows) => {
+    const username = req.user.username;
+    db.all("SELECT bucket, lastAccessed FROM user_buckets WHERE username = ? ORDER BY lastAccessed DESC", [username], async (err, rows) => {
         if (err) {
             return res.status(500).json({error: err.message});
         }
-        res.json(rows);
+        const history = [];
+        for (const row of rows || []) {
+            // Rows an older build registered for the internal store keys are
+            // not cases and never shown.
+            if (!row || !isCaseBucket(row.bucket, username)) { continue; }
+            const item = {bucket: row.bucket, lastAccessed: row.lastAccessed, hasFile: false, stats: null, caseNumber: caseNumberFromBucket(row.bucket, username)};
+            try {
+                const stored = await readStoredBundle(row.bucket, username);
+                // A search file always carries its pages; anything else stored
+                // under the key (a "{}" placeholder, a truncated write) is not
+                // a file the website could open.
+                if (stored && stored.bundle.pages && typeof stored.bundle.pages === 'object') {
+                    item.hasFile = true;
+                    item.stats = syncDelta.computeBundleStats(stored.bundle);
+                    item.lastModified = stored.bundle.lastModified || null;
+                }
+            } catch (e) {
+                // A stored file that cannot be read is reported without stats; the
+                // case still shows so the user can delete it.
+            }
+            history.push(item);
+        }
+        res.json(history);
     });
 });
 
@@ -965,9 +1018,19 @@ app.put('/api/auth/settings', authMiddleware, (req, res) => {
     });
 });
 
-// Helper to track bucket access
+// A bucket id names a case only when it is a real CASE # ("<CASE #>_<username>").
+// A path such as /api/v1//bundle (empty CASE #) that a proxy collapsed to
+// /api/v1/bundle would otherwise register "bundle", "all-files" or
+// "user-<pin>" as cases in the user's Saved Cases list.
+const isCaseBucket = (bucket, username) => {
+    const value = String(bucket || '').trim();
+    if (!value || isInternalStoreKey(value)) { return false; }
+    return !isInternalStoreKey(caseNumberFromBucket(value, username));
+};
+
+// Helper to track bucket access (remember the CASE # in the user's Saved Cases)
 const trackBucketAccess = (username, bucket) => {
-    if (!username || !bucket) return;
+    if (!username || !isCaseBucket(bucket, username)) return;
     const now = new Date().toISOString();
     db.run("INSERT OR REPLACE INTO user_buckets (username, bucket, lastAccessed) VALUES (?, ?, ?)", [username, bucket, now]);
 };
@@ -1275,7 +1338,7 @@ app.post('/api/v1/:bucket/rows', authMiddleware, async (req, res) => {
             syncDelta.stampSections(bundle, touched, nowIso);
 
             await writeStoredBundle(bucket, userName, userPin, bundle, nowIso);
-            await applyChangesToTables(userName, bucket, bundle, applied);
+            await applyChangesToTables(userName, caseNumberFromBucket(bucket, userName), bundle, applied);
             // Every activity-log entry the batch carried gets its own row, tied
             // to this login and the CASE #, before the batch is confirmed.
             await recordActivityEntryChanges(userName, bucket, bundle, applied);
@@ -1383,6 +1446,11 @@ app.get('/api/v1/:bucket/page/:page', authMiddleware, async (req, res) => {
 // Scoped to the authenticated login: a user only ever sees the files they
 // created (store.userName), so one login never sees another login's data even
 // when they share a bucket (e.g. the same PIN).
+//
+// Only search files are listed. The bucket also holds the website's own
+// bookkeeping rows - the shared "bundle" slot, the old "all-files" list and the
+// "user-<pin>" presence pings - and listing those here is what made cases
+// called "bundle", "all-files", "user-1967" appear in older builds' Saved Cases.
 app.get('/api/v1/:bucket/all-files', authMiddleware, (req, res) => {
     const {bucket} = req.params;
     trackBucketAccess(req.user.username, bucket);
@@ -1390,6 +1458,7 @@ app.get('/api/v1/:bucket/all-files', authMiddleware, (req, res) => {
         if (err) return res.status(500).json({error: 'Failed to query database'});
         const files = {};
         rows.forEach(row => {
+            if (isInternalStoreKey(row.key)) { return; }
             files[row.key] = { lastModified: row.updatedAt };
         });
         res.json(files);
@@ -1468,18 +1537,39 @@ const caseNumberFromBucket = (bucket, userName) => {
     return bucket;
 };
 
+// Every search_case value the structured rows of a case may carry: the clean
+// CASE # behind the bucket, the file name stored inside the search file (older
+// builds keyed rows by it, with or without ".json") and the raw bucket id
+// (older builds again). Never an internal store key, so a case delete can
+// never wipe rows that belong to every case.
+const searchCaseCandidates = (bucket, userName, storedBundle) => {
+    const names = new Set();
+    const add = (value) => {
+        const text = String(value || '').trim();
+        if (!text || isInternalStoreKey(text)) { return; }
+        names.add(text);
+        names.add(text.replace(/\.json$/i, ''));
+        names.add(`${text.replace(/\.json$/i, '')}.json`);
+    };
+    add(caseNumberFromBucket(bucket, userName));
+    add(bucket);
+    if (storedBundle && typeof storedBundle.fileName === 'string') { add(storedBundle.fileName); }
+    return Array.from(names).filter((name) => name && !isInternalStoreKey(name));
+};
+
 // Permanently delete an entire case (search file) for the authenticated login.
 // Unlike DELETE /:bucket/:key (which removes a single store key), this wipes
 // every trace of the case for this user so it cannot resync back: all store
 // rows for (bucket, userName), the user_buckets history row (username, bucket),
 // and every structured-table row for (username, search_case = CASE #). Saved
-// Cases calls it so a corrupt or never-cached case can still be removed.
+// Cases calls it for any listed case - one whose search file is missing or
+// unreadable is removed exactly the same way, so a case that cannot be loaded
+// can always still be deleted.
 app.delete('/api/v1/:bucket', authMiddleware, async (req, res) => {
     const {bucket} = req.params;
     const userName = req.user.username;
     const userPin = req.headers['x-user-pin'] || req.headers['x-user-password'] || '';
     const isSuperAdmin = userPin === '1976';
-    const searchCase = caseNumberFromBucket(bucket, userName);
 
     try {
         // Super-Admin protection: a regular user cannot delete a case whose
@@ -1496,20 +1586,37 @@ app.delete('/api/v1/:bucket', authMiddleware, async (req, res) => {
             });
         }
 
-        // 1) Every store key for this case owned by the caller.
-        await runAsync("DELETE FROM store WHERE bucket = ? AND userName = ?", [bucket, userName]);
-        // 2) The case-history row so it stops appearing in Saved Cases.
-        await runAsync("DELETE FROM user_buckets WHERE username = ? AND bucket = ?", [userName, bucket]);
-        // 3) Structured rows for the specific CASE # (never the shared 'bundle'
-        //    store key, which is common to every case), including the per-entry
-        //    activity log rows.
-        if (searchCase) {
-            for (const table of [...STRUCTURED_TABLES, ACTIVITY_ENTRIES_TABLE]) {
-                await runAsync(`DELETE FROM \`${table}\` WHERE username = ? AND search_case = ?`, [userName, searchCase]);
-            }
+        // The stored file (if it can still be read) tells which CASE # names
+        // its structured rows; a corrupt or missing file just means the rows
+        // are looked up by the bucket's CASE # alone.
+        let storedBundle = null;
+        try {
+            const stored = await readStoredBundle(bucket, userName);
+            storedBundle = stored ? stored.bundle : null;
+        } catch (e) {
+            storedBundle = null;
         }
+        const searchCases = searchCaseCandidates(bucket, userName, storedBundle);
 
-        res.json({success: true});
+        await withBucketLock(bucket, async () => {
+            // 1) Every store key for this case owned by the caller.
+            await runAsync("DELETE FROM store WHERE bucket = ? AND userName = ?", [bucket, userName]);
+            // 2) The case-history row so it stops appearing in Saved Cases.
+            await runAsync("DELETE FROM user_buckets WHERE username = ? AND bucket = ?", [userName, bucket]);
+            // 3) Structured rows for the specific CASE # (never the shared 'bundle'
+            //    store key, which is common to every case), including the per-entry
+            //    activity log rows.
+            for (const searchCase of searchCases) {
+                for (const table of [...STRUCTURED_TABLES, ACTIVITY_ENTRIES_TABLE]) {
+                    await runAsync(`DELETE FROM \`${table}\` WHERE username = ? AND search_case = ?`, [userName, searchCase]);
+                }
+            }
+            // 4) A retried row batch for the deleted case must not be mistaken
+            //    for one already applied should the CASE # be created again.
+            recentBatchIds.delete(bucket);
+        });
+
+        res.json({success: true, deleted: {bucket, searchCases}});
     } catch (err) {
         console.error('[SYNC] case delete failed:', err.message);
         res.status(500).json({error: 'Failed to delete case'});
@@ -1590,14 +1697,14 @@ const putActiveBundle = async (req, res) => {
             if (isImport) {
                 // The import is only reported as done once every table holds
                 // the imported rows for (username, CASE #).
-                await decomposeBundleToTables(userName, STORE_BUNDLE_KEY, bundle);
+                await decomposeBundleToTables(userName, caseNumberFromBucket(bucket, userName), bundle);
                 await recordActivityEntriesFromBundle(userName, bucket, bundle);
                 // A retried row batch from before the import must not be
                 // mistaken for one already applied to the new copy.
                 recentBatchIds.delete(bucket);
                 return {status: 200, body: {success: true, imported: true, lastModified: nowIso}};
             }
-            decomposeBundleToTables(userName, STORE_BUNDLE_KEY, bundle)
+            decomposeBundleToTables(userName, caseNumberFromBucket(bucket, userName), bundle)
                 .then(() => recordActivityEntriesFromBundle(userName, bucket, bundle))
                 .catch((decomposeErr) => console.error('[DB] decompose error:', decomposeErr.message));
 
@@ -1676,10 +1783,15 @@ app.put('/api/v1/:bucket/:key', authMiddleware, (req, res) => {
                 (err) => {
                     if (err) return res.status(500).json({error: 'Failed to save data'});
                     // Also split the saved bundle into the structured tables,
-                    // tagged with the team username and CASE # (the store key).
-                    decomposeBundleToTables(userName, key, req.body)
-                        .then(() => recordActivityEntriesFromBundle(userName, key, req.body))
-                        .catch((decomposeErr) => console.error('[DB] decompose error:', decomposeErr.message));
+                    // tagged with the team username and the CASE # behind the
+                    // bucket. Bookkeeping keys ("all-files", "user-<pin>") are
+                    // not search files and never become cases.
+                    if (!isInternalStoreKey(key)) {
+                        const fallbackCase = caseNumberFromBucket(bucket, userName);
+                        decomposeBundleToTables(userName, fallbackCase, req.body)
+                            .then(() => recordActivityEntriesFromBundle(userName, bucket, req.body))
+                            .catch((decomposeErr) => console.error('[DB] decompose error:', decomposeErr.message));
+                    }
                     res.json({success: true});
                 });
     });

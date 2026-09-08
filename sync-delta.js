@@ -646,6 +646,27 @@
         return bundle;
     }
 
+    // Count the populated Regions / Segments / Personnel / Tasks rows of a search
+    // file. The Saved Cases table on the home page shows these per case; the
+    // server computes them from the stored copy so the website never needs a
+    // local copy of a case just to show its numbers. Tolerant of partial
+    // bundles so it never throws.
+    function computeBundleStats(bundle) {
+        const empty = {regions: 0, segments: 0, personnel: 0, tasks: 0};
+        if (!isPlainObject(bundle) || !isPlainObject(bundle.pages)) return empty;
+        const pages = bundle.pages;
+        const filled = (rows, column) => (Array.isArray(rows) ? rows : [])
+            .filter((row) => Array.isArray(row) && row[column] !== undefined && row[column] !== null && String(row[column]).trim() !== '')
+            .length;
+        const indexRows = isPlainObject(pages.index) ? pages.index.rows : null;
+        return {
+            regions: filled(indexRows, 0),
+            segments: filled(pages.page2, 1),
+            personnel: filled(pages.page3, 0),
+            tasks: filled(pages.page4, 0)
+        };
+    }
+
     // The sections of a stored bundle that changed at or after `since`. Without
     // stamps (a bundle written by an older server) everything is returned.
     function sectionsChangedSince(bundle, since) {
@@ -680,6 +701,7 @@
         mergeServerSections,
         stampSections,
         sectionsChangedSince,
+        computeBundleStats,
         hashValue,
         deepEqual,
         normalizePath,

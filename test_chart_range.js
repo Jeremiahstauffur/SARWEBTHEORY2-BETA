@@ -1,4 +1,5 @@
-// Drives the real app.js in a sandbox (fake localStorage / DOM / fetch) to check
+// Drives the real app.js in a sandbox (in-memory store handed in as
+// window.SAR_MEMORY_STORAGE, tripwire localStorage, fake DOM / fetch) to check
 // the Start/End range of the PSRc and POS cumulative charts (Home / Search Log):
 //   - by default Start is one hour before the earliest task assignment BY DATE
 //     (a backdated task with a higher number still wins) and End is now,
@@ -60,11 +61,18 @@ function makeElement() {
     return el;
 }
 
+const localStorageAccess = [];
 function createSandbox({store, page = 'home'} = {}) {
     const localStorage = {
-        getItem: (k) => (Object.prototype.hasOwnProperty.call(store, k) ? store[k] : null),
-        setItem: (k, v) => { store[k] = String(v); },
-        removeItem: (k) => { delete store[k]; }
+        getItem: (k) => { localStorageAccess.push(`getItem ${k}`); return null; },
+        setItem: (k) => { localStorageAccess.push(`setItem ${k}`); },
+        removeItem: () => {}
+    };
+    const sessionData = {};
+    const sessionStorage = {
+        getItem: (k) => (Object.prototype.hasOwnProperty.call(sessionData, k) ? sessionData[k] : null),
+        setItem: (k, v) => { sessionData[k] = String(v); },
+        removeItem: (k) => { delete sessionData[k]; }
     };
     const cookieJar = {'sar-user-name-v1': 'tester', 'sar-user-password-v1': '1234'};
     const byId = {};
@@ -107,7 +115,8 @@ function createSandbox({store, page = 'home'} = {}) {
         setInterval: () => 0,
         clearInterval() {},
         localStorage,
-        sessionStorage: localStorage,
+        sessionStorage,
+        SAR_MEMORY_STORAGE: store,
         document,
         navigator: {userAgent: 'node', onLine: true},
         addEventListener() {},
