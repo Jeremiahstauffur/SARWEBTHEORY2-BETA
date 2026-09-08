@@ -10,6 +10,7 @@
       try {
         var t = localStorage.getItem('sar-theme-cache');
         if (t === 'light') document.documentElement.classList.add('light-mode');
+        if (localStorage.getItem('sar-geek-mode-cache') === 'on') document.documentElement.classList.add('geek-mode');
         var a = localStorage.getItem('sar-accent-cache');
         if (a) {
           var p = a.split('|');
@@ -55,14 +56,14 @@
         <section class="hero">
         <h1>User Account</h1>
         <p>Manage account settings, PIN, and handle.</p>
-        <div id="user-tabs" style="display: none; justify-content: center; gap: 10px; margin-top: 20px;">
-          <button id="tab-account" class="mini-pill active" style="padding: 10px 25px;">My Account</button>
-          <button id="tab-manage" class="mini-pill" style="padding: 10px 25px;">Manage Users</button>
+        <div id="user-tabs" style="display: none; justify-content: center; gap: 10px; margin-top: calc(20px * var(--space-scale, 1));">
+          <button id="tab-account" class="mini-pill active" style="padding: calc(10px * var(--space-scale, 1)) calc(25px * var(--space-scale, 1));">My Account</button>
+          <button id="tab-manage" class="mini-pill" style="padding: calc(10px * var(--space-scale, 1)) calc(25px * var(--space-scale, 1));">Manage Users</button>
         </div>
       </section>
 
       <section class="table-card">
-        <div id="user-account-container" style="padding: 20px;">
+        <div id="user-account-container" style="padding: calc(20px * var(--space-scale, 1));">
            <!-- Content will be injected here via app.js -->
         </div>
         <div class="status" id="save-status">Ready.</div>
@@ -100,7 +101,7 @@
     <div class="notification-sidebar" id="notif-sidebar">
       <div class="notification-header">
         <h2 style="margin:0;">Notifications</h2>
-        <button class="clear-btn" id="close-notif" style="padding: 5px 10px;">?</button>
+        <button class="clear-btn" id="close-notif" style="padding: calc(5px * var(--space-scale, 1)) calc(10px * var(--space-scale, 1));">?</button>
       </div>
       <div class="notification-list" id="notif-list">
       </div>

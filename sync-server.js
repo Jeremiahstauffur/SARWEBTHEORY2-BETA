@@ -501,6 +501,7 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
             settings_page: {
                 theme: bundle.theme,
                 showTips: bundle.showTips,
+                geekMode: bundle.geekMode,
                 background: bundle.background,
                 deleteMode: bundle.deleteMode,
                 segmentColorScaleUsePsriMax: bundle.segmentColorScaleUsePsriMax,

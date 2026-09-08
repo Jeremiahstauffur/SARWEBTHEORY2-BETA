@@ -10,6 +10,7 @@
       try {
         var t = localStorage.getItem('sar-theme-cache');
         if (t === 'light') document.documentElement.classList.add('light-mode');
+        if (localStorage.getItem('sar-geek-mode-cache') === 'on') document.documentElement.classList.add('geek-mode');
         var a = localStorage.getItem('sar-accent-cache');
         if (a) {
           var p = a.split('|');
@@ -61,7 +62,7 @@
         <div class="home-grid">
           <div class="home-panel">
             <h2>Delete Mode</h2>
-            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               When ON, rows are deleted immediately. When OFF, you will be asked for confirmation.
             </p>
             <div class="home-row">
@@ -75,7 +76,7 @@
 
           <div class="home-panel">
             <h2>Background Image</h2>
-            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Choose a new background image for the application. The image is stored within your data file.
             </p>
             <div class="home-actions">
@@ -89,7 +90,7 @@
 
           <div class="home-panel">
             <h2>Application Logo</h2>
-            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Choose a logo to display in the header. The image is stored within your data file.
             </p>
             <div class="home-actions">
@@ -103,7 +104,7 @@
 
           <div class="home-panel">
             <h2>Theme</h2>
-            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Switch between Dark Mode and Light Mode.
             </p>
             <div class="home-row">
@@ -113,7 +114,7 @@
               </label>
               <span id="theme-label">Dark Mode</span>
             </div>
-            <p style="margin: 20px 0 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin: calc(20px * var(--space-scale, 1)) 0 calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               When ON, the site's accent color uses your personal highlight color. When OFF, the default blue accent is used.
             </p>
             <div class="home-row">
@@ -127,7 +128,7 @@
 
           <div class="home-panel">
             <h2>Tips Display</h2>
-            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               When ON, informational text tips are displayed throughout the site. When OFF, they are hidden.
             </p>
             <div class="home-row">
@@ -141,12 +142,12 @@
 
           <div class="home-panel">
             <h2>Par Check Frequency</h2>
-            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Set the reminder frequency for Par Checks in minutes. Default is 20 minutes.
             </p>
             <div class="home-row">
               <input type="number" id="par-freq-input" class="pill-cell" style="width: 80px; text-align: center;" min="1" step="1">
-              <span id="par-freq-label" style="margin-left: 10px;">minutes</span>
+              <span id="par-freq-label" style="margin-left: calc(10px * var(--space-scale, 1));">minutes</span>
             </div>
           </div>
 
@@ -168,19 +169,19 @@
 
           <div class="home-panel full-width">
             <h2>Segment Color Scale</h2>
-            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Control how segment colors are calculated on the map overlays. Segments always use their current PSRc for
               color placement, while this toggle decides whether the scale tops out at the highest PSRc or the highest
               PSRi from the Segments page.
             </p>
-            <div class="home-row" style="margin-bottom: 15px;">
+            <div class="home-row" style="margin-bottom: calc(15px * var(--space-scale, 1));">
               <label class="toggle-switch">
                 <input id="segment-scale-max-toggle" type="checkbox">
                 <span class="slider"></span>
               </label>
               <span id="segment-scale-max-label">Scale max uses highest PSRc</span>
             </div>
-            <div class="home-row" style="flex-wrap: wrap; gap: 16px; align-items: flex-end; margin-bottom: 15px;">
+            <div class="home-row" style="flex-wrap: wrap; gap: 16px; align-items: flex-end; margin-bottom: calc(15px * var(--space-scale, 1));">
               <label style="display: flex; flex-direction: column; gap: 6px; font-size: 0.9rem;">
                 <span>Low Color (0)</span>
                 <input id="segment-scale-low-color-input" type="color" value="#40c057">
@@ -233,11 +234,25 @@
             <div id="segment-search-opacity-label" style="margin-top: 10px; font-size: 0.85rem; color: var(--muted);"></div>
           </div>
 
+          <div class="home-panel">
+            <h2>Geek Mode</h2>
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
+              When ON, padding and margins across the site are reduced to one third of their normal size for a denser layout. When OFF, the standard spacing is used.
+            </p>
+            <div class="home-row">
+              <label class="toggle-switch">
+                <input type="checkbox" id="geek-mode-toggle">
+                <span class="slider"></span>
+              </label>
+              <span id="geek-mode-label">Geek Mode is OFF</span>
+            </div>
+          </div>
+
           <div class="home-panel full-width">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px;">
+            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: calc(15px * var(--space-scale, 1));">
               <h2 style="margin: 0;">CalTopo Proxy Settings</h2>
               <div id="proxy-status-container"
-                   style="font-size: 0.9rem; display: flex; align-items: center; gap: 8px; background: rgba(0,0,0,0.05); padding: 5px 12px; border-radius: 20px;">
+                   style="font-size: 0.9rem; display: flex; align-items: center; gap: 8px; background: rgba(0,0,0,0.05); padding: calc(5px * var(--space-scale, 1)) calc(12px * var(--space-scale, 1)); border-radius: 20px;">
                 <span id="proxy-status-dot"
                       style="width: 10px; height: 10px; border-radius: 50%; background: #ccc;"></span>
                 <span id="proxy-status-text">Checking...</span>
@@ -246,7 +261,7 @@
                       style="background: var(--accent); color: white; border: none;">Help Me Setup
               </button>
             </div>
-            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
                 CalTopo Team API requests should be signed by your proxy, not sent browser-direct to CalTopo.
                 Enter the Web Proxy URL below (e.g.,
               <code>https://sarwebtheory2-production.up.railway.app/api/proxy</code>).
@@ -256,7 +271,7 @@
                      placeholder="e.g., https://sarwebtheory2-production.up.railway.app/api/proxy" style="flex-grow: 1;"
                        type="text">
               <button id="save-proxy-btn" class="clear-btn" type="button">Save Proxy Settings</button>
-              <button class="clear-btn" id="test-proxy-btn" style="margin-left: 10px; border-color: var(--accent); color: var(--accent);"
+              <button class="clear-btn" id="test-proxy-btn" style="margin-left: calc(10px * var(--space-scale, 1)); border-color: var(--accent); color: var(--accent);"
                       type="button">Test Connection
               </button>
             </div>
@@ -264,7 +279,7 @@
 
           <div class="home-panel full-width">
             <h2>Data Synchronization</h2>
-            <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Enter your Sync Server URL (from Railway) to synchronize data across devices.
               All devices logged in with the same username will share data automatically.
             </p>
@@ -274,11 +289,11 @@
               <button class="clear-btn" id="save-sync-url-btn" style="white-space: nowrap;" type="button">Save Sync
                 Settings
               </button>
-              <button class="clear-btn" id="test-sync-btn" style="margin-left: 10px; border-color: var(--accent); color: var(--accent);"
+              <button class="clear-btn" id="test-sync-btn" style="margin-left: calc(10px * var(--space-scale, 1)); border-color: var(--accent); color: var(--accent);"
                       type="button">Test Connection
               </button>
             </div>
-            <div id="sync-status-msg" style="margin-top: 10px; font-size: 0.85rem; color: var(--accent);"></div>
+            <div id="sync-status-msg" style="margin-top: calc(10px * var(--space-scale, 1)); font-size: 0.85rem; color: var(--accent);"></div>
           </div>
         </div>
 
@@ -317,7 +332,7 @@
     <div class="notification-sidebar" id="notif-sidebar">
       <div class="notification-header">
         <h2 style="margin:0;">Notifications</h2>
-        <button class="clear-btn" id="close-notif" style="padding: 5px 10px;">?</button>
+        <button class="clear-btn" id="close-notif" style="padding: calc(5px * var(--space-scale, 1)) calc(10px * var(--space-scale, 1));">?</button>
       </div>
       <div class="notification-list" id="notif-list">
         <!-- Notifications will be injected here -->

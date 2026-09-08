@@ -10,6 +10,7 @@
       try {
         var t = localStorage.getItem('sar-theme-cache');
         if (t === 'light') document.documentElement.classList.add('light-mode');
+        if (localStorage.getItem('sar-geek-mode-cache') === 'on') document.documentElement.classList.add('geek-mode');
         var a = localStorage.getItem('sar-accent-cache');
         if (a) {
           var p = a.split('|');
@@ -22,7 +23,7 @@
   <link rel="stylesheet" href="styles.css?v=20260904" />
   <style>
     .mobile-status-container {
-      padding: 15px;
+      padding: calc(15px * var(--space-scale, 1));
       display: flex;
       flex-direction: column;
       gap: 20px;
@@ -37,7 +38,7 @@
       font-size: 0.75rem;
       color: var(--muted);
       text-transform: uppercase;
-      margin-left: 2px;
+      margin-left: calc(2px * var(--space-scale, 1));
     }
     #member-dropdown {
       appearance: none;
@@ -45,7 +46,7 @@
       background-repeat: no-repeat;
       background-position: right 12px center;
       background-size: 18px;
-      padding-right: 40px;
+      padding-right: calc(40px * var(--space-scale, 1));
     }
     #member-dropdown option {
       background: var(--popup-bg);
@@ -60,7 +61,7 @@
       background: rgba(255, 255, 255, 0.05);
       border: 1px solid var(--line);
       border-radius: 12px;
-      padding: 12px;
+      padding: calc(12px * var(--space-scale, 1));
       display: flex;
       flex-direction: column;
       gap: 8px;
@@ -73,7 +74,7 @@
     .status-time-pill {
       font-size: 0.8rem;
       background: var(--pill-bg);
-      padding: 4px 8px;
+      padding: calc(4px * var(--space-scale, 1)) calc(8px * var(--space-scale, 1));
       border-radius: 6px;
       border: 1px solid var(--line);
     }
@@ -85,7 +86,7 @@
       color: var(--accent);
       background: none;
       border: none;
-      padding: 4px;
+      padding: calc(4px * var(--space-scale, 1));
       cursor: pointer;
     }
   </style>
@@ -129,16 +130,16 @@
         </div>
 
         <div id="status-history-container">
-          <h2 style="font-size: 1rem; margin-bottom: 10px; color: var(--muted); text-transform: uppercase;">Incident Times</h2>
+          <h2 style="font-size: 1rem; margin-bottom: calc(10px * var(--space-scale, 1)); color: var(--muted); text-transform: uppercase;">Incident Times</h2>
           <div id="incident-times-container" class="incident-times-container">
-            <div style="text-align: center; opacity: 0.5; padding: 20px;">Select a member to view incident times</div>
+            <div style="text-align: center; opacity: 0.5; padding: calc(20px * var(--space-scale, 1));">Select a member to view incident times</div>
           </div>
         </div>
 
-        <div id="activity-history-container" style="margin-top: 20px;">
-          <h2 style="font-size: 1rem; margin-bottom: 10px; color: var(--muted); text-transform: uppercase;">Recent History</h2>
+        <div id="activity-history-container" style="margin-top: calc(20px * var(--space-scale, 1));">
+          <h2 style="font-size: 1rem; margin-bottom: calc(10px * var(--space-scale, 1)); color: var(--muted); text-transform: uppercase;">Recent History</h2>
           <div id="status-list" class="status-list">
-            <div style="text-align: center; opacity: 0.5; padding: 20px;">Select a member to view history</div>
+            <div style="text-align: center; opacity: 0.5; padding: calc(20px * var(--space-scale, 1));">Select a member to view history</div>
           </div>
         </div>
       </div>
@@ -235,8 +236,8 @@
           renderIncidentTimes(selectedMember);
           renderHistory(selectedMember);
         } else {
-          document.getElementById('incident-times-container').innerHTML = '<div style="text-align: center; opacity: 0.5; padding: 20px;">Select a member to view incident times</div>';
-          statusList.innerHTML = '<div style="text-align: center; opacity: 0.5; padding: 20px;">Select a member to view history</div>';
+          document.getElementById('incident-times-container').innerHTML = '<div style="text-align: center; opacity: 0.5; padding: calc(20px * var(--space-scale, 1));">Select a member to view incident times</div>';
+          statusList.innerHTML = '<div style="text-align: center; opacity: 0.5; padding: calc(20px * var(--space-scale, 1));">Select a member to view history</div>';
         }
       };
 
@@ -264,7 +265,7 @@
 
         statusList.innerHTML = '';
         if (filtered.length === 0) {
-          statusList.innerHTML = '<div style="text-align: center; opacity: 0.5; padding: 20px;">No status records found</div>';
+          statusList.innerHTML = '<div style="text-align: center; opacity: 0.5; padding: calc(20px * var(--space-scale, 1));">No status records found</div>';
           return;
         }
 

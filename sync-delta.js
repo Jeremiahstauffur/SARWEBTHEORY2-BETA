@@ -73,6 +73,7 @@
         profile: 'profile',
         theme: 'settings_page',
         showTips: 'settings_page',
+        geekMode: 'settings_page',
         background: 'settings_page',
         deleteMode: 'settings_page',
         parCheckFrequency: 'settings_page',
