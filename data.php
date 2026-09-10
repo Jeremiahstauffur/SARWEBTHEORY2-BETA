@@ -2,7 +2,7 @@
 // data.php - PHP bridge for SAR database storage using SQLite
 header("Access-Control-Allow-Origin: *");
 header("Access-Control-Allow-Methods: GET, POST, PUT, DELETE, OPTIONS");
-header("Access-Control-Allow-Headers: Content-Type, Authorization, X-User-Name, X-User-Pin, X-Last-Modified");
+header("Access-Control-Allow-Headers: Content-Type, Authorization, X-User-Name, X-User-Pin, X-User-Password, X-Last-Modified");
 header("Content-Type: application/json");
 
 if ($_SERVER['REQUEST_METHOD'] === 'OPTIONS') {
@@ -68,6 +68,18 @@ try {
         bucket VARCHAR(191) NOT NULL,
         lastAccessed VARCHAR(64),
         PRIMARY KEY (username, bucket)
+    ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
+
+    // Per-login images from the Settings page (header logo, background photo),
+    // stored as data: URLs under the login username. Mirrors sync-server.js.
+    $db->exec("CREATE TABLE IF NOT EXISTS user_assets (
+        username VARCHAR(191) NOT NULL,
+        asset_kind VARCHAR(32) NOT NULL,
+        file_name VARCHAR(255),
+        mime_type VARCHAR(100),
+        data LONGTEXT,
+        updatedAt VARCHAR(64),
+        PRIMARY KEY (username, asset_kind)
     ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4");
 } catch (PDOException $e) {
     http_response_code(500);
@@ -179,6 +191,64 @@ if ($parts[1] === 'auth') {
         $stmt->execute([$username]);
         echo json_encode($stmt->fetchAll(PDO::FETCH_ASSOC));
         exit;
+    }
+
+    // /api/auth/assets[/:kind] - the login's header logo and background photo.
+    if ($action === 'assets') {
+        $kinds = ['logo', 'background'];
+        $kind = isset($parts[3]) ? $parts[3] : '';
+        $rowToJson = function ($row) {
+            return [
+                'data' => $row['data'],
+                'fileName' => $row['file_name'] ?: '',
+                'mimeType' => $row['mime_type'] ?: '',
+                'updatedAt' => $row['updatedAt'] ?: null,
+            ];
+        };
+        if ($kind === '' && $method === 'GET') {
+            $stmt = $db->prepare("SELECT asset_kind, file_name, mime_type, data, updatedAt FROM user_assets WHERE username = ?");
+            $stmt->execute([$username]);
+            $out = ['logo' => null, 'background' => null];
+            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                if (in_array($row['asset_kind'], $kinds, true) && $row['data']) {
+                    $out[$row['asset_kind']] = $rowToJson($row);
+                }
+            }
+            echo json_encode($out);
+            exit;
+        }
+        if (!in_array($kind, $kinds, true)) {
+            http_response_code(400); echo json_encode(["error" => "unknown asset kind"]); exit;
+        }
+        if ($method === 'GET') {
+            $stmt = $db->prepare("SELECT asset_kind, file_name, mime_type, data, updatedAt FROM user_assets WHERE username = ? AND asset_kind = ?");
+            $stmt->execute([$username, $kind]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if (!$row || !$row['data']) {
+                http_response_code(404); echo json_encode(["error" => "no such asset"]); exit;
+            }
+            echo json_encode($rowToJson($row));
+            exit;
+        }
+        if ($method === 'PUT') {
+            $imageData = isset($data['data']) && is_string($data['data']) ? $data['data'] : '';
+            if (!preg_match('#^data:(image/[a-z0-9.+-]+)[;,]#i', $imageData, $m)) {
+                http_response_code(400); echo json_encode(["error" => "data must be an image data URL"]); exit;
+            }
+            $mimeType = strtolower($m[1]);
+            $fileName = isset($data['fileName']) && is_string($data['fileName']) ? substr($data['fileName'], 0, 255) : '';
+            $nowIso = date('c');
+            $stmt = $db->prepare("REPLACE INTO user_assets (username, asset_kind, file_name, mime_type, data, updatedAt) VALUES (?, ?, ?, ?, ?, ?)");
+            $stmt->execute([$username, $kind, $fileName, $mimeType, $imageData, $nowIso]);
+            echo json_encode(["success" => true, "asset" => ["fileName" => $fileName, "mimeType" => $mimeType, "updatedAt" => $nowIso]]);
+            exit;
+        }
+        if ($method === 'DELETE') {
+            $stmt = $db->prepare("DELETE FROM user_assets WHERE username = ? AND asset_kind = ?");
+            $stmt->execute([$username, $kind]);
+            echo json_encode(["success" => true]);
+            exit;
+        }
     }
     
     http_response_code(404);

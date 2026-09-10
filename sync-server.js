@@ -335,6 +335,21 @@ const initDatabaseSchema = () => {
             PRIMARY KEY (username)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
+        // Images a login uploaded on the Settings page (the header logo and the
+        // background photo), one row per (login username, kind). They belong to
+        // the login - not to a CASE # - so they follow the user onto every
+        // device and every case until "Remove Logo" / "Use Default" is pressed.
+        // `data` is the image as a data: URL, exactly as the browser read it.
+        db.run(`CREATE TABLE IF NOT EXISTS \`${USER_ASSETS_TABLE}\` (
+            username VARCHAR(191) NOT NULL,
+            asset_kind VARCHAR(32) NOT NULL,
+            file_name VARCHAR(255),
+            mime_type VARCHAR(100),
+            data LONGTEXT,
+            updatedAt VARCHAR(64),
+            PRIMARY KEY (username, asset_kind)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
         // Super-Admin credentials that gate account registration. This table is
         // populated manually by the operator (no UI manages it): insert one row
         // per admin code you want to accept. Registration is allowed only when
@@ -460,6 +475,10 @@ const ACTIVITY_ENTRIES_TABLE = 'activity_log_entries';
 
 // "Declined for now" New Assignment notifications (one row per feature).
 const DECLINED_ASSIGNMENTS_TABLE = 'declined_assignment_features';
+
+// Per-login images from the Settings page (see initDatabaseSchema).
+const USER_ASSETS_TABLE = 'user_assets';
+const USER_ASSET_KINDS = ['logo', 'background'];
 
 // Promise wrapper around the sqlite-compatible db.run helper.
 const runAsync = (sql, params = []) => new Promise((resolve, reject) => {
@@ -840,6 +859,8 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports.SINGLE_TABLES = SINGLE_TABLES;
     module.exports.STRUCTURED_TABLES = STRUCTURED_TABLES;
     module.exports.ACTIVITY_ENTRIES_TABLE = ACTIVITY_ENTRIES_TABLE;
+    module.exports.USER_ASSETS_TABLE = USER_ASSETS_TABLE;
+    module.exports.USER_ASSET_KINDS = USER_ASSET_KINDS;
     module.exports.DECLINED_ASSIGNMENTS_TABLE = DECLINED_ASSIGNMENTS_TABLE;
     module.exports.activityEntryId = activityEntryId;
     module.exports.collectActivityEntryChanges = collectActivityEntryChanges;
@@ -1035,6 +1056,81 @@ app.get('/api/auth/settings', authMiddleware, (req, res) => {
 app.put('/api/auth/settings', authMiddleware, (req, res) => {
     const settings = JSON.stringify(req.body || {});
     db.run("INSERT OR REPLACE INTO user_settings (username, settings) VALUES (?, ?)", [req.user.username, settings], (err) => {
+        if (err) return res.status(500).json({error: err.message});
+        res.json({success: true});
+    });
+});
+
+// ---------------------------------------------------------------------------
+// Per-login images: the header logo and the background photo chosen on the
+// Settings page. Stored under the login username (not the CASE #), so they are
+// served back on every device and in every case until removed.
+//   GET    /api/auth/assets          -> {logo: {...}|null, background: {...}|null}
+//   PUT    /api/auth/assets/:kind    body {data: 'data:image/...;base64,...', fileName}
+//   DELETE /api/auth/assets/:kind
+// ---------------------------------------------------------------------------
+const isUserAssetKind = (kind) => USER_ASSET_KINDS.includes(String(kind || ''));
+
+// The MIME type carried by an image data: URL ('' when it is not one).
+const imageDataUrlMimeType = (value) => {
+    const match = /^data:(image\/[a-z0-9.+-]+)[;,]/i.exec(String(value || ''));
+    return match ? match[1].toLowerCase() : '';
+};
+
+const userAssetRowToJson = (row) => ({
+    data: row.data,
+    fileName: row.file_name || '',
+    mimeType: row.mime_type || '',
+    updatedAt: row.updatedAt || null
+});
+
+app.get('/api/auth/assets', authMiddleware, (req, res) => {
+    db.all(`SELECT asset_kind, file_name, mime_type, data, updatedAt FROM \`${USER_ASSETS_TABLE}\` WHERE username = ?`, [req.user.username], (err, rows) => {
+        if (err) return res.status(500).json({error: err.message});
+        const out = {};
+        USER_ASSET_KINDS.forEach((kind) => { out[kind] = null; });
+        (rows || []).forEach((row) => {
+            if (row && isUserAssetKind(row.asset_kind) && row.data) {
+                out[row.asset_kind] = userAssetRowToJson(row);
+            }
+        });
+        res.json(out);
+    });
+});
+
+app.get('/api/auth/assets/:kind', authMiddleware, (req, res) => {
+    const {kind} = req.params;
+    if (!isUserAssetKind(kind)) return res.status(400).json({error: 'unknown asset kind'});
+    db.get(`SELECT asset_kind, file_name, mime_type, data, updatedAt FROM \`${USER_ASSETS_TABLE}\` WHERE username = ? AND asset_kind = ?`, [req.user.username, kind], (err, row) => {
+        if (err) return res.status(500).json({error: err.message});
+        if (!row || !row.data) return res.status(404).json({error: 'no such asset'});
+        res.json(userAssetRowToJson(row));
+    });
+});
+
+app.put('/api/auth/assets/:kind', authMiddleware, (req, res) => {
+    const {kind} = req.params;
+    if (!isUserAssetKind(kind)) return res.status(400).json({error: 'unknown asset kind'});
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const data = typeof body.data === 'string' ? body.data : '';
+    const mimeType = imageDataUrlMimeType(data);
+    if (!mimeType) return res.status(400).json({error: 'data must be an image data URL'});
+    const fileName = typeof body.fileName === 'string' ? body.fileName.slice(0, 255) : '';
+    const nowIso = new Date().toISOString();
+    db.run(
+        `REPLACE INTO \`${USER_ASSETS_TABLE}\` (username, asset_kind, file_name, mime_type, data, updatedAt) VALUES (?, ?, ?, ?, ?, ?)`,
+        [req.user.username, kind, fileName, mimeType, data, nowIso],
+        (err) => {
+            if (err) return res.status(500).json({error: err.message});
+            res.json({success: true, asset: {fileName, mimeType, updatedAt: nowIso}});
+        }
+    );
+});
+
+app.delete('/api/auth/assets/:kind', authMiddleware, (req, res) => {
+    const {kind} = req.params;
+    if (!isUserAssetKind(kind)) return res.status(400).json({error: 'unknown asset kind'});
+    db.run(`DELETE FROM \`${USER_ASSETS_TABLE}\` WHERE username = ? AND asset_kind = ?`, [req.user.username, kind], (err) => {
         if (err) return res.status(500).json({error: err.message});
         res.json({success: true});
     });

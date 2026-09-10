@@ -28,6 +28,8 @@ const USER_PASSWORD_STORAGE_KEY = 'sar-user-password-v1';
 const CALTOPO_PROXY_STORAGE_KEY = 'sar-caltopo-proxy-v1';
 const CALTOPO_CREDS_STORAGE_KEY = 'sar-caltopo-creds-v1';
 const DEVICE_ID_STORAGE_KEY = 'sar-device-id-v1';
+// The background photo every page shows unless the login uploaded its own.
+const DEFAULT_BACKGROUND_IMAGE = 'assets/us-night.jpg';
 // Row changes this device has made but not yet delivered to the server. Every
 // save is diffed against the copy that was on this device just before it, and
 // only those rows are queued here and uploaded. The queue lives in memory for
@@ -1690,6 +1692,11 @@ function getUserCredentials() {
 // memory for the lifetime of the page. Loaded once on start-up, right after login.
 let _serverSettings = null;
 let _serverSettingsLoading = false;
+// True once the server's copy was actually read during this page load. Writes
+// that happen on their own (not from a user action) wait for this, so a slow or
+// unreachable server can never make the page overwrite the stored settings
+// with an empty record.
+let _serverSettingsLoaded = false;
 
 async function loadServerSettings() {
     const creds = getUserCredentials();
@@ -1715,6 +1722,7 @@ async function loadServerSettings() {
         });
         if (resp.ok) {
             _serverSettings = await resp.json();
+            _serverSettingsLoaded = true;
             setStorageItem(SERVER_SETTINGS_CACHE_KEY, JSON.stringify(_serverSettings));
         } else if (_serverSettings === null) {
             _serverSettings = {};
@@ -1762,6 +1770,231 @@ async function setServerSetting(key, value) {
     const settings = await loadServerSettings();
     settings[key] = value;
     await saveServerSettings(settings);
+}
+
+// ---------------------------------------------------------------------------
+// Login preferences.
+//
+// The Settings page used to keep every preference only inside the open search
+// file, so a new CASE # (or another device) came up with the defaults again.
+// The preferences below now also live in the database under the LOGIN username
+// (the user_settings row read by loadServerSettings), and on every page load
+// they are copied onto the open case before anything is drawn - so a login sees
+// its own settings every time it signs in, on every device and in every case.
+//
+// Two groups of settings are shown on the Settings page (each panel carries a
+// pill naming who it is saved for, see renderSettingScopePills):
+//   * per USER ACCOUNT (the person selected from the accounts list): the theme
+//     and "Use My Highlight Color" - stored on that account;
+//   * per LOGIN: everything else - stored here.
+// ---------------------------------------------------------------------------
+const USER_PREFERENCES_KEY = 'sar-user-preferences-v1';
+
+// Bundle keys that are login preferences. Each is mirrored 1:1 between the
+// open case and the login's preference record.
+const LOGIN_PREFERENCE_KEYS = [
+    'deleteMode',
+    'showTips',
+    'parCheckFrequency',
+    'mapUnaccountedAutoCheck',
+    'segmentColorScaleUsePsriMax',
+    'segmentColorScaleLowColor',
+    'segmentColorScaleMidColor',
+    'segmentColorScaleHighColor',
+    'segmentActiveSearchOpacityPercent',
+    'segmentActiveSearchFillColor',
+    'segmentActiveSearchBorderOpacityPercent',
+    'segmentActiveSearchBorderColor',
+    'segmentActiveSearchBorderWidth'
+];
+
+// The login's preference record (never null). `geekMode` and the last applied
+// `theme` live here as well; they are not bundle keys.
+function getUserPreferences() {
+    const prefs = _serverSettings && _serverSettings[USER_PREFERENCES_KEY];
+    return prefs && typeof prefs === 'object' && !Array.isArray(prefs) ? prefs : {};
+}
+
+// Store one or more preferences for this login. Returns the save promise (or
+// null when nothing changed / nobody is logged in) so callers may await it.
+function saveUserPreferences(patch) {
+    if (!getUserCredentials() || !patch || typeof patch !== 'object') return null;
+    // Never write before the server's record was read: the PUT replaces the
+    // whole record, so saving onto an empty stand-in would wipe the login's
+    // case number, proxy URL and every other setting.
+    if (!_serverSettingsLoaded) {
+        console.warn('Preferences not saved: the server settings have not been read yet.');
+        return null;
+    }
+    if (!_serverSettings) { _serverSettings = {}; }
+    const current = getUserPreferences();
+    const next = Object.assign({}, current);
+    let changed = false;
+    Object.keys(patch).forEach((key) => {
+        if (patch[key] === undefined) return;
+        if (JSON.stringify(current[key]) !== JSON.stringify(patch[key])) {
+            next[key] = patch[key];
+            changed = true;
+        }
+    });
+    if (!changed) return null;
+    _serverSettings[USER_PREFERENCES_KEY] = next;
+    return saveServerSettings(_serverSettings);
+}
+
+// Settings page helper: a login preference was changed on the open case; keep
+// the login's record in step.
+function persistLoginPreference(key, value) {
+    if (!LOGIN_PREFERENCE_KEYS.includes(key)) return null;
+    return saveUserPreferences({[key]: value});
+}
+
+// Copy the login's stored preferences onto a case. Returns true when the case
+// was changed (the caller then saves it so the case mirrors the login).
+function applyLoginPreferencesToBundle(bundle) {
+    if (!bundle || typeof bundle !== 'object') return false;
+    const prefs = getUserPreferences();
+    let changed = false;
+    LOGIN_PREFERENCE_KEYS.forEach((key) => {
+        if (prefs[key] === undefined) return;
+        if (JSON.stringify(bundle[key]) !== JSON.stringify(prefs[key])) {
+            bundle[key] = JSON.parse(JSON.stringify(prefs[key]));
+            changed = true;
+        }
+    });
+    return changed;
+}
+
+// Geek Mode (compact spacing) is a login preference applied to <html>.
+function isGeekModeEnabled() {
+    return getUserPreferences().geekMode === true;
+}
+
+function applyGeekMode(enabled = isGeekModeEnabled()) {
+    const root = document.documentElement;
+    if (!root || !root.classList) return;
+    if (enabled) root.classList.add('geek-mode');
+    else root.classList.remove('geek-mode');
+    rememberUiHint();
+}
+
+// The theme currently applied to the page ('light' | 'dark').
+function getAppliedTheme() {
+    const root = document.documentElement;
+    return root && root.classList && root.classList.contains('light-mode') ? 'light' : 'dark';
+}
+
+// ---------------------------------------------------------------------------
+// Boot hint + boot overlay (see theme-boot.js).
+//
+// The theme is only known after the server has been read, so the page used to
+// paint dark and then switch to light. theme-boot.js runs in <head>, reads a
+// tiny hint cookie with the theme (and Geek Mode) last applied for this login
+// and puts the page in that theme before the first paint; it also covers the
+// page with an 80% dark/light overlay and a spinner until finishPageBoot()
+// says the preferences from the server have been applied.
+// ---------------------------------------------------------------------------
+const UI_HINT_COOKIE = 'sar-ui-hint';
+
+function rememberUiHint(theme = getAppliedTheme(), geek = isGeekModeEnabled()) {
+    const flags = [theme === 'light' ? 'light' : 'dark'];
+    if (geek) flags.push('geek');
+    try { setCookie(UI_HINT_COOKIE, flags.join(','), 365); } catch (e) { /* ignore */ }
+}
+
+// Write the hint from the preferences just read for a login (used right after
+// logging in, before the reload, so the very first page already paints right).
+function rememberUiHintFromPreferences() {
+    const prefs = getUserPreferences();
+    rememberUiHint(prefs.theme === 'light' ? 'light' : 'dark', prefs.geekMode === true);
+}
+
+let _pageBootFinished = false;
+function finishPageBoot() {
+    if (_pageBootFinished) return;
+    _pageBootFinished = true;
+    const root = document.documentElement;
+    if (!root || !root.classList || !root.classList.contains('sar-booting')) return;
+    root.classList.add('sar-boot-done');
+    setTimeout(() => {
+        root.classList.remove('sar-booting');
+        root.classList.remove('sar-boot-done');
+    }, 320);
+}
+
+// ---------------------------------------------------------------------------
+// Per-login images (header logo, background photo).
+//
+// The images chosen on the Settings page are stored in the database under the
+// login username (/api/auth/assets) and read back on every page load, so they
+// are the same on every device and in every case and only go away through the
+// "Remove Logo" / "Use Default" buttons. They used to be kept inside the case
+// file only - and the logo was not even re-applied on load - so a refresh lost
+// them.
+// ---------------------------------------------------------------------------
+const USER_ASSET_KINDS = ['logo', 'background'];
+let _userAssets = null;
+
+function getUserAsset(kind) {
+    const asset = _userAssets && _userAssets[kind];
+    return asset && typeof asset.data === 'string' && asset.data ? asset : null;
+}
+
+function getUserAssetsUrl(kind) {
+    const base = getSyncServerUrl().replace(/\/$/, '');
+    return kind ? `${base}/api/auth/assets/${kind}` : `${base}/api/auth/assets`;
+}
+
+async function loadUserAssets() {
+    if (!getUserCredentials() || !getSyncServerUrl()) return _userAssets || {};
+    try {
+        const resp = await apiFetch(`${getUserAssetsUrl()}?_=${Date.now()}`, {headers: getAuthHeaders()});
+        if (resp.ok) {
+            const data = await resp.json();
+            _userAssets = data && typeof data === 'object' ? data : {};
+        } else if (_userAssets === null) {
+            _userAssets = {};
+        }
+    } catch (e) {
+        console.warn('Failed to load user images:', e);
+        if (_userAssets === null) _userAssets = {};
+    }
+    return _userAssets;
+}
+
+// Store an image for this login. `dataUrl` is the data: URL the browser read.
+// Resolves to true when the server confirmed the write.
+async function saveUserAsset(kind, dataUrl, fileName) {
+    if (!USER_ASSET_KINDS.includes(kind) || !getUserCredentials()) return false;
+    if (!_userAssets) _userAssets = {};
+    _userAssets[kind] = {data: dataUrl, fileName: fileName || '', updatedAt: new Date().toISOString()};
+    try {
+        const resp = await apiFetch(getUserAssetsUrl(kind), {
+            method: 'PUT',
+            headers: getAuthHeaders({'Content-Type': 'application/json'}),
+            body: JSON.stringify({data: dataUrl, fileName: fileName || ''})
+        });
+        return resp.ok;
+    } catch (e) {
+        console.warn(`Failed to store the ${kind} image:`, e);
+        return false;
+    }
+}
+
+async function deleteUserAsset(kind) {
+    if (!USER_ASSET_KINDS.includes(kind)) return false;
+    if (_userAssets) _userAssets[kind] = null;
+    if (!getUserCredentials()) return false;
+    try {
+        const resp = await apiFetch(getUserAssetsUrl(kind), {
+            method: 'DELETE',
+            headers: getAuthHeaders()
+        });
+        return resp.ok;
+    } catch (e) {
+        console.warn(`Failed to remove the ${kind} image:`, e);
+        return false;
+    }
 }
 
 // This login's cases as the server lists them (see GET /api/auth/history).
@@ -2299,6 +2532,13 @@ function showLoginPopup() {
                 setCookie(USER_NAME_STORAGE_KEY, data.user.username);
                 setCookie(USER_PASSWORD_STORAGE_KEY, data.user.pin);
                 setCurrentUser(data.user);
+                // Read this login's stored preferences now and leave the theme
+                // hint for the reload, so the first page after logging in
+                // already paints in the login's theme (see theme-boot.js).
+                loginBtn.textContent = 'Loading your settings\u2026';
+                _serverSettings = null;
+                await withTimeout(loadServerSettings(), 6000);
+                rememberUiHintFromPreferences();
                 closePopup(popup);
                 window.location.reload();
                 return;
@@ -11252,13 +11492,17 @@ function applyTheme(bundle) {
     }
   }
 
-  // The preference comes from the search file on the server (read after login),
-  // so nothing is cached on the device.
+  // The preference comes from the search file on the server (read after login);
+  // the device only keeps the boot hint (see theme-boot.js) so the next page
+  // paints in this theme straight away instead of flashing dark first.
   if (theme === 'light') {
     document.documentElement.classList.add('light-mode');
   } else {
     document.documentElement.classList.remove('light-mode');
   }
+  rememberUiHint(theme);
+  // Remembered for the login too, so a fresh device gets the right hint at login.
+  saveUserPreferences({theme: theme === 'light' ? 'light' : 'dark'});
 }
 
 function hexToRgbTriple(hex) {
@@ -11313,14 +11557,32 @@ function applyAccentColor(bundle) {
   root.style.setProperty('--accent-rgb', triple);
 }
 
+// The background photo: the image stored for this login on the server wins;
+// otherwise the case's own setting (a path or an older embedded image); else the
+// default satellite image from the stylesheet.
+function getBackgroundImageSource(bundle) {
+  const own = getUserAsset('background');
+  if (own) return own.data;
+  return bundle && typeof bundle.background === 'string' && bundle.background ? bundle.background : DEFAULT_BACKGROUND_IMAGE;
+}
+
 function applyBackground(bundle) {
-  if (bundle && bundle.background) {
-    document.body.style.backgroundImage = `linear-gradient(var(--bg-dim-start), var(--bg-dim-end)), url('${bundle.background}')`;
+  const src = getBackgroundImageSource(bundle);
+  if (src) {
+    document.body.style.backgroundImage = `linear-gradient(var(--bg-dim-start), var(--bg-dim-end)), url('${src}')`;
   }
 }
 
+// The header logo: the image stored for this login on the server, else the
+// case's own (legacy) logo, else none.
+function getLogoImageSource(bundle) {
+  const own = getUserAsset('logo');
+  if (own) return own.data;
+  return bundle && typeof bundle.logo === 'string' ? bundle.logo : '';
+}
+
 function applyLogo(bundle) {
-  const src = bundle && bundle.logo ? bundle.logo : '';
+  const src = getLogoImageSource(bundle);
   document.querySelectorAll('[data-header-logo]').forEach((img) => {
     if (src) {
       img.src = src;
@@ -11342,6 +11604,53 @@ function applyTipsVisibility(bundle) {
     if (p.closest('.hero')) {
       p.style.display = showTips ? '' : 'none';
     }
+  });
+}
+
+// Settings page: put a small pill in the upper corner of every panel naming who
+// its settings are saved for. A panel marked data-setting-scope="user" is kept
+// on the selected user's account and shows that user's name; a panel marked
+// "login" is kept under the login username (see LOGIN_PREFERENCE_KEYS and
+// saveUserAsset) and shows the username that is logged in.
+const SETTING_SCOPE_USER_ICON = '<svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20 21v-2a4 4 0 0 0-4-4H8a4 4 0 0 0-4 4v2"></path><circle cx="12" cy="7" r="4"></circle></svg>';
+const SETTING_SCOPE_LOGIN_ICON = '<svg viewBox="0 0 24 24" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 1 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"></path></svg>';
+
+function renderSettingScopePills() {
+  if (typeof document === 'undefined' || !document.querySelectorAll) return;
+  const creds = getUserCredentials();
+  const loginName = creds && creds.name ? String(creds.name).trim() : '';
+  const userName = getAccountName(getCurrentUser());
+  const panels = document.querySelectorAll('.home-panel[data-setting-scope]');
+  (panels && panels.forEach ? Array.from(panels) : []).forEach((panel) => {
+    const scope = panel.dataset && panel.dataset.settingScope === 'user' ? 'user' : 'login';
+    let pill = panel.querySelector('.setting-scope-pill');
+    if (!pill) {
+      pill = document.createElement('span');
+      pill.className = 'setting-scope-pill';
+      panel.classList.add('has-scope-pill');
+      if (typeof panel.prepend === 'function') panel.prepend(pill);
+      else panel.insertBefore(pill, panel.firstChild || null);
+    }
+    pill.classList.toggle('setting-scope-pill--user', scope === 'user');
+    pill.classList.toggle('setting-scope-pill--login', scope === 'login');
+    const name = scope === 'user' ? (userName || loginName) : loginName;
+    const shown = name || (scope === 'user' ? 'No user selected' : 'Not logged in');
+    pill.innerHTML = '';
+    const icon = document.createElement('span');
+    icon.className = 'setting-scope-pill-icon';
+    icon.innerHTML = scope === 'user' ? SETTING_SCOPE_USER_ICON : SETTING_SCOPE_LOGIN_ICON;
+    const kind = document.createElement('span');
+    kind.className = 'setting-scope-pill-kind';
+    kind.textContent = scope === 'user' ? 'User' : 'Login';
+    const nameEl = document.createElement('span');
+    nameEl.className = 'setting-scope-pill-name';
+    nameEl.textContent = shown;
+    pill.appendChild(icon);
+    pill.appendChild(kind);
+    pill.appendChild(nameEl);
+    pill.title = scope === 'user'
+      ? `Saved for the selected user (${shown}): follows this user in the accounts list.`
+      : `Saved for the login username (${shown}): follows you onto every device and every case.`;
   });
 }
 
@@ -11407,6 +11716,9 @@ function buildSettingsPage() {
             input.value = nextSettings[settingsKey];
             if (eventName === 'onchange') logIfChanged(nextBundle);
             saveBundle(nextBundle);
+            // A login preference: stored for the login once the value is settled
+            // (a color picker fires `oninput` on every drag step; see onchange).
+            if (eventName === 'onchange') persistLoginPreference(bundleKey, nextBundle[bundleKey]);
             updateSegmentSearchOpacityLabel(nextSettings);
             status.textContent = message;
         };
@@ -11414,6 +11726,7 @@ function buildSettingsPage() {
             input.onchange = () => {
                 const nextBundle = loadBundle();
                 if (logIfChanged(nextBundle)) saveBundle(nextBundle);
+                persistLoginPreference(bundleKey, nextBundle[bundleKey]);
             };
         }
     };
@@ -11428,6 +11741,7 @@ function buildSettingsPage() {
             logSettingChange('Segment color scale maximum', wasPsriMax ? 'highest PSRi' : 'highest PSRc',
                 segmentScaleMaxToggle.checked ? 'highest PSRi' : 'highest PSRc', nextBundle);
             saveBundle(nextBundle);
+            persistLoginPreference('segmentColorScaleUsePsriMax', nextBundle.segmentColorScaleUsePsriMax);
             updateSegmentScaleLabel(getSegmentDisplaySettings(nextBundle));
             status.textContent = 'Segment color scale maximum source updated.';
         };
@@ -11456,6 +11770,7 @@ function buildSettingsPage() {
                 saveBundle(nextBundle);
             }
             lastLoggedValue = stored;
+            persistLoginPreference(key, nextBundle[key]);
         };
     });
 
@@ -11474,18 +11789,38 @@ function buildSettingsPage() {
   toggle.checked = !!bundle.deleteMode;
   label.textContent = `Delete Mode is ${toggle.checked ? 'ON' : 'OFF'}`;
 
+  // Who each panel's settings are saved for (user account vs. login).
+  renderSettingScopePills();
+
   if (themeToggle) {
-    themeToggle.checked = bundle.theme === 'light';
-    themeLabel.textContent = bundle.theme === 'light' ? 'Light Mode' : 'Dark Mode';
+    // The theme is a per-user setting: it lives on the selected user's account
+    // (that is what applyTheme reads first), with the case's own theme as the
+    // fallback when no account is selected. The toggle shows - and changes -
+    // what is actually applied.
+    const currentUser = getCurrentUser();
+    const findThemeAccount = (b) => (b.accounts || []).find(a =>
+      currentUser && a.username === currentUser.username && a.pin === currentUser.pin
+    );
+    const resolveTheme = (b) => {
+      const account = findThemeAccount(b);
+      const theme = account && account.theme ? account.theme : b.theme;
+      return theme === 'light' ? 'light' : 'dark';
+    };
+    const currentTheme = resolveTheme(bundle);
+    themeToggle.checked = currentTheme === 'light';
+    themeLabel.textContent = currentTheme === 'light' ? 'Light Mode' : 'Dark Mode';
     themeToggle.onchange = () => {
       const nextBundle = loadBundle();
-      const previousTheme = nextBundle.theme === 'light' ? 'light' : 'dark';
-      nextBundle.theme = themeToggle.checked ? 'light' : 'dark';
-      logSettingChange('Theme', previousTheme, nextBundle.theme, nextBundle);
+      const previousTheme = resolveTheme(nextBundle);
+      const nextTheme = themeToggle.checked ? 'light' : 'dark';
+      const account = findThemeAccount(nextBundle);
+      if (account) account.theme = nextTheme;
+      nextBundle.theme = nextTheme;
+      logSettingChange('Theme', previousTheme, nextTheme, nextBundle);
       saveBundle(nextBundle);
       applyTheme(nextBundle);
       applyBackground(nextBundle);
-      themeLabel.textContent = nextBundle.theme === 'light' ? 'Light Mode' : 'Dark Mode';
+      themeLabel.textContent = nextTheme === 'light' ? 'Light Mode' : 'Dark Mode';
       status.textContent = 'Theme updated and saved.';
     };
   }
@@ -11529,6 +11864,7 @@ function buildSettingsPage() {
       nextBundle.showTips = tipsToggle.checked;
       logSettingChange('Tips', wereOn ? 'ON' : 'OFF', tipsToggle.checked ? 'ON' : 'OFF', nextBundle);
       saveBundle(nextBundle);
+      persistLoginPreference('showTips', nextBundle.showTips);
       applyTipsVisibility(nextBundle);
       tipsLabel.textContent = `Tips are ${tipsToggle.checked ? 'ON' : 'OFF'}`;
       status.textContent = 'Tips display preference updated.';
@@ -11548,6 +11884,7 @@ function buildSettingsPage() {
       nextBundle.parCheckFrequency = val;
       logSettingChange('Par check frequency (minutes)', previousFrequency, val, nextBundle);
       saveBundle(nextBundle);
+      persistLoginPreference('parCheckFrequency', val);
       status.textContent = `Par check frequency updated to ${val} minutes.`;
     };
   }
@@ -11564,6 +11901,7 @@ function buildSettingsPage() {
       nextBundle.mapUnaccountedAutoCheck = mapAutoCheckToggle.checked;
       logSettingChange('Automatic unaccounted map feature check', wasOn ? 'ON' : 'OFF', mapAutoCheckToggle.checked ? 'ON' : 'OFF', nextBundle);
       saveBundle(nextBundle);
+      persistLoginPreference('mapUnaccountedAutoCheck', nextBundle.mapUnaccountedAutoCheck);
       if (mapAutoCheckLabel) mapAutoCheckLabel.textContent = describe(mapAutoCheckToggle.checked);
       status.textContent = mapAutoCheckToggle.checked
         ? 'Unaccounted map features will be checked every 5 minutes.'
@@ -11577,26 +11915,61 @@ function buildSettingsPage() {
     nextBundle.deleteMode = toggle.checked;
     logSettingChange('Delete Mode', wasOn ? 'ON' : 'OFF', toggle.checked ? 'ON' : 'OFF', nextBundle);
     saveBundle(nextBundle);
+    persistLoginPreference('deleteMode', nextBundle.deleteMode);
     label.textContent = `Delete Mode is ${toggle.checked ? 'ON' : 'OFF'}`;
     status.textContent = `Settings saved automatically.`;
   };
 
+  const geekModeToggle = document.getElementById('geek-mode-toggle');
+  const geekModeLabel = document.getElementById('geek-mode-label');
+  if (geekModeToggle) {
+    const describeGeek = enabled => `Geek Mode is ${enabled ? 'ON' : 'OFF'}`;
+    geekModeToggle.checked = isGeekModeEnabled();
+    if (geekModeLabel) geekModeLabel.textContent = describeGeek(geekModeToggle.checked);
+    geekModeToggle.onchange = () => {
+      const wasOn = isGeekModeEnabled();
+      const nextBundle = loadBundle();
+      logSettingChange('Geek Mode', wasOn ? 'ON' : 'OFF', geekModeToggle.checked ? 'ON' : 'OFF', nextBundle);
+      saveBundle(nextBundle);
+      saveUserPreferences({geekMode: geekModeToggle.checked});
+      applyGeekMode(geekModeToggle.checked);
+      if (geekModeLabel) geekModeLabel.textContent = describeGeek(geekModeToggle.checked);
+      status.textContent = geekModeToggle.checked
+        ? 'Geek Mode on: compact spacing is used across the site.'
+        : 'Geek Mode off: standard spacing is used.';
+    };
+  }
+
+  // Read a chosen image file as a data: URL.
+  const readImageFile = (file) => new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = (e) => resolve(e.target.result);
+    reader.onerror = () => reject(reader.error || new Error('read failed'));
+    reader.readAsDataURL(file);
+  });
+
+  // The background photo and the logo are stored on the server under the login
+  // username (see saveUserAsset), so they come back on every device, in every
+  // case and after every refresh, until the buttons below remove them.
   if (bgInput) {
     bgInput.onchange = async () => {
       const file = bgInput.files?.[0];
       if (!file) return;
 
       try {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const nextBundle = loadBundle();
-          nextBundle.background = e.target.result;
-          addActivityLogEntry('System', `Setting "Background image" changed to uploaded image "${file.name}"`, nextBundle);
-          saveBundle(nextBundle);
-          applyBackground(nextBundle);
-          status.textContent = 'Background updated and saved.';
-        };
-        reader.readAsDataURL(file);
+        const dataUrl = await readImageFile(file);
+        status.textContent = 'Storing the background image on the server\u2026';
+        const stored = await saveUserAsset('background', dataUrl, file.name);
+        const nextBundle = loadBundle();
+        // The case only remembers that a custom photo is in use; the image
+        // itself belongs to the login.
+        nextBundle.background = DEFAULT_BACKGROUND_IMAGE;
+        addActivityLogEntry('System', `Setting "Background image" changed to uploaded image "${file.name}"`, nextBundle);
+        saveBundle(nextBundle);
+        applyBackground(nextBundle);
+        status.textContent = stored
+          ? 'Background updated and saved for your login.'
+          : 'Background applied, but it could not be stored on the server. Check the connection and try again.';
       } catch (err) {
         status.textContent = 'Could not load the image.';
       }
@@ -11605,12 +11978,14 @@ function buildSettingsPage() {
   }
 
   if (resetBgBtn) {
-    resetBgBtn.onclick = () => {
+    resetBgBtn.onclick = async () => {
+      const hadCustom = !!getUserAsset('background');
       const nextBundle = loadBundle();
-      const wasDefault = nextBundle.background === 'assets/us-night.jpg';
-      nextBundle.background = 'assets/us-night.jpg';
+      const wasDefault = nextBundle.background === DEFAULT_BACKGROUND_IMAGE && !hadCustom;
+      nextBundle.background = DEFAULT_BACKGROUND_IMAGE;
       if (!wasDefault) addActivityLogEntry('System', 'Setting "Background image" reverted to the default image', nextBundle);
       saveBundle(nextBundle);
+      await deleteUserAsset('background');
       applyBackground(nextBundle);
         status.textContent = 'Background reverted to default us-night satellite image.';
     };
@@ -11625,16 +12000,18 @@ function buildSettingsPage() {
       if (!file) return;
 
       try {
-        const reader = new FileReader();
-        reader.onload = (e) => {
-          const nextBundle = loadBundle();
-          nextBundle.logo = e.target.result;
-          addActivityLogEntry('System', `Setting "Logo" changed to uploaded image "${file.name}"`, nextBundle);
-          saveBundle(nextBundle);
-          applyLogo(nextBundle);
-          status.textContent = 'Logo updated and saved.';
-        };
-        reader.readAsDataURL(file);
+        const dataUrl = await readImageFile(file);
+        status.textContent = 'Storing the logo on the server\u2026';
+        const stored = await saveUserAsset('logo', dataUrl, file.name);
+        const nextBundle = loadBundle();
+        // The image belongs to the login; the case no longer embeds it.
+        nextBundle.logo = '';
+        addActivityLogEntry('System', `Setting "Logo" changed to uploaded image "${file.name}"`, nextBundle);
+        saveBundle(nextBundle);
+        applyLogo(nextBundle);
+        status.textContent = stored
+          ? 'Logo updated and saved for your login.'
+          : 'Logo applied, but it could not be stored on the server. Check the connection and try again.';
       } catch (err) {
         status.textContent = 'Could not load the image.';
       }
@@ -11643,12 +12020,13 @@ function buildSettingsPage() {
   }
 
   if (resetLogoBtn) {
-    resetLogoBtn.onclick = () => {
+    resetLogoBtn.onclick = async () => {
       const nextBundle = loadBundle();
-      const hadLogo = !!(typeof nextBundle.logo === 'string' && nextBundle.logo.trim());
+      const hadLogo = !!getUserAsset('logo') || !!(typeof nextBundle.logo === 'string' && nextBundle.logo.trim());
       nextBundle.logo = '';
       if (hadLogo) addActivityLogEntry('System', 'Setting "Logo" removed', nextBundle);
       saveBundle(nextBundle);
+      await deleteUserAsset('logo');
       applyLogo(nextBundle);
       status.textContent = 'Logo removed.';
     };
@@ -15062,6 +15440,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     initPageTransitions();
     
     if (!getUserCredentials()) {
+        // Nothing to read for a visitor who is not logged in: lift the boot
+        // overlay so the login popup can be used.
+        finishPageBoot();
         showLoginPopup();
         return;
     }
@@ -15073,6 +15454,10 @@ document.addEventListener('DOMContentLoaded', async () => {
     // later auto-save can even overwrite the server with an empty default bundle).
     // The wait is bounded by a timeout so an unreachable server can't hang the page.
     await withTimeout(loadServerSettings(), 8000);
+
+    // The login's own images (logo, background photo) only need the credentials,
+    // so they are read alongside the case and awaited just before drawing.
+    const userAssetsReady = withTimeout(loadUserAssets(), 10000);
 
     if (!getSyncBucket() && !isHomePage()) {
         // No case number is set yet. Instead of silently bouncing the user back
@@ -15099,14 +15484,27 @@ document.addEventListener('DOMContentLoaded', async () => {
     }
     startSyncPolling();
     
-    const bundle = loadBundle();
+    // The login's stored preferences win over whatever the case last held, so a
+    // login sees its own settings in every case and on every device. The case
+    // is saved when that changed it, so it mirrors the login from now on.
+    let bundle = loadBundle();
+    if (getUserCredentials() && applyLoginPreferencesToBundle(bundle) && getSyncBucket()) {
+        saveBundle(bundle);
+        bundle = loadBundle();
+    }
+    await userAssetsReady;
     applyTheme(bundle);
+    applyGeekMode();
     applyAccentColor(bundle);
     applyBackground(bundle);
+    applyLogo(bundle);
     applyTipsVisibility(bundle);
     updateFileNameDisplay();
     updateHeaderProfile();
     syncMobileBottomNav();
+    // Everything that decides how the page looks has been applied: lift the
+    // boot overlay (see theme-boot.js).
+    finishPageBoot();
 
     // Pages with their own inline script (mobile-status.html) render from this
     // event: the case is in memory only from here on, never before.
