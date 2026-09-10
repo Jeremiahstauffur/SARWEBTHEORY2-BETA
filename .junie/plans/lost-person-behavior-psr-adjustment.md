@@ -38,6 +38,11 @@ lift the adjustment without losing anything entered on the Incident page.
 - Defaults seeded as 0.5 / 1.0 / 1.5 / 2.0 mi for every terrain; the user enters real values in the DB.
 - IPP control sits beside the section heading (shared by all categories); label + terrain are on
   one line except on mobile.
+- **Follow-up (row ids):** the database UI could not edit rows of `lpb_default_distances` because the
+  table only had the composite key `(category, terrain)`. Both distance tables get an `id` column - a
+  unique five-digit `AUTO_INCREMENT` primary key (10000 upwards) - and keep `(category, terrain)` /
+  `(username, category, terrain)` as a `UNIQUE` key, so an edit stays with its terrain × category row.
+  Tables created before the column existed are migrated in place on server start (values preserved).
 
 # Technical Design
 
@@ -68,7 +73,11 @@ same PSR. The login's edits live only in `lpb_user_distances` and seed the next 
 - `sync-delta.js`: `SINGLE_TABLE_KEYS.lostPersonBehavior = 'lost_person_behavior'`.
 - `sync-server.js`: tables + seed in `initDatabaseSchema`, `lost_person_behavior` in `SINGLE_TABLES`,
   `syncLostPersonIppTable` (REPLACE/DELETE `lpb_ipp` whenever the section is written),
-  `GET/PUT /api/lpb/distances`, whole-case delete includes `lpb_ipp`.
+  `GET/PUT /api/lpb/distances`, whole-case delete includes `lpb_ipp`. Row ids: `LPB_FIRST_ROW_ID`
+  (10000) + `ensureLpbRowIds(table, keyColumns)` (information_schema check → `ALTER TABLE` adds the
+  `id` primary key + unique key → shifts pre-existing rows into the five-digit range); the seed uses
+  `INSERT … SELECT … WHERE NOT EXISTS` and the override write `INSERT … ON DUPLICATE KEY UPDATE` so
+  ids are neither burnt on every start nor changed on every save.
 - `page2.html`: LPB panel (`#lpb-toggle`, `#lpb-label`). `styles.css`: `.lpb-*`, `.psri-bracket-tag`.
 
 ### Sync
@@ -82,7 +91,10 @@ through `decomposeBundleToTables`.
   bracket selection, centroid/haversine, sanitizer round-trip, PSRi ×4 / ×2 / unchanged, PSRc and
   Search Log follow, Segments switch keeps settings, IPP import → row batch, GET/PUT distances,
   Incident section and Segments table render (tags on PSRi pills).
-- `test_lpb_server.js` — Express endpoints over an in-memory mysql2 stand-in.
+- `test_lpb_server.js` — Express endpoints over an in-memory mysql2 stand-in (16 checks). The stand-in
+  starts both distance tables in their pre-`id` shape and numbers rows from 1 on the `ALTER TABLE`, so the
+  migration (add column → shift into 10000+ → counter), its idempotence on a second start, the
+  collision-safe shift, the `NOT EXISTS` seed and the id-preserving `ON DUPLICATE KEY UPDATE` are covered.
 - `test_structured_tables.js` — plan carries `lost_person_behavior` / `lostPersonIpp`.
 
 # Delivery Steps
@@ -91,3 +103,4 @@ through `decomposeBundleToTables`.
 ### ✓ Step 2: Bundle key, PSR factor and Incident / Segments UI in `app.js`, `page2.html`, `styles.css`
 ### ✓ Step 3: Server tables, `/api/lpb/distances`, `lpb_ipp` mirror, whole-case delete
 ### ✓ Step 4: Tests (`test_lost_person_behavior.js`, `test_lpb_server.js`, `test_structured_tables.js`), `package.json`, `?v=` bump, AGENTS.md
+### ✓ Step 5: Five-digit `id` primary key on `lpb_default_distances` / `lpb_user_distances` (schema, in-place migration, seed + override writes, `test_lpb_server.js`, AGENTS.md)

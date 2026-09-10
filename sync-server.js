@@ -304,6 +304,48 @@ const db = {
     serialize(fn) { if (typeof fn === 'function') { fn(); } }
 };
 
+// Gives one of the Lost Person Behavior distance tables its `id` column: a
+// unique five-digit AUTO_INCREMENT primary key (LPB_FIRST_ROW_ID upwards),
+// with the old composite key kept as a UNIQUE key so there is still exactly
+// one row per `keyColumns` combination. The planner edits these tables by hand
+// and the database UI will only edit a row it can address by a single-column
+// primary key; the id also keeps an edit with its terrain x category row. A
+// table created before the column existed is migrated in place - the rows and
+// their values stay, MySQL numbers them when the column is added (possibly
+// from 1) and the second step moves such rows up into the five-digit range,
+// clear of any id already in use. A table that already has the column is left
+// alone, so this runs on every start.
+const ensureLpbRowIds = async (table, keyColumns) => {
+    const column = await getAsync(
+        'SELECT COLUMN_NAME AS columnName FROM information_schema.COLUMNS WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = ? AND COLUMN_NAME = ?',
+        [table, 'id']
+    );
+    let changed = false;
+    if (!column) {
+        await runAsync(`ALTER TABLE \`${table}\`
+            DROP PRIMARY KEY,
+            ADD COLUMN id INT UNSIGNED NOT NULL AUTO_INCREMENT FIRST,
+            ADD PRIMARY KEY (id),
+            ADD UNIQUE KEY \`uq_${table}\` (${keyColumns.join(', ')}),
+            AUTO_INCREMENT = ${LPB_FIRST_ROW_ID}`);
+        changed = true;
+    }
+    const range = await getAsync(`SELECT MIN(id) AS lo, MAX(id) AS hi FROM \`${table}\``);
+    const lo = range && range.lo != null ? Number(range.lo) : null;
+    const hi = range && range.hi != null ? Number(range.hi) : null;
+    if (lo !== null && lo < LPB_FIRST_ROW_ID) {
+        const shift = Math.max(LPB_FIRST_ROW_ID, hi + 1) - lo;
+        await runAsync(`UPDATE \`${table}\` SET id = id + ? WHERE id < ?`, [shift, LPB_FIRST_ROW_ID]);
+        changed = true;
+    }
+    if (changed) {
+        // MySQL raises this to (highest id + 1) when that is larger, so new
+        // rows always continue after the ones that are there.
+        await runAsync(`ALTER TABLE \`${table}\` AUTO_INCREMENT = ${LPB_FIRST_ROW_ID}`);
+        console.log(`[DB] ${table}: rows now carry a five-digit id`);
+    }
+};
+
 const initDatabaseSchema = () => {
     db.serialize(() => {
         db.run(`CREATE TABLE IF NOT EXISTS store (
@@ -455,12 +497,30 @@ const initDatabaseSchema = () => {
         // How far from the IPP a lost person of a behaviour category is found,
         // per terrain type: the 25 / 50 / 75 / 95 % distances in miles. This is
         // the table the planner edits by hand in the database (no UI writes
-        // it). Every known category x terrain is seeded once with placeholder
-        // miles so the website always finds a complete set; INSERT IGNORE
-        // never overwrites a row the planner already entered. The seed is
-        // chained onto the CREATE's callback because the pool may otherwise
-        // run the INSERTs before the table exists.
-        db.run(`CREATE TABLE IF NOT EXISTS \`${LPB_DEFAULTS_TABLE}\` (
+        // it), which is why every row carries `id`, a unique five-digit number
+        // (see ensureLpbRowIds); (category, terrain) stays unique on top of
+        // it. Every known category x terrain is seeded once with placeholder
+        // miles so the website always finds a complete set, and a row the
+        // planner already entered is never overwritten. The seed is written
+        // as INSERT ... SELECT ... WHERE NOT EXISTS rather than INSERT IGNORE
+        // because an ignored INSERT IGNORE still uses up an AUTO_INCREMENT
+        // number, which would leave a gap in the ids after every start.
+        // Create, migrate and seed are chained because the pool may otherwise
+        // run them in any order.
+        const seedLpbDefaults = async () => {
+            const seed = mapSegmentUtils.LPB_SEED_DISTANCES;
+            const nowIso = new Date().toISOString();
+            for (const category of mapSegmentUtils.LPB_CATEGORIES) {
+                for (const terrain of mapSegmentUtils.LPB_TERRAINS) {
+                    await runAsync(`INSERT INTO \`${LPB_DEFAULTS_TABLE}\` (category, terrain, p25, p50, p75, p95, updatedAt)
+                        SELECT ?, ?, ?, ?, ?, ?, ? FROM DUAL
+                        WHERE NOT EXISTS (SELECT 1 FROM \`${LPB_DEFAULTS_TABLE}\` WHERE category = ? AND terrain = ?)`,
+                        [category.label, terrain, seed.p25, seed.p50, seed.p75, seed.p95, nowIso, category.label, terrain]);
+                }
+            }
+        };
+        runAsync(`CREATE TABLE IF NOT EXISTS \`${LPB_DEFAULTS_TABLE}\` (
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
             category VARCHAR(191) NOT NULL,
             terrain VARCHAR(64) NOT NULL,
             p25 DECIMAL(6,1),
@@ -468,27 +528,21 @@ const initDatabaseSchema = () => {
             p75 DECIMAL(6,1),
             p95 DECIMAL(6,1),
             updatedAt VARCHAR(64),
-            PRIMARY KEY (category, terrain)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, (err) => {
-            if (err) {
-                console.error(`[DB] could not create ${LPB_DEFAULTS_TABLE}:`, err.message);
-                return;
-            }
-            const seed = mapSegmentUtils.LPB_SEED_DISTANCES;
-            const nowIso = new Date().toISOString();
-            mapSegmentUtils.LPB_CATEGORIES.forEach((category) => {
-                mapSegmentUtils.LPB_TERRAINS.forEach((terrain) => {
-                    db.run(`INSERT IGNORE INTO \`${LPB_DEFAULTS_TABLE}\` (category, terrain, p25, p50, p75, p95, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
-                        [category.label, terrain, seed.p25, seed.p50, seed.p75, seed.p95, nowIso]);
-                });
-            });
-        });
+            PRIMARY KEY (id),
+            UNIQUE KEY \`uq_${LPB_DEFAULTS_TABLE}\` (category, terrain)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=${LPB_FIRST_ROW_ID}`)
+            .then(() => ensureLpbRowIds(LPB_DEFAULTS_TABLE, ['category', 'terrain']))
+            .then(seedLpbDefaults)
+            .catch((err) => console.error(`[DB] could not prepare ${LPB_DEFAULTS_TABLE}:`, err.message));
 
-        // A login's own version of those distances, edited on the Settings
+        // A login's own version of those distances, edited on the Incident
         // page. Tied to the login username only (never to a CASE #) so the
         // edits follow the user onto every device and every case. A NULL
-        // bracket means "no override - use the planner's default".
-        db.run(`CREATE TABLE IF NOT EXISTS \`${LPB_USER_DISTANCES_TABLE}\` (
+        // bracket means "no override - use the planner's default". Same
+        // five-digit `id` (and the same migration) as the defaults table so
+        // these rows can be looked at and corrected in the database UI too.
+        runAsync(`CREATE TABLE IF NOT EXISTS \`${LPB_USER_DISTANCES_TABLE}\` (
+            id INT UNSIGNED NOT NULL AUTO_INCREMENT,
             username VARCHAR(191) NOT NULL,
             category VARCHAR(191) NOT NULL,
             terrain VARCHAR(64) NOT NULL,
@@ -497,8 +551,11 @@ const initDatabaseSchema = () => {
             p75 DECIMAL(6,1) NULL,
             p95 DECIMAL(6,1) NULL,
             updatedAt VARCHAR(64),
-            PRIMARY KEY (username, category, terrain)
-        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+            PRIMARY KEY (id),
+            UNIQUE KEY \`uq_${LPB_USER_DISTANCES_TABLE}\` (username, category, terrain)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 AUTO_INCREMENT=${LPB_FIRST_ROW_ID}`)
+            .then(() => ensureLpbRowIds(LPB_USER_DISTANCES_TABLE, ['username', 'category', 'terrain']))
+            .catch((err) => console.error(`[DB] could not prepare ${LPB_USER_DISTANCES_TABLE}:`, err.message));
 
         // The IPP (initial planning point) of a case: which CalTopo marker it
         // was imported from and where it is, one row per (login, CASE #). It
@@ -559,6 +616,9 @@ const LPB_DEFAULTS_TABLE = 'lpb_default_distances';
 // A login's own edits to those distances (a NULL bracket = use the default),
 // tied to the login username only - never to a CASE #.
 const LPB_USER_DISTANCES_TABLE = 'lpb_user_distances';
+// The first `id` handed out in the two distance tables: every row gets a
+// unique five-digit number from here up (see ensureLpbRowIds).
+const LPB_FIRST_ROW_ID = 10000;
 // The IPP marker of a case, one row per (login, CASE #), derived from the
 // search file whenever it is saved.
 const LPB_IPP_TABLE = 'lpb_ipp';
@@ -678,7 +738,9 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
                 segmentActiveSearchBorderWidth: bundle.segmentActiveSearchBorderWidth,
                 parCheckFrequency: bundle.parCheckFrequency,
                 mapUnaccountedAutoCheck: bundle.mapUnaccountedAutoCheck,
-                mapFeatureTypeFilters: bundle.mapFeatureTypeFilters
+                mapFeatureTypeFilters: bundle.mapFeatureTypeFilters,
+                caltopoColorSyncHeartbeatMinutes: bundle.caltopoColorSyncHeartbeatMinutes,
+                caltopoColorSyncCooldownSeconds: bundle.caltopoColorSyncCooldownSeconds
             }
         }
     };
@@ -991,7 +1053,9 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports.LPB_DEFAULTS_TABLE = LPB_DEFAULTS_TABLE;
     module.exports.LPB_USER_DISTANCES_TABLE = LPB_USER_DISTANCES_TABLE;
     module.exports.LPB_IPP_TABLE = LPB_IPP_TABLE;
+    module.exports.LPB_FIRST_ROW_ID = LPB_FIRST_ROW_ID;
     module.exports.syncLostPersonIppTable = syncLostPersonIppTable;
+    module.exports.ensureLpbRowIds = ensureLpbRowIds;
     // The schema builder is exposed so a test can check the seed rows are
     // written after (not alongside) the CREATE they depend on.
     module.exports.initDatabaseSchema = initDatabaseSchema;
@@ -1758,13 +1822,14 @@ app.delete('/api/v1/:bucket/declined-assignments/:featureKey', authMiddleware, (
 // ---------------------------------------------------------------------------
 // How far from the IPP a lost person of a behaviour category is usually found,
 // per terrain type, as the 25 / 50 / 75 / 95 % distances in miles. The planner
-// keeps the base numbers in lpb_default_distances by hand; a login may replace
-// single brackets on the Settings page, and those edits live in
-// lpb_user_distances under the login username only - so they apply to every
-// case and every device of that login, never to another login. The website
-// always receives the complete picture: a default for every category x terrain
-// (the seed placeholder standing in for a row the table does not have) plus
-// this login's overrides. The IPP itself travels inside the search file
+// keeps the base numbers in lpb_default_distances by hand (every row has a
+// five-digit `id` for that, see ensureLpbRowIds); a login may replace single
+// brackets on the Incident page, and those edits live in lpb_user_distances
+// under the login username only - so they apply to every case and every device
+// of that login, never to another login. The website always receives the
+// complete picture: a default for every category x terrain (the seed
+// placeholder standing in for a row the table does not have) plus this login's
+// overrides. The IPP itself travels inside the search file
 // (bundle.lostPersonBehavior.ipp) and is mirrored into lpb_ipp on every save
 // (see syncLostPersonIppTable); there is no separate endpoint for it.
 //   GET /api/lpb/distances  -> {categories, terrains, brackets, defaults, overrides}
@@ -1895,9 +1960,13 @@ app.put('/api/lpb/distances', authMiddleware, async (req, res) => {
     const nowIso = new Date().toISOString();
     try {
         if (stored) {
+            // Update in place rather than REPLACE (delete + insert) so the row
+            // keeps the five-digit id the planner sees in the database UI.
             await runAsync(
-                `REPLACE INTO \`${LPB_USER_DISTANCES_TABLE}\` (username, category, terrain, p25, p50, p75, p95, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
-                [username, category.label, terrain, override.p25, override.p50, override.p75, override.p95, nowIso]
+                `INSERT INTO \`${LPB_USER_DISTANCES_TABLE}\` (username, category, terrain, p25, p50, p75, p95, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE p25 = ?, p50 = ?, p75 = ?, p95 = ?, updatedAt = ?`,
+                [username, category.label, terrain, override.p25, override.p50, override.p75, override.p95, nowIso,
+                    override.p25, override.p50, override.p75, override.p95, nowIso]
             );
         } else {
             await runAsync(

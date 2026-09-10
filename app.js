@@ -90,6 +90,19 @@ const MAP_UNACCOUNTED_CHECK_INTERVAL_MS = 5 * 60 * 1000;
 const MAP_UNACCOUNTED_LAST_CHECK_STORAGE_KEY = 'sar-map-unaccounted-last-check-v1';
 const UNACCOUNTED_FEATURES_NOTIFICATION_TITLE = 'Unaccounted Map Features';
 const UNACCOUNTED_FEATURES_NOTIFICATION_CLASS = 'map-features-unaccounted';
+// CalTopo color sync: the PSRc segment-color push is coalesced so CalTopo is
+// never asked more often than the cooldown ("maximum refresh", seconds) and is
+// re-asserted at least once per heartbeat ("minimum refresh", minutes). These
+// defaults apply until the login changes them on the Settings page.
+const CALTOPO_COLOR_SYNC_DEFAULT_COOLDOWN_SECONDS = 10;
+const CALTOPO_COLOR_SYNC_DEFAULT_HEARTBEAT_MINUTES = 1;
+// How often the countdown / heartbeat ticker wakes up.
+const CALTOPO_COLOR_SYNC_TICK_INTERVAL_MS = 1000;
+// When THIS tab last pushed (or tried to push) the colors. sessionStorage is
+// used on purpose: it survives page navigation inside the tab (every page is a
+// full reload) and is forgotten when the tab closes. It is a clock, never a
+// piece of case data - the case's own hint is maps[0].caltopoAssignmentOverlayState.updatedAt.
+const CALTOPO_COLOR_SYNC_LAST_PUSH_STORAGE_KEY = 'sar-caltopo-color-sync-last-v1';
 // One notification per CalTopo Assignment that is on the map but not imported
 // yet, with its own Import / Decline buttons.
 const NEW_ASSIGNMENT_NOTIFICATION_TITLE = 'New Assignment';
@@ -533,6 +546,35 @@ function getSegmentDisplaySettings(bundle) {
         activeSearchBorderOpacityPercent,
         activeSearchBorderOpacity: activeSearchBorderOpacityPercent / 100,
         activeSearchBorderWidth
+    };
+}
+
+// A color-sync interval is a whole number of units (minutes or seconds) of at
+// least 1; anything else falls back to the given default. Shared by the
+// sanitizer, the scheduler and the Settings page so they can never disagree.
+function normalizeCalTopoColorSyncInterval(value, fallback) {
+    if (value === null || value === undefined || value === '') return fallback;
+    const parsed = typeof value === 'number' ? value : parseFloat(String(value).trim());
+    if (!Number.isFinite(parsed)) return fallback;
+    const rounded = Math.round(parsed);
+    return rounded >= 1 ? rounded : fallback;
+}
+
+// Returns {heartbeatMinutes, cooldownSeconds, heartbeatMs, cooldownMs} for the
+// CalTopo color push. The cooldown ("never more often than") can never exceed
+// the heartbeat ("at least every"), so it is clamped to heartbeat * 60 seconds
+// here rather than only in the Settings UI - a stale preference record must not
+// be able to produce a cooldown longer than the heartbeat.
+function getCalTopoColorSyncSettings(bundle) {
+    const source = (bundle && typeof bundle === 'object') ? bundle : {};
+    const heartbeatMinutes = normalizeCalTopoColorSyncInterval(source.caltopoColorSyncHeartbeatMinutes, CALTOPO_COLOR_SYNC_DEFAULT_HEARTBEAT_MINUTES);
+    const rawCooldown = normalizeCalTopoColorSyncInterval(source.caltopoColorSyncCooldownSeconds, CALTOPO_COLOR_SYNC_DEFAULT_COOLDOWN_SECONDS);
+    const cooldownSeconds = Math.min(rawCooldown, heartbeatMinutes * 60);
+    return {
+        heartbeatMinutes,
+        cooldownSeconds,
+        heartbeatMs: heartbeatMinutes * 60 * 1000,
+        cooldownMs: cooldownSeconds * 1000
     };
 }
 
@@ -1494,6 +1536,19 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
 
     let updatedCount = 0;
     const errors = [];
+    // Whether this push changed anything in the case's own copy of the shapes
+    // (a first-time capture of a shape's original style, a new fill/border, a
+    // corrected object class, an appended task summary). Only then is the case
+    // saved: the heartbeat re-pushes identical colors every minute, and saving
+    // the heavy `maps` section each time would make every device download it
+    // again for nothing.
+    let changedLocally = false;
+
+    // A push is an attempt on this tab's cooldown clock, whether it is the
+    // scheduler's or the Maps page toggle's, and whether or not it succeeds.
+    if (enabled) {
+        markCalTopoColorSyncAttempt();
+    }
 
     for (const feature of matchingAssignments) {
         const styleKey = getCalTopoOverlayOriginalStyleKey(feature);
@@ -1510,6 +1565,7 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
 
         if (enabled && !Object.prototype.hasOwnProperty.call(originals, styleKey)) {
             originals[styleKey] = originalStyle;
+            changedLocally = true;
         }
 
         const isActiveSearch = enabled && isFeatureActivelyBeingSearched(feature, activeSearchNames);
@@ -1550,6 +1606,7 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
 
         if (result && successfulType && feature.attributes.class !== successfulType) {
             feature.attributes.class = successfulType;
+            changedLocally = true;
         }
 
         if (!result) {
@@ -1557,9 +1614,16 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
             continue;
         }
 
+        // Compare the captured style before and after so a re-push of the same
+        // colors is recognised as "nothing changed".
+        const styleBefore = JSON.stringify(captureCalTopoFeatureStyle(feature.attributes));
         applyCapturedCalTopoFeatureStyle(feature.attributes, overlayStyle);
+        if (JSON.stringify(captureCalTopoFeatureStyle(feature.attributes)) !== styleBefore) {
+            changedLocally = true;
+        }
         if (nextDescription !== null) {
             feature.attributes.description = nextDescription;
+            changedLocally = true;
         }
         updatedCount++;
     }
@@ -1569,13 +1633,18 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
     }
 
     if (enabled) {
-        map.caltopoAssignmentOverlayState.updatedAt = Date.now();
+        // `updatedAt` is the case's record of the last push that CHANGED a shape;
+        // other devices read it as a lower bound for their own cooldown.
+        if (changedLocally) {
+            map.caltopoAssignmentOverlayState.updatedAt = Date.now();
+            saveBundle(bundle);
+        }
     } else {
         delete map.caltopoAssignmentOverlayState;
+        saveBundle(bundle);
     }
 
-    saveBundle(bundle);
-    return {updatedCount, errors};
+    return {updatedCount, errors, changed: changedLocally};
 }
 
 // Re-push the CalTopo/SARTopo assignment overlay (PSRc colors, active-search
@@ -1584,40 +1653,148 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
 // segment's PSRc, a team finishing its assignment (which flips the segment
 // from actively searched back to resting), or a sweep count being logged.
 //
-// This is a best-effort, debounced, SILENT refresh: it does nothing unless the
-// assignment overlay is currently enabled and a CalTopo map with already
-// fetched shapes exists. That way ordinary edits on devices that never turned
-// the overlay on (or never fetched shapes) pay no cost and trigger no network
-// requests.
-let _caltopoOverlayRefreshTimer = null;
+// This is a best-effort, SILENT refresh: it does nothing unless the assignment
+// overlay is currently enabled and a CalTopo map with already fetched shapes
+// exists. That way ordinary edits on devices that never turned the overlay on
+// (or never fetched shapes) pay no cost and trigger no network requests.
+//
+// It is also RATE LIMITED ("CalTopo color sync", Settings page):
+//   * cooldown  - CalTopo is never asked more often than every N seconds. A
+//                 request inside the cooldown is not dropped: ONE push is
+//                 scheduled for the end of the cooldown and every request until
+//                 then folds into it (refreshCalTopoAssignmentOverlayIfEnabled);
+//   * heartbeat - the colors are re-asserted at least every N minutes even when
+//                 nothing changed, so a hand edit in CalTopo or a push that was
+//                 lost never leaves the map stale (caltopoColorSyncTick, driven
+//                 by a 1 s ticker started from DOMContentLoaded);
+//   * page load - every page is a full reload, so the ticker's start asks for a
+//                 push too: it runs at once when the cooldown is over, otherwise
+//                 at the end of the cooldown.
+// The last push time lives in sessionStorage (this tab's clock, survives page
+// navigation) and the case carries a hint of the last push that changed a shape
+// (maps[0].caltopoAssignmentOverlayState.updatedAt, written by any device); the
+// later of the two counts, so a device never re-pushes right after another one.
 let _caltopoOverlayRefreshInFlight = false;
 let _caltopoOverlayRefreshPending = false;
+// The one pending push and when it is due (drives the Maps page countdown).
+let _caltopoColorSyncTimer = null;
+let _caltopoColorSyncDueAt = 0;
+// The 1 s ticker behind the heartbeat and the countdown.
+let _caltopoColorSyncTicker = null;
 
-function refreshCalTopoAssignmentOverlayIfEnabled(options = {}) {
-    const {delay = 1200} = options;
-    if (typeof isCalTopoAssignmentOverlayEnabled !== 'function' || !isCalTopoAssignmentOverlayEnabled()) {
-        return;
-    }
-    // A map with already-fetched shapes must exist; otherwise there is nothing
-    // to recolor and we must not surprise the user with a background fetch.
-    let bundle;
+// loadBundle() for the scheduler: null instead of an exception, so a broken
+// store can never break the ticker.
+function loadBundleForCalTopoColorSync() {
     try {
-        bundle = loadBundle();
+        return loadBundle();
     } catch (e) {
-        return;
+        return null;
+    }
+}
+
+// When the colors were last pushed (or a push was last attempted) - epoch ms,
+// 0 when never. The later of this tab's own record and the case's hint.
+function getLastCalTopoColorSyncAt(bundle) {
+    let own = 0;
+    try {
+        own = parseInt(sessionStorage.getItem(CALTOPO_COLOR_SYNC_LAST_PUSH_STORAGE_KEY) || '0', 10) || 0;
+    } catch (e) {
+        own = 0;
+    }
+    const state = bundle && bundle.maps && bundle.maps[0] ? bundle.maps[0].caltopoAssignmentOverlayState : null;
+    const hint = state && Number.isFinite(Number(state.updatedAt)) ? Number(state.updatedAt) : 0;
+    return Math.max(own, hint, 0);
+}
+
+// Remember that this tab pushed (or tried to push) the colors now. Recorded
+// BEFORE the push so a failing CalTopo is retried no sooner than the cooldown.
+function markCalTopoColorSyncAttempt(at = Date.now()) {
+    try {
+        sessionStorage.setItem(CALTOPO_COLOR_SYNC_LAST_PUSH_STORAGE_KEY, String(at));
+    } catch (e) { /* sessionStorage unavailable: the case hint still applies */ }
+}
+
+// The overlay is switched on and a CalTopo map with already-fetched shapes
+// exists; otherwise there is nothing to recolor and we must not surprise the
+// user with a background fetch.
+function canRunCalTopoColorSync(bundle) {
+    if (typeof isCalTopoAssignmentOverlayEnabled !== 'function' || !isCalTopoAssignmentOverlayEnabled()) {
+        return false;
     }
     const map = bundle && bundle.maps && bundle.maps[0] ? bundle.maps[0] : null;
-    if (!map || !map.id || !Array.isArray(map.features) || map.features.length === 0) {
+    return !!(map && map.id && Array.isArray(map.features) && map.features.length > 0);
+}
+
+function clearPendingCalTopoColorSync() {
+    if (_caltopoColorSyncTimer) {
+        clearTimeout(_caltopoColorSyncTimer);
+    }
+    _caltopoColorSyncTimer = null;
+    _caltopoColorSyncDueAt = 0;
+}
+
+// Ask for a color push. `delay` only coalesces a burst of edits into one push;
+// the push never runs before the cooldown since the last one has passed. At
+// most one push is pending at any time: a request that would run no sooner than
+// the pending one simply folds into it.
+function refreshCalTopoAssignmentOverlayIfEnabled(options = {}) {
+    const {delay = 300} = options;
+    const bundle = loadBundleForCalTopoColorSync();
+    if (!canRunCalTopoColorSync(bundle)) {
         return;
     }
-    if (_caltopoOverlayRefreshTimer) {
-        clearTimeout(_caltopoOverlayRefreshTimer);
+    const {cooldownMs} = getCalTopoColorSyncSettings(bundle);
+    const now = Date.now();
+    const runAt = Math.max(now + Math.max(0, Number(delay) || 0), getLastCalTopoColorSyncAt(bundle) + cooldownMs);
+    if (_caltopoColorSyncTimer && _caltopoColorSyncDueAt <= runAt) {
+        return;
     }
-    _caltopoOverlayRefreshTimer = setTimeout(runCalTopoAssignmentOverlayRefresh, delay);
+    clearPendingCalTopoColorSync();
+    _caltopoColorSyncDueAt = runAt;
+    _caltopoColorSyncTimer = setTimeout(runCalTopoAssignmentOverlayRefresh, Math.max(0, runAt - now));
+}
+
+// When the next push is due: the pending one if any, else the heartbeat.
+function getNextCalTopoColorSyncAt(bundle = loadBundleForCalTopoColorSync()) {
+    if (_caltopoColorSyncTimer) {
+        return _caltopoColorSyncDueAt;
+    }
+    const {heartbeatMs} = getCalTopoColorSyncSettings(bundle);
+    return getLastCalTopoColorSyncAt(bundle) + heartbeatMs;
+}
+
+// "m:ss" for a remaining time; never below 0:00.
+function formatCountdown(ms) {
+    const totalSeconds = Math.max(0, Math.ceil((Number(ms) || 0) / 1000));
+    const minutes = Math.floor(totalSeconds / 60);
+    const seconds = totalSeconds % 60;
+    return `${minutes}:${String(seconds).padStart(2, '0')}`;
+}
+
+// The Maps page pill next to the map title: "Color sync in m:ss" (time to the
+// pending push or the heartbeat), "Syncing..." while a push runs, hidden when
+// the PSRc Assignment Colors toggle is off or no shapes were fetched. A no-op
+// on every other page (no element).
+function renderCalTopoColorSyncCountdown() {
+    if (typeof document === 'undefined') return;
+    const pill = document.getElementById('caltopo-color-sync-countdown');
+    if (!pill) return;
+    const bundle = loadBundleForCalTopoColorSync();
+    if (!canRunCalTopoColorSync(bundle)) {
+        pill.style.display = 'none';
+        pill.textContent = '';
+        return;
+    }
+    pill.style.display = '';
+    if (_caltopoOverlayRefreshInFlight) {
+        pill.textContent = 'Syncing\u2026';
+        return;
+    }
+    pill.textContent = `Color sync in ${formatCountdown(getNextCalTopoColorSyncAt(bundle) - Date.now())}`;
 }
 
 async function runCalTopoAssignmentOverlayRefresh() {
-    _caltopoOverlayRefreshTimer = null;
+    clearPendingCalTopoColorSync();
     // Collapse overlapping requests: if a push is already running, remember that
     // another refresh was requested and run it once the current one settles so
     // the map always ends on the latest colors/opacity.
@@ -1625,26 +1802,61 @@ async function runCalTopoAssignmentOverlayRefresh() {
         _caltopoOverlayRefreshPending = true;
         return;
     }
-    if (typeof isCalTopoAssignmentOverlayEnabled !== 'function' || !isCalTopoAssignmentOverlayEnabled()) {
+    if (!canRunCalTopoColorSync(loadBundleForCalTopoColorSync())) {
         return;
     }
     _caltopoOverlayRefreshInFlight = true;
+    markCalTopoColorSyncAttempt();
+    renderCalTopoColorSyncCountdown();
     try {
         await updateCalTopoAssignmentOverlay(true);
-        if (typeof refreshCalTopoIframe === 'function') {
-            try { refreshCalTopoIframe(); } catch (e) {}
-        }
     } catch (err) {
         // Silent by design: an auto-refresh must never interrupt data entry with
         // an error dialog. The manual toggle still surfaces problems to the user.
         console.warn('CalTopo assignment overlay auto-refresh failed:', err);
     } finally {
         _caltopoOverlayRefreshInFlight = false;
+        renderCalTopoColorSyncCountdown();
         if (_caltopoOverlayRefreshPending) {
             _caltopoOverlayRefreshPending = false;
-            _caltopoOverlayRefreshTimer = setTimeout(runCalTopoAssignmentOverlayRefresh, 300);
+            // Through the gate, so the re-run respects the cooldown too.
+            refreshCalTopoAssignmentOverlayIfEnabled({delay: 0});
         }
     }
+}
+
+// One tick of the 1 s ticker: redraw the countdown, then the heartbeat. The
+// heartbeat is skipped while the tab is hidden (like the unaccounted-feature
+// check), while a push is running or one is already pending.
+function caltopoColorSyncTick() {
+    renderCalTopoColorSyncCountdown();
+    if (typeof document !== 'undefined' && document.hidden) {
+        return;
+    }
+    if (_caltopoOverlayRefreshInFlight || _caltopoColorSyncTimer) {
+        return;
+    }
+    const bundle = loadBundleForCalTopoColorSync();
+    if (!canRunCalTopoColorSync(bundle)) {
+        return;
+    }
+    const {heartbeatMs} = getCalTopoColorSyncSettings(bundle);
+    if (Date.now() - getLastCalTopoColorSyncAt(bundle) >= heartbeatMs) {
+        refreshCalTopoAssignmentOverlayIfEnabled({delay: 0});
+    }
+}
+
+// Started once per page from the DOMContentLoaded handler, after the case is
+// in memory.
+function startCalTopoColorSyncTicker() {
+    if (_caltopoColorSyncTicker) {
+        return;
+    }
+    _caltopoColorSyncTicker = setInterval(caltopoColorSyncTick, CALTOPO_COLOR_SYNC_TICK_INTERVAL_MS);
+    // Page just loaded / switched: push now when the cooldown is over, else at
+    // the end of the cooldown.
+    refreshCalTopoAssignmentOverlayIfEnabled({delay: 500});
+    caltopoColorSyncTick();
 }
 
 function wait(ms) {
@@ -2044,7 +2256,9 @@ const LOGIN_PREFERENCE_KEYS = [
     'segmentActiveSearchFillColor',
     'segmentActiveSearchBorderOpacityPercent',
     'segmentActiveSearchBorderColor',
-    'segmentActiveSearchBorderWidth'
+    'segmentActiveSearchBorderWidth',
+    'caltopoColorSyncHeartbeatMinutes',
+    'caltopoColorSyncCooldownSeconds'
 ];
 
 // The login's preference record (never null). Geek Mode (`geekModeByUser` plus
@@ -3754,7 +3968,7 @@ function showStatusPicker(currentStatus, onSelect) {
     content.insertBefore(list, btnContainer);
 }
 
-function showTimePrompt(title, onConfirm, onCancel, initialTime = null, onPopupCreated = null) {
+function showTimePrompt(title, onConfirm, onCancel, initialTime = null, onPopupCreated = null, initialDate = null) {
     const popup = createPopup(title, null, onCancel);
     const content = popup.querySelector('.popup-content');
     const btnContainer = popup.querySelector('.popup-buttons');
@@ -3769,7 +3983,7 @@ function showTimePrompt(title, onConfirm, onCancel, initialTime = null, onPopupC
     const dateInput = document.createElement('input');
     dateInput.className = 'pill-input';
     dateInput.placeholder = 'MM-DD-YYYY';
-    dateInput.value = defaultDate;
+    dateInput.value = initialDate || defaultDate;
     setupAutoFormatDate(dateInput);
     inputs.appendChild(dateInput);
 
@@ -4192,6 +4406,507 @@ function renderIcReportForm() {
   };
 }
 
+// ---------------------------------------------------------------------------
+// Incident Times Report
+//
+// Records, per DAY of the incident, when every roster member went Enroute,
+// arrived On Scene, started Returning and Arrived Home, plus the hours spent
+// on scene (On Scene -> Returning). It is edited under the "Incident Times"
+// button of the Forms page, on the mobile status page (one member at a time)
+// and on the Personnel page's Member Reports, printed on its own from the
+// Forms page and included, compactly, in the Case # Printout.
+//
+// The case stores
+//   bundle.incidentDays = [ { "<member name>": {enroute, onScene, returning, arrived} }, ... ]
+// one object per day, keyed by member name, so two phones marking different
+// people at the same moment merge key by key in row-level sync (one change per
+// day). A stamp is "MM-DD-YYYY HH:MM". A day has no date of its own: its button
+// shows the earliest Enroute date of anyone that day and "Day N" until someone
+// is enroute. Files from before this existed kept the times in personnel
+// columns 9-12 (one extra roster row per extra "incident set"); those seed
+// Day 1, Day 2, ... as bare "HH:MM" stamps when a file has no incidentDays yet.
+// ---------------------------------------------------------------------------
+
+const INCIDENT_TIME_FIELDS = [
+  {key: 'enroute', label: 'Enroute', legacyIndex: 9},
+  {key: 'onScene', label: 'On Scene', legacyIndex: 10},
+  {key: 'returning', label: 'Returning', legacyIndex: 11},
+  {key: 'arrived', label: 'Arrived Home', legacyIndex: 12}
+];
+
+function blankIncidentTimes() {
+  return {enroute: '', onScene: '', returning: '', arrived: ''};
+}
+
+function normalizeIncidentStamp(value) {
+  return (value === undefined || value === null) ? '' : String(value).trim();
+}
+
+// One member's four stamps in canonical form; null when all four are blank.
+function normalizeIncidentTimesEntry(raw) {
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+  const entry = blankIncidentTimes();
+  let any = false;
+  INCIDENT_TIME_FIELDS.forEach(field => {
+    entry[field.key] = normalizeIncidentStamp(raw[field.key]);
+    if (entry[field.key]) any = true;
+  });
+  return any ? entry : null;
+}
+
+// One day: member name -> entry. Blank members and unsafe keys are dropped.
+function normalizeIncidentDay(raw) {
+  const day = {};
+  if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return day;
+  Object.keys(raw).forEach(name => {
+    const key = String(name).trim();
+    if (!key || key === '__proto__' || key === 'constructor' || key === 'prototype') return;
+    const entry = normalizeIncidentTimesEntry(raw[name]);
+    if (entry) day[key] = entry;
+  });
+  return day;
+}
+
+// Days seeded from the pre-incidentDays layout: a member's n-th roster row
+// carrying times in columns 9-12 becomes that member's entry of day n.
+function legacyIncidentDaysFromPersonnel(rows) {
+  const days = [];
+  const rowsSeen = {};
+  (Array.isArray(rows) ? rows : []).forEach(row => {
+    if (!Array.isArray(row)) return;
+    const name = normalizeIncidentStamp(row[0]);
+    if (!name) return;
+    const entry = blankIncidentTimes();
+    let any = false;
+    INCIDENT_TIME_FIELDS.forEach(field => {
+      entry[field.key] = normalizeIncidentStamp(row[field.legacyIndex]);
+      if (entry[field.key]) any = true;
+    });
+    if (!any) return;
+    const dayIndex = rowsSeen[name] || 0;
+    rowsSeen[name] = dayIndex + 1;
+    while (days.length <= dayIndex) days.push({});
+    days[dayIndex][name] = entry;
+  });
+  return days;
+}
+
+// The canonical incidentDays of a file: always at least one day.
+function normalizeIncidentDays(raw, personnelRows) {
+  const days = Array.isArray(raw) ? raw.map(normalizeIncidentDay) : legacyIncidentDaysFromPersonnel(personnelRows);
+  if (!days.length) days.push({});
+  return days;
+}
+
+function getIncidentDays(bundle) {
+  const b = bundle || loadBundle();
+  b.incidentDays = normalizeIncidentDays(b.incidentDays, b.pages && b.pages.page3);
+  return b.incidentDays;
+}
+
+// "MM-DD-YYYY HH:MM" -> {date, time, ms, minutes}; a bare "HH:MM" has no date
+// (ms null) and anything else is kept as typed (time only). null when blank.
+function parseIncidentStamp(stamp) {
+  const text = normalizeIncidentStamp(stamp);
+  if (!text) return null;
+  const match = text.match(/^(?:(\d{1,2})-(\d{1,2})-(\d{4})\s+)?(\d{1,2}):(\d{2})$/);
+  if (!match) return {date: '', time: text, ms: null, minutes: null};
+  const hours = Number(match[4]);
+  const mins = Number(match[5]);
+  const time = `${String(hours).padStart(2, '0')}:${match[5]}`;
+  if (!match[1]) return {date: '', time, ms: null, minutes: hours * 60 + mins};
+  const date = `${match[1].padStart(2, '0')}-${match[2].padStart(2, '0')}-${match[3]}`;
+  const ms = new Date(Number(match[3]), Number(match[1]) - 1, Number(match[2]), hours, mins).getTime();
+  return {date, time, ms: Number.isFinite(ms) ? ms : null, minutes: hours * 60 + mins};
+}
+
+function formatIncidentStamp(date, time) {
+  return `${normalizeIncidentStamp(date)} ${normalizeIncidentStamp(time)}`.trim();
+}
+
+// The earliest Enroute stamp of anyone that day (null when nobody is enroute
+// with a date yet).
+function getIncidentDayEarliestEnroute(day) {
+  let best = null;
+  Object.keys(day || {}).forEach(name => {
+    const parsed = parseIncidentStamp(day[name] && day[name].enroute);
+    if (parsed && parsed.ms !== null && (best === null || parsed.ms < best.ms)) best = parsed;
+  });
+  return best;
+}
+
+// What the day's button says: the earliest Enroute date, else "Day N".
+function getIncidentDayLabel(day, index) {
+  const earliest = getIncidentDayEarliestEnroute(day);
+  return earliest ? earliest.date : `Day ${index + 1}`;
+}
+
+// hh:mm from On Scene until Returning; '' while either is missing. Stamps
+// without a date are taken to be on the same day (crossing midnight adds 24h).
+function getIncidentHoursOnScene(entry) {
+  const start = parseIncidentStamp(entry && entry.onScene);
+  const end = parseIncidentStamp(entry && entry.returning);
+  if (!start || !end) return '';
+  let diffMinutes;
+  if (start.ms !== null && end.ms !== null) {
+    diffMinutes = Math.round((end.ms - start.ms) / 60000);
+  } else if (start.minutes !== null && end.minutes !== null) {
+    diffMinutes = end.minutes - start.minutes;
+    if (diffMinutes < 0) diffMinutes += 24 * 60;
+  } else {
+    return '';
+  }
+  if (diffMinutes < 0) return '';
+  return `${String(Math.floor(diffMinutes / 60)).padStart(2, '0')}:${String(diffMinutes % 60).padStart(2, '0')}`;
+}
+
+// Everyone shown on a day's table: the roster (unique names) plus anyone the
+// day already has times for (a member since removed from the roster).
+function getIncidentReportNames(bundle, day) {
+  const names = new Set();
+  ((bundle && bundle.pages && bundle.pages.page3) || []).forEach(row => {
+    const name = Array.isArray(row) ? normalizeIncidentStamp(row[0]) : '';
+    if (name) names.add(name);
+  });
+  Object.keys(day || {}).forEach(name => names.add(name));
+  return Array.from(names).sort((a, b) => a.localeCompare(b));
+}
+
+// The team a member is on per the roster (for the activity log entry).
+function getIncidentMemberTeam(bundle, memberName) {
+  const row = ((bundle && bundle.pages && bundle.pages.page3) || []).find(r => Array.isArray(r) && normalizeIncidentStamp(r[0]) === memberName);
+  const team = row ? normalizeIncidentStamp(row[1]) : '';
+  return team || 'System';
+}
+
+// Sets (or, with a blank stamp, clears) one time of one member on one day and
+// logs it. Returns true when the case changed.
+function setIncidentTime(memberName, dayIndex, fieldKey, stamp) {
+  const field = INCIDENT_TIME_FIELDS.find(f => f.key === fieldKey);
+  const name = normalizeIncidentStamp(memberName);
+  if (!field || !name || !Number.isInteger(dayIndex) || dayIndex < 0) return false;
+  const b = loadBundle();
+  const days = getIncidentDays(b);
+  while (days.length <= dayIndex) days.push({});
+  const day = days[dayIndex];
+  const entry = day[name] ? Object.assign(blankIncidentTimes(), day[name]) : blankIncidentTimes();
+  const previous = entry[field.key];
+  const next = normalizeIncidentStamp(stamp);
+  if (previous === next) return false;
+  entry[field.key] = next;
+  if (normalizeIncidentTimesEntry(entry)) day[name] = entry; else delete day[name];
+  const dayLabel = getIncidentDayLabel(day, dayIndex);
+  const dayNote = dayLabel === `Day ${dayIndex + 1}` ? dayLabel : `Day ${dayIndex + 1}, ${dayLabel}`;
+  const action = next
+    ? `Incident Times: ${name} ${field.label} time set to ${next}${previous ? ` (was ${previous})` : ''} - ${dayNote}`
+    : `Incident Times: ${name} ${field.label} time cleared (was ${previous}) - ${dayNote}`;
+  addActivityLogEntry(getIncidentMemberTeam(b, name), action, b, name);
+  saveBundle(b);
+  return true;
+}
+
+// Adds the next day and returns its index.
+function addIncidentDay() {
+  const b = loadBundle();
+  const days = getIncidentDays(b);
+  days.push({});
+  addActivityLogEntry('System', `Incident Times: Day ${days.length} added`, b);
+  saveBundle(b);
+  return days.length - 1;
+}
+
+// The status shown in the All Members table, derived from the incident times:
+// the furthest step reached on the member's OLDEST day that has times but no
+// Arrived Home yet (a day started while an older one is still open keeps the
+// older one driving the status). null when every day of theirs is finished,
+// so callers fall back to the raw status field.
+function getMemberIncidentStatus(memberName, incidentDays) {
+  const name = normalizeIncidentStamp(memberName);
+  if (!name || !Array.isArray(incidentDays)) return null;
+  for (const day of incidentDays) {
+    const entry = day && day[name];
+    if (!entry) continue;
+    const hasActivity = INCIDENT_TIME_FIELDS.some(field => entry[field.key]);
+    if (!hasActivity || entry.arrived) continue;
+    if (entry.returning) return 'Returning Home';
+    if (entry.onScene) return 'On-Scene';
+    if (entry.enroute) return 'Enroute';
+    return null;
+  }
+  return null;
+}
+
+// The rows of one member across the days (Member Reports printout).
+function getMemberIncidentTimecardRows(bundle, memberName) {
+  const name = normalizeIncidentStamp(memberName);
+  const rows = [];
+  getIncidentDays(bundle).forEach((day, index) => {
+    const entry = day[name];
+    if (!entry) return;
+    rows.push({dayLabel: getIncidentDayLabel(day, index), dayNumber: index + 1, entry, hours: getIncidentHoursOnScene(entry)});
+  });
+  return rows;
+}
+
+// Which day the report is showing (per page load).
+let currentIncidentDayIndex = 0;
+
+// The day buttons next to the report title: one per day (its date, or
+// "Day N" until someone is enroute) and a "+" that starts the next day.
+function renderIncidentDayButtons(container, days, onSelect) {
+  container.innerHTML = '';
+  container.className = 'incident-day-tabs';
+  days.forEach((day, index) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'mini-pill incident-day-btn' + (index === currentIncidentDayIndex ? ' active' : '');
+    btn.textContent = getIncidentDayLabel(day, index);
+    btn.title = `Day ${index + 1}`;
+    btn.onclick = () => {
+      currentIncidentDayIndex = index;
+      onSelect();
+    };
+    container.appendChild(btn);
+  });
+  const addBtn = document.createElement('button');
+  addBtn.type = 'button';
+  addBtn.className = 'mini-pill incident-day-add no-print';
+  addBtn.textContent = '+';
+  addBtn.title = `Add Day ${days.length + 1}`;
+  addBtn.setAttribute('aria-label', `Add Day ${days.length + 1}`);
+  addBtn.onclick = () => {
+    currentIncidentDayIndex = addIncidentDay();
+    onSelect();
+  };
+  container.appendChild(addBtn);
+}
+
+// The day buttons live inside the title element when the page has one (Forms
+// page "Incident Times Report", mobile "Incident Times"); the element is reused
+// across rebuilds and recreated when the title was rewritten.
+function ensureIncidentDayTabs(titleEl) {
+  let tabs = document.getElementById('incident-day-tabs');
+  if (tabs && tabs.parentElement !== titleEl) {
+    if (typeof tabs.remove === 'function') tabs.remove();
+    tabs = null;
+  }
+  if (!tabs) {
+    tabs = document.createElement('div');
+    tabs.id = 'incident-day-tabs';
+    titleEl.appendChild(tabs);
+  }
+  return tabs;
+}
+
+// One time cell: the stamp's time (and its date when it is not the day's
+// date) or a "+" to enter it. Clicking opens the date/time prompt with a
+// "Clear Info" button, exactly as before.
+function createIncidentTimeButton(memberName, dayIndex, field, entry, dayDate, rerender) {
+  const stamp = entry ? entry[field.key] : '';
+  const parsed = parseIncidentStamp(stamp);
+  const btn = document.createElement('button');
+  btn.type = 'button';
+  btn.className = 'incident-time-btn' + (parsed ? '' : ' incident-time-empty');
+  btn.title = parsed ? `${field.label}: ${stamp}` : `Set ${field.label}`;
+  if (parsed) {
+    const time = document.createElement('span');
+    time.className = 'incident-time-value';
+    time.textContent = parsed.time;
+    btn.appendChild(time);
+    if (parsed.date && parsed.date !== dayDate) {
+      const date = document.createElement('span');
+      date.className = 'incident-time-date';
+      date.textContent = parsed.date;
+      btn.appendChild(date);
+    }
+  } else {
+    btn.textContent = '+';
+  }
+  btn.onclick = () => {
+    showTimePrompt(`Set ${field.label} - ${memberName}`, (d, t) => {
+      const date = normalizeIncidentStamp(d);
+      const time = normalizeIncidentStamp(t);
+      if (!time) {
+        if (typeof showToast === 'function') showToast('Enter a time (hh:mm) to set it.');
+        return;
+      }
+      setIncidentTime(memberName, dayIndex, field.key, formatIncidentStamp(date, time));
+      rerender();
+    }, null, parsed ? parsed.time : null, (popup) => {
+      if (!parsed) return;
+      const btnContainer = popup.querySelector('.popup-buttons');
+      const clearBtn = document.createElement('button');
+      clearBtn.className = 'popup-btn';
+      clearBtn.style.marginRight = 'auto';
+      clearBtn.style.color = '#eb5757';
+      clearBtn.textContent = 'Clear Info';
+      clearBtn.onclick = () => {
+        setIncidentTime(memberName, dayIndex, field.key, '');
+        popup.remove();
+        rerender();
+      };
+      btnContainer.insertBefore(clearBtn, btnContainer.firstChild);
+    }, (parsed && parsed.date) || dayDate || null);
+  };
+  return btn;
+}
+
+// The table of one day: Name | Enroute | On Scene | Returning | Arrived Home |
+// Hours On Scene. With `memberName` only that member's row is shown (mobile
+// status page, Member Reports) and the Name column is left out.
+function renderIncidentDayTable(container, bundle, dayIndex, memberName, rerender) {
+  const days = getIncidentDays(bundle);
+  const day = days[dayIndex] || {};
+  const earliest = getIncidentDayEarliestEnroute(day);
+  const dayDate = earliest ? earliest.date : '';
+  const names = memberName ? [memberName] : getIncidentReportNames(bundle, day);
+
+  if (!names.length) {
+    const empty = document.createElement('div');
+    empty.className = 'incident-times-empty';
+    empty.textContent = 'No members found in the roster.';
+    container.appendChild(empty);
+    return;
+  }
+
+  const scroll = document.createElement('div');
+  scroll.className = 'incident-times-scroll';
+  const table = document.createElement('table');
+  table.className = 'incident-times-table';
+  table.setAttribute('aria-label', `Incident times for Day ${dayIndex + 1}`);
+
+  const thead = document.createElement('thead');
+  const headRow = document.createElement('tr');
+  const headers = (memberName ? [] : ['Name']).concat(INCIDENT_TIME_FIELDS.map(f => f.label), ['Hours On Scene']);
+  headers.forEach(label => {
+    const th = document.createElement('th');
+    th.textContent = label;
+    headRow.appendChild(th);
+  });
+  thead.appendChild(headRow);
+  table.appendChild(thead);
+
+  const tbody = document.createElement('tbody');
+  names.forEach(name => {
+    const entry = day[name] || null;
+    const tr = document.createElement('tr');
+    tr.className = 'incident-times-row';
+    tr.dataset.member = name;
+    if (!memberName) {
+      const tdName = document.createElement('td');
+      tdName.className = 'incident-times-name';
+      tdName.dataset.label = 'Name';
+      tdName.textContent = name;
+      tr.appendChild(tdName);
+    }
+    INCIDENT_TIME_FIELDS.forEach(field => {
+      const td = document.createElement('td');
+      td.dataset.label = field.label;
+      td.appendChild(createIncidentTimeButton(name, dayIndex, field, entry, dayDate, rerender));
+      tr.appendChild(td);
+    });
+    const tdHours = document.createElement('td');
+    tdHours.className = 'incident-times-hours';
+    tdHours.dataset.label = 'Hours On Scene';
+    tdHours.textContent = getIncidentHoursOnScene(entry) || '—';
+    tr.appendChild(tdHours);
+    tbody.appendChild(tr);
+  });
+  table.appendChild(tbody);
+  scroll.appendChild(table);
+  container.appendChild(scroll);
+}
+
+// Draws the whole report into `container`: the day buttons (inside
+// `options.titleEl` when given, else at the top of the container) and the
+// open day's table. `options.memberName` limits the table to one member.
+function renderIncidentTimesReport(container, options = {}) {
+  if (!container) return;
+  const memberName = normalizeIncidentStamp(options.memberName) || null;
+  const titleEl = options.titleEl || null;
+  const bundle = loadBundle();
+  const days = getIncidentDays(bundle);
+  if (currentIncidentDayIndex >= days.length) currentIncidentDayIndex = days.length - 1;
+  if (currentIncidentDayIndex < 0) currentIncidentDayIndex = 0;
+
+  const rerender = () => renderIncidentTimesReport(container, options);
+  container.innerHTML = '';
+  container.classList.add('incident-times-report');
+
+  const tabs = titleEl ? ensureIncidentDayTabs(titleEl) : document.createElement('div');
+  renderIncidentDayButtons(tabs, days, rerender);
+  if (!titleEl) container.appendChild(tabs);
+
+  renderIncidentDayTable(container, bundle, currentIncidentDayIndex, memberName, rerender);
+}
+
+// One member's view of the report (mobile status page, Member Reports).
+function renderMemberIncidentCards(memberName, container, titleEl = null) {
+  renderIncidentTimesReport(container, {memberName, titleEl});
+}
+
+// Print styles of the report; shared by the Forms page "Print Report" and the
+// (compact) block of the Case # Printout.
+const INCIDENT_TIMES_PRINT_STYLES = `
+        .incident-times-print { margin-bottom: 20px; }
+        .incident-times-print-title { font-size: 14pt; border-bottom: 1px solid #333; margin: 20px 0 10px 0; padding-bottom: 2px; }
+        .incident-day-print { margin-bottom: 14px; page-break-inside: avoid; }
+        .incident-day-print-title { font-size: 11pt; font-weight: 700; margin: 0 0 6px 0; color: #000; }
+        .incident-times-print-table { width: 100%; border-collapse: collapse; font-size: 10pt; }
+        .incident-times-print-table th, .incident-times-print-table td { border: 1px solid #000; padding: 4px 6px; text-align: center; }
+        .incident-times-print-table th { background: #eee !important; -webkit-print-color-adjust: exact; font-size: 8pt; text-transform: uppercase; letter-spacing: 0.5px; }
+        .incident-times-print-table td.incident-times-print-name { text-align: left; font-weight: 600; }
+        .incident-times-print-table td.incident-times-print-hours { font-weight: 700; }
+        .incident-times-print.compact .incident-times-print-table { font-size: 8pt; }
+        .incident-times-print.compact .incident-times-print-table th, .incident-times-print.compact .incident-times-print-table td { padding: 2px 4px; }
+        .incident-times-print.compact .incident-day-print-title { font-size: 9pt; margin-bottom: 3px; }
+        .incident-times-print.compact .incident-day-print { margin-bottom: 8px; }
+        .incident-times-print-empty { font-style: italic; color: #888; font-size: 10pt; }
+`;
+
+// Static markup of the report for the printouts: one table per day, in the
+// new layout. `compact` (Case # Printout) lists only the members with a time
+// that day and skips days nobody has times on; the full report lists the
+// whole roster so blanks can be filled in by hand.
+function getIncidentTimesPrintHTML(bundle, options = {}) {
+  const compact = options.compact === true;
+  const esc = escapeIcReportHtml;
+  const days = getIncidentDays(bundle);
+  const blocks = [];
+  days.forEach((day, index) => {
+    const earliest = getIncidentDayEarliestEnroute(day);
+    const dayDate = earliest ? earliest.date : '';
+    const names = compact ? Object.keys(day).sort((a, b) => a.localeCompare(b)) : getIncidentReportNames(bundle, day);
+    if (!names.length) return;
+    const label = getIncidentDayLabel(day, index);
+    const title = label === `Day ${index + 1}` ? label : `Day ${index + 1} - ${label}`;
+    const rows = names.map(name => {
+      const entry = day[name] || blankIncidentTimes();
+      const cells = INCIDENT_TIME_FIELDS.map(field => {
+        const parsed = parseIncidentStamp(entry[field.key]);
+        if (!parsed) return '<td></td>';
+        const text = (parsed.date && parsed.date !== dayDate) ? `${parsed.time} (${parsed.date})` : parsed.time;
+        return `<td>${esc(text)}</td>`;
+      }).join('');
+      return `<tr><td class="incident-times-print-name">${esc(name)}</td>${cells}<td class="incident-times-print-hours">${esc(getIncidentHoursOnScene(entry))}</td></tr>`;
+    }).join('');
+    blocks.push(`
+                <div class="incident-day-print">
+                    <div class="incident-day-print-title">${esc(title)}</div>
+                    <table class="incident-times-print-table">
+                        <thead><tr><th>Name</th>${INCIDENT_TIME_FIELDS.map(f => `<th>${esc(f.label)}</th>`).join('')}<th>Hours On Scene</th></tr></thead>
+                        <tbody>${rows}</tbody>
+                    </table>
+                </div>`);
+  });
+  const body = blocks.length ? blocks.join('') : '<div class="incident-times-print-empty">No incident times have been recorded for this case.</div>';
+  return `
+            <div class="incident-times-print${compact ? ' compact' : ''}">
+                ${compact ? '<h2 class="incident-times-print-title">Incident Times</h2>' : ''}
+                ${body}
+            </div>`;
+}
+
 function defaultBundle() {
   return {
     // A new search file is named after the CASE # it is created for.
@@ -4217,6 +4932,10 @@ function defaultBundle() {
     teamLeaveTimes: {},
     teamAssignmentTimes: {},
     parCheckFrequency: 20,
+    // CalTopo color push limits: at least every N minutes, never more often
+    // than every N seconds (Settings page "CalTopo Color Sync").
+    caltopoColorSyncHeartbeatMinutes: CALTOPO_COLOR_SYNC_DEFAULT_HEARTBEAT_MINUTES,
+    caltopoColorSyncCooldownSeconds: CALTOPO_COLOR_SYNC_DEFAULT_COOLDOWN_SECONDS,
     dismissedNotifications: [],
     arrivedTeams: [],
     forms: {},
@@ -4233,6 +4952,8 @@ function defaultBundle() {
     permanentPersonnel: {},
     // The one IC Report of this CASE # (Forms page, "IC Report" button).
     icReport: defaultIcReport(),
+    // Incident Times Report: one (empty) day to start with.
+    incidentDays: [{}],
     // Incident page "Lost Person Behavior": no category on, no IPP yet, and the
     // PSR adjustment applied as soon as both exist.
     lostPersonBehavior: normalizeLostPersonBehavior(null),
@@ -4416,6 +5137,11 @@ function sanitizeBundle(bundle) {
   const segmentActiveSearchBorderOpacityPercent = segmentDisplaySettings.activeSearchBorderOpacityPercent;
   const segmentActiveSearchBorderColor = segmentDisplaySettings.activeSearchBorderColor;
   const segmentActiveSearchBorderWidth = segmentDisplaySettings.activeSearchBorderWidth;
+  // CalTopo color push limits, normalised (>= 1, cooldown never above the
+  // heartbeat) so every device schedules the same way.
+  const caltopoColorSyncSettings = getCalTopoColorSyncSettings(bundle);
+  const caltopoColorSyncHeartbeatMinutes = caltopoColorSyncSettings.heartbeatMinutes;
+  const caltopoColorSyncCooldownSeconds = caltopoColorSyncSettings.cooldownSeconds;
   const theme = bundle.theme || 'dark';
   const lastModified = bundle.lastModified || new Date().toISOString();
   const forms = bundle.forms || {};
@@ -4426,6 +5152,9 @@ function sanitizeBundle(bundle) {
   const mapUnaccountedAutoCheck = bundle.mapUnaccountedAutoCheck !== false;
   const mapFeatureTypeFilters = getMapFeatureTypeFilters(bundle);
   const icReport = sanitizeIcReport(bundle.icReport);
+  // The Incident Times Report's days; a file that predates it is seeded from
+  // the times its personnel rows carried in columns 9-12.
+  const incidentDays = normalizeIncidentDays(bundle.incidentDays, pages.page3);
   // The Incident page's Lost Person Behavior settings (category switches,
   // terrain, the case's four distances per category, the imported IPP and the
   // Segments page's apply switch). Kept in canonical form so two devices never
@@ -4546,6 +5275,8 @@ function sanitizeBundle(bundle) {
     segmentActiveSearchBorderOpacityPercent,
     segmentActiveSearchBorderColor,
     segmentActiveSearchBorderWidth,
+    caltopoColorSyncHeartbeatMinutes,
+    caltopoColorSyncCooldownSeconds,
     pages, 
     forms, 
     profile, 
@@ -4556,6 +5287,7 @@ function sanitizeBundle(bundle) {
     mapFeatureTypeFilters,
     permanentPersonnel,
     icReport,
+    incidentDays,
     lostPersonBehavior,
     accounts: syncedAccounts 
   };
@@ -6767,36 +7499,6 @@ function buildSegmentsTable() {
 
 let currentPersonnelSubpage = 'activity';
 
-// Derive the status to show in the All Members table for a member from their
-// incident timecards instead of the raw stored status field. A member can have
-// several incident timecard "sets" (each stored as its own personnel row with the
-// same name) with times in columns 9=Enroute, 10=On Scene, 11=Returning,
-// 12=Arrived Home. A set is considered "finished" once Arrived Home is filled.
-// Per the requirement, the status shown is the most recently reached status of the
-// member's OLDEST unfinished set (e.g. if a new card is started while the old one
-// is still open, the old card drives the displayed status). Returns null when the
-// member has no unfinished set, so callers can fall back to the raw status.
-function getMemberIncidentStatus(memberName, allData) {
-  if (!memberName || !Array.isArray(allData)) return null;
-
-  const statusForSet = (row) => {
-    if (row[11]) return 'Returning Home';
-    if (row[10]) return 'On-Scene';
-    if (row[9]) return 'Enroute';
-    return null;
-  };
-
-  const sets = allData.filter(r => r && r[0] === memberName);
-  for (const row of sets) {
-    const hasActivity = row[9] || row[10] || row[11] || row[12];
-    // Oldest unfinished set: has activity but has not Arrived Home yet.
-    if (hasActivity && !row[12]) {
-      return statusForSet(row);
-    }
-  }
-  return null;
-}
-
 function buildPersonnelTable() {
   const btnAll = document.getElementById('btn-all-members');
   const btnAct = document.getElementById('btn-activity');
@@ -7033,6 +7735,8 @@ function buildPersonnelAllMembersTable() {
   const sortToggle = document.getElementById('personnel-sort-toggle');
   const sortLabel = document.getElementById('personnel-sort-label');
   const data = loadData();
+  // The Status column follows the Incident Times Report (see getMemberIncidentStatus).
+  const incidentDays = getIncidentDays(loadBundle());
 
   // Ensure first row has 'Off Duty' if it's empty
   if (data.length > 0 && !data[0][0] && !data[0][1]) {
@@ -7072,11 +7776,11 @@ function buildPersonnelAllMembersTable() {
   
   let filteredData = [...data];
 
-  // Collapse duplicate members: a member can have several incident timecard
-  // "sets" stored as separate personnel rows sharing the same name (see
-  // getMemberIncidentStatus). The All Members table must show each member only
-  // once, so keep only the first row for each non-empty name. Rows with an empty
-  // name (e.g. a freshly added blank row) are always kept so they stay editable.
+  // Collapse duplicate members: files from before the Incident Times Report
+  // kept a member's extra incident "sets" as separate personnel rows sharing
+  // the same name. The All Members table must show each member only once, so
+  // keep only the first row for each non-empty name. Rows with an empty name
+  // (e.g. a freshly added blank row) are always kept so they stay editable.
   const seenMemberNames = new Set();
   filteredData = filteredData.filter(row => {
     const name = row && row[0] ? String(row[0]).trim() : '';
@@ -7226,12 +7930,12 @@ function buildPersonnelAllMembersTable() {
         cellContainer.appendChild(selectLead);
       } else {
         if (c === 6) { // Status column
-          // The displayed status must reflect the incident timecards rather than the
-          // raw stored status field: show the most recently updated status within the
-          // member's OLDEST unfinished incident timecard set (see getMemberIncidentStatus).
+          // The displayed status must reflect the Incident Times Report rather than
+          // the raw stored status field: show the furthest step reached on the
+          // member's OLDEST unfinished day (see getMemberIncidentStatus).
           const rawStatus = data[originalRowIndex][c];
           const baseLabel = rawStatus === 'true' ? 'On-Scene' : (rawStatus === 'false' ? 'Off Duty' : (rawStatus || 'Off Duty'));
-          const derivedStatus = getMemberIncidentStatus(data[originalRowIndex][0], data);
+          const derivedStatus = getMemberIncidentStatus(data[originalRowIndex][0], incidentDays);
           const statusLabel = derivedStatus || baseLabel;
           const statusBtn = document.createElement('button');
           statusBtn.className = 'mini-pill status-pill-btn';
@@ -9677,20 +10381,21 @@ function printCurrentReport(type) {
     });
   }
 
-  // Build the incident timecards table for a single-member report (before the activity log).
+  // Build the incident times table for a single-member report (before the
+  // activity log): one row per day of the Incident Times Report the member
+  // has times on.
   let timecardsHtml = '';
   if (type !== 'team') {
-    const page3 = bundle.pages.page3 || [];
-    const memberRows = page3.filter(r =>
-      r[0] === currentMemberReportSelection && (r[9] || r[10] || r[11] || r[12])
-    );
-    if (memberRows.length > 0) {
-      timecardsHtml += '<h2 class="section-title">Incident Timecards</h2>';
+    const memberDays = getMemberIncidentTimecardRows(bundle, currentMemberReportSelection);
+    if (memberDays.length > 0) {
+      const esc = escapeIcReportHtml;
+      timecardsHtml += '<h2 class="section-title">Incident Times</h2>';
       timecardsHtml += '<table class="timecards-table"><thead><tr>' +
-        '<th>Incident Set</th><th>Enroute</th><th>On Scene</th><th>Returning</th><th>Arrived Home</th>' +
+        '<th>Day</th><th>Enroute</th><th>On Scene</th><th>Returning</th><th>Arrived Home</th><th>Hours On Scene</th>' +
         '</tr></thead><tbody>';
-      memberRows.forEach((r, i) => {
-        timecardsHtml += `<tr><td>Set ${i + 1}</td><td>${r[9] || ''}</td><td>${r[10] || ''}</td><td>${r[11] || ''}</td><td>${r[12] || ''}</td></tr>`;
+      memberDays.forEach(row => {
+        const dayText = row.dayLabel === `Day ${row.dayNumber}` ? row.dayLabel : `Day ${row.dayNumber} - ${row.dayLabel}`;
+        timecardsHtml += `<tr><td>${esc(dayText)}</td><td>${esc(row.entry.enroute)}</td><td>${esc(row.entry.onScene)}</td><td>${esc(row.entry.returning)}</td><td>${esc(row.entry.arrived)}</td><td>${esc(row.hours)}</td></tr>`;
       });
       timecardsHtml += '</tbody></table>';
     }
@@ -9924,150 +10629,6 @@ function buildTeamReports() {
     
     tableBody.appendChild(tr);
   });
-}
-
-function renderMemberIncidentCards(memberName, container) {
-    if (!container) return;
-    container.innerHTML = '';
-    
-    const bundle = loadBundle();
-    const memberRows = (bundle.pages.page3 || []).filter(r => r[0] === memberName);
-    const allRows = memberRows;
-
-    const cardsWrapper = document.createElement('div');
-    cardsWrapper.className = 'incident-times-container';
-
-    allRows.forEach((pRow, index) => {
-        const card = document.createElement('div');
-        card.className = 'incident-card';
-        
-        const header = document.createElement('div');
-        header.className = 'incident-card-header';
-        
-        const title = document.createElement('div');
-        title.className = 'incident-card-title';
-        title.textContent = `Incident Set ${index + 1}`;
-        header.appendChild(title);
-
-        const delBtn = document.createElement('div');
-        delBtn.className = 'delete-card-btn no-print';
-        delBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="3 6 5 6 21 6"></polyline><path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6m3 0V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2"></path><line x1="10" y1="11" x2="10" y2="17"></line><line x1="14" y1="11" x2="14" y2="17"></line></svg>';
-        delBtn.onclick = (e) => {
-            e.stopPropagation();
-            if (confirm('Delete this incident row?')) {
-                const page3 = bundle.pages.page3 || [];
-                const memberIncidentRows = page3.filter(row => row[0] === memberName);
-                if (memberIncidentRows.length <= 1) {
-                    pRow[9] = '';
-                    pRow[10] = '';
-                    pRow[11] = '';
-                    pRow[12] = '';
-                    saveBundle(bundle);
-                    renderMemberIncidentCards(memberName, container);
-                    return;
-                }
-
-                const absoluteIndex = page3.indexOf(pRow);
-                if (absoluteIndex > -1) {
-                    page3.splice(absoluteIndex, 1);
-                    saveBundle(bundle);
-                    renderMemberIncidentCards(memberName, container);
-                }
-            }
-        };
-        header.appendChild(delBtn);
-        card.appendChild(header);
-        
-        const grid = document.createElement('div');
-        grid.className = 'incident-times-grid';
-        
-        const fields = [
-            { key: 'enroute', idx: 9, label: 'Enroute' },
-            { key: 'onScene', idx: 10, label: 'On Scene' },
-            { key: 'returning', idx: 11, label: 'Returning' },
-            { key: 'arrived', idx: 12, label: 'Arrived Home' }
-        ];
-        
-        fields.forEach(f => {
-            const slot = document.createElement('div');
-            slot.className = 'time-slot';
-            slot.onclick = () => {
-                showTimePrompt(`Set ${f.label}`, (d, t) => {
-                    pRow[f.idx] = t;
-                    saveBundle(bundle);
-                    renderMemberIncidentCards(memberName, container);
-                }, null, pRow[f.idx] || null, (popup) => {
-                    const btnContainer = popup.querySelector('.popup-buttons');
-                    const clearBtn = document.createElement('button');
-                    clearBtn.className = 'popup-btn';
-                    clearBtn.style.marginRight = 'auto';
-                    clearBtn.style.color = '#eb5757';
-                    clearBtn.textContent = 'Clear Info';
-                    clearBtn.onclick = () => {
-                        pRow[f.idx] = '';
-                        saveBundle(bundle);
-                        renderMemberIncidentCards(memberName, container);
-                        popup.remove();
-                    };
-                    btnContainer.insertBefore(clearBtn, btnContainer.firstChild);
-                });
-            };
-            
-            const lbl = document.createElement('div');
-            lbl.className = 'time-slot-label';
-            lbl.textContent = f.label;
-            slot.appendChild(lbl);
-            
-            const val = document.createElement('div');
-            val.className = 'time-slot-value';
-            if (pRow[f.idx]) {
-                val.textContent = pRow[f.idx];
-            } else {
-                val.className += ' add-time-btn-small';
-                val.textContent = '+';
-            }
-            slot.appendChild(val);
-            grid.appendChild(slot);
-        });
-        card.appendChild(grid);
-        cardsWrapper.appendChild(card);
-    });
-    
-    // Add "Add Incident Row" button back as requested in previous requirements
-    const placeholder = document.createElement('div');
-    placeholder.className = 'add-card-placeholder no-print';
-    placeholder.onclick = () => {
-        const page3 = bundle.pages.page3 || [];
-        // Create a new row for the same member
-        // Assuming the structure from previous knowledge: member name is index 0
-        const firstRow = memberRows[0];
-        const newRow = firstRow ? [...firstRow] : Array(14).fill('');
-        newRow[0] = memberName;
-        // Clear incident times in the new row (indexes 9-12)
-        newRow[9] = '';
-        newRow[10] = '';
-        newRow[11] = '';
-        newRow[12] = '';
-        // Clear old sets JSON if it exists
-        if (newRow[13]) newRow[13] = '';
-        
-        page3.push(newRow);
-        saveBundle(bundle);
-        renderMemberIncidentCards(memberName, container);
-    };
-    
-    const icon = document.createElement('div');
-    icon.className = 'add-card-icon';
-    icon.textContent = '+';
-    placeholder.appendChild(icon);
-    
-    const txt = document.createElement('div');
-    txt.className = 'add-card-text';
-    txt.textContent = 'Add Incident Row';
-    placeholder.appendChild(txt);
-    
-    cardsWrapper.appendChild(placeholder);
-    container.appendChild(cardsWrapper);
 }
 
 let currentMemberReportSelection = '';
@@ -12335,6 +12896,81 @@ function buildSettingsPage() {
     };
   }
 
+  // CalTopo color sync: how often the PSRc colors are pushed to CalTopo. The
+  // heartbeat (minutes, "at least every") and the cooldown (seconds, "never
+  // more often than") go through the same helper the scheduler uses, so what
+  // is shown is exactly what runs; the cooldown can never exceed the heartbeat.
+  const caltopoSyncHeartbeatInput = document.getElementById('caltopo-sync-heartbeat-input');
+  const caltopoSyncCooldownInput = document.getElementById('caltopo-sync-cooldown-input');
+  const showCalTopoColorSyncInputs = (source) => {
+    const settings = getCalTopoColorSyncSettings(source);
+    if (caltopoSyncHeartbeatInput) caltopoSyncHeartbeatInput.value = settings.heartbeatMinutes;
+    if (caltopoSyncCooldownInput) caltopoSyncCooldownInput.value = settings.cooldownSeconds;
+    return settings;
+  };
+  if (caltopoSyncHeartbeatInput || caltopoSyncCooldownInput) {
+    showCalTopoColorSyncInputs(bundle);
+  }
+  if (caltopoSyncHeartbeatInput) {
+    caltopoSyncHeartbeatInput.onchange = () => {
+      const nextBundle = loadBundle();
+      const previous = getCalTopoColorSyncSettings(nextBundle);
+      const minutes = normalizeCalTopoColorSyncInterval(caltopoSyncHeartbeatInput.value, null);
+      if (minutes === null) {
+        // Invalid: back to the value in force.
+        showCalTopoColorSyncInputs(nextBundle);
+        status.textContent = 'The heartbeat must be a whole number of minutes, 1 or more.';
+        return;
+      }
+      nextBundle.caltopoColorSyncHeartbeatMinutes = minutes;
+      const next = showCalTopoColorSyncInputs(nextBundle);
+      if (next.heartbeatMinutes === previous.heartbeatMinutes && next.cooldownSeconds === previous.cooldownSeconds) {
+        return;
+      }
+      logSettingChange('CalTopo color sync heartbeat (minutes)', previous.heartbeatMinutes, next.heartbeatMinutes, nextBundle);
+      persistLoginPreference('caltopoColorSyncHeartbeatMinutes', next.heartbeatMinutes);
+      let message = `CalTopo colors will be pushed at least every ${next.heartbeatMinutes} minute${next.heartbeatMinutes === 1 ? '' : 's'}.`;
+      if (next.cooldownSeconds !== previous.cooldownSeconds) {
+        // A shorter heartbeat pulled the cooldown down with it.
+        nextBundle.caltopoColorSyncCooldownSeconds = next.cooldownSeconds;
+        logSettingChange('CalTopo color sync cooldown (seconds)', previous.cooldownSeconds, next.cooldownSeconds, nextBundle);
+        persistLoginPreference('caltopoColorSyncCooldownSeconds', next.cooldownSeconds);
+        message += ` The cooldown was shortened to ${next.cooldownSeconds} seconds so it does not exceed the heartbeat.`;
+      }
+      saveBundle(nextBundle);
+      status.textContent = message;
+    };
+  }
+  if (caltopoSyncCooldownInput) {
+    caltopoSyncCooldownInput.onchange = () => {
+      const nextBundle = loadBundle();
+      const previous = getCalTopoColorSyncSettings(nextBundle);
+      const seconds = normalizeCalTopoColorSyncInterval(caltopoSyncCooldownInput.value, null);
+      if (seconds === null) {
+        showCalTopoColorSyncInputs(nextBundle);
+        status.textContent = 'The cooldown must be a whole number of seconds, 1 or more.';
+        return;
+      }
+      nextBundle.caltopoColorSyncCooldownSeconds = seconds;
+      // Clamped to the heartbeat by the shared helper; the input shows the
+      // value that will actually be used.
+      const next = showCalTopoColorSyncInputs(nextBundle);
+      nextBundle.caltopoColorSyncCooldownSeconds = next.cooldownSeconds;
+      if (next.cooldownSeconds === previous.cooldownSeconds) {
+        status.textContent = seconds !== next.cooldownSeconds
+          ? `The cooldown cannot exceed the ${next.heartbeatMinutes}-minute heartbeat; it stays at ${next.cooldownSeconds} seconds.`
+          : status.textContent;
+        return;
+      }
+      logSettingChange('CalTopo color sync cooldown (seconds)', previous.cooldownSeconds, next.cooldownSeconds, nextBundle);
+      saveBundle(nextBundle);
+      persistLoginPreference('caltopoColorSyncCooldownSeconds', next.cooldownSeconds);
+      status.textContent = seconds !== next.cooldownSeconds
+        ? `CalTopo colors will be pushed at most every ${next.cooldownSeconds} seconds (capped at the ${next.heartbeatMinutes}-minute heartbeat).`
+        : `CalTopo colors will be pushed at most every ${next.cooldownSeconds} seconds.`;
+    };
+  }
+
   const mapAutoCheckToggle = document.getElementById('map-auto-check-toggle');
   const mapAutoCheckLabel = document.getElementById('map-auto-check-label');
   if (mapAutoCheckToggle) {
@@ -13267,7 +13903,10 @@ function buildFormsPage() {
     const taskPills = document.getElementById('task-pills-container');
     if (taskPills) taskPills.style.display = 'flex';
     const taskTitle = document.getElementById('task-view-title');
-    if (taskTitle) taskTitle.textContent = 'Task Assignment Form';
+    if (taskTitle) {
+      taskTitle.textContent = 'Task Assignment Form';
+      taskTitle.classList.remove('incident-times-title');
+    }
   } else if (currentFormsSubpage === 'incident-times') {
     setActiveSubNav(btnIncidentTimes);
     if (taskView) taskView.style.display = 'block'; // Keep taskView visible because it contains the interactive-form-container
@@ -13309,14 +13948,9 @@ function buildFormsPage() {
     }
     buildTaskAssignmentForm();
   } else if (currentFormsSubpage === 'incident-times') {
+    // No "Add Row" here any more: a member's extra sets of times are the
+    // extra DAYS added with the "+" button next to the report title.
     if (printContainer) {
-      const addRowBtn = document.createElement('button');
-      addRowBtn.className = 'sub-nav-btn active';
-      addRowBtn.style.marginRight = '8px';
-      addRowBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px; vertical-align: middle;"><line x1="12" y1="5" x2="12" y2="19"></line><line x1="5" y1="12" x2="19" y2="12"></line></svg>Add Row';
-      addRowBtn.onclick = () => addIncidentRow();
-      printContainer.appendChild(addRowBtn);
-
       const printBtn = document.createElement('button');
       printBtn.className = 'sub-nav-btn active';
       printBtn.innerHTML = '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" style="margin-right: 8px; vertical-align: middle;"><polyline points="6 9 6 2 18 2 18 9"></polyline><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"></path><rect x="6" y="14" width="12" height="8"></rect></svg>Print Report';
@@ -13326,7 +13960,10 @@ function buildFormsPage() {
     const taskPills = document.getElementById('task-pills-container');
     if (taskPills) taskPills.style.display = 'none';
     const taskTitle = document.getElementById('task-view-title');
-    if (taskTitle) taskTitle.textContent = 'Incident Times Report';
+    if (taskTitle) {
+      taskTitle.textContent = 'Incident Times Report';
+      taskTitle.classList.add('incident-times-title');
+    }
 
     buildIncidentTimesReport();
   } else if (currentFormsSubpage === 'ic-report') {
@@ -13340,7 +13977,10 @@ function buildFormsPage() {
     const taskPills = document.getElementById('task-pills-container');
     if (taskPills) taskPills.style.display = 'none';
     const taskTitle = document.getElementById('task-view-title');
-    if (taskTitle) taskTitle.textContent = 'IC Report Form';
+    if (taskTitle) {
+      taskTitle.textContent = 'IC Report Form';
+      taskTitle.classList.remove('incident-times-title');
+    }
 
     buildIcReportForm();
   } else {
@@ -13350,10 +13990,12 @@ function buildFormsPage() {
   }
 }
 
+// Prints the whole Incident Times Report (every day, whole roster) in the
+// day-table layout - the "Print Report" button of the Incident Times form.
 function printIncidentTimesReport() {
-    const container = document.getElementById('interactive-form-container');
-    if (!container) return;
-    const tableHTML = container.innerHTML;
+    const bundle = loadBundle();
+    const fileName = (bundle.fileName || "Search_File").replace('.json', '');
+    const reportHTML = getIncidentTimesPrintHTML(bundle);
 
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
@@ -13361,28 +14003,14 @@ function printIncidentTimesReport() {
         return;
     }
 
-    const bundle = loadBundle();
-    const fileName = (bundle.fileName || "Search_File").replace('.json', '');
-
     printWindow.document.write(`
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <title>Incident Times Report - ${fileName}</title>
+    <title>Incident Times Report - ${escapeIcReportHtml(fileName)}</title>
     <style>
         ${TASK_FORM_PRINT_STYLES}
-        .incident-report-member-section { margin-bottom: 24px; page-break-inside: avoid; }
-        .incident-report-member-name { font-size: 13pt; font-weight: 700; margin: 0 0 8px 0; padding-bottom: 4px; border-bottom: 1px solid #000; color: #000 !important; }
-        .incident-times-container { display: flex; flex-direction: column; gap: 10px; margin-bottom: 10px; }
-        .incident-card { border: 1px solid #000; border-radius: 6px; padding: 10px; background: #fff !important; page-break-inside: avoid; }
-        .incident-card-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
-        .incident-card-title { font-size: 9pt; font-weight: 800; text-transform: uppercase; letter-spacing: 0.5px; color: #000 !important; }
-        .incident-times-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 8px; }
-        .time-slot { border: 1px solid #999; border-radius: 4px; padding: 6px 8px; background: #fff !important; }
-        .time-slot-label { font-size: 7pt; text-transform: uppercase; letter-spacing: 0.5px; opacity: 0.8; color: #000 !important; }
-        .time-slot-value { font-size: 10pt; font-weight: 600; color: #000 !important; }
-        .time-slot-value.add-time-btn-small { color: #999 !important; }
-        .delete-card-btn, .add-card-placeholder { display: none !important; }
+        ${INCIDENT_TIMES_PRINT_STYLES}
         @media print {
             button { display: none !important; }
             .no-print { display: none !important; }
@@ -13395,9 +14023,9 @@ function printIncidentTimesReport() {
     </div>
     <div class="print-container">
         <h1>Incident Times Report</h1>
-        <p><strong>File:</strong> ${fileName}</p>
+        <p><strong>File:</strong> ${escapeIcReportHtml(fileName)}</p>
         <div class="report-content">
-            ${tableHTML}
+            ${reportHTML}
         </div>
     </div>
     <script>
@@ -13422,46 +14050,12 @@ function findTaskTagForMember(memberName, logs) {
   return null;
 }
 
+// The Forms page report: the day buttons sit next to the "Incident Times
+// Report" title and the open day's table fills the form container.
 function buildIncidentTimesReport() {
   const container = document.getElementById('interactive-form-container');
   if (!container) return;
-  container.innerHTML = '';
-
-  const bundle = loadBundle();
-  const roster = bundle.pages.page3 || [];
-  const memberNames = Array.from(new Set(roster.map(r => r[0]).filter(Boolean)))
-    .sort((a, b) => a.localeCompare(b));
-
-  if (memberNames.length === 0) {
-    const empty = document.createElement('div');
-    empty.style.textAlign = 'center';
-    empty.style.opacity = '0.5';
-    empty.style.padding = '40px';
-    empty.textContent = 'No members found in the roster.';
-    container.appendChild(empty);
-    return;
-  }
-
-  memberNames.forEach(name => {
-    const section = document.createElement('div');
-    section.className = 'incident-report-member-section';
-    section.style.marginBottom = '30px';
-
-    const heading = document.createElement('h3');
-    heading.className = 'incident-report-member-name';
-    heading.textContent = name;
-    heading.style.margin = '0 0 10px 0';
-    heading.style.padding = '8px 0';
-    heading.style.borderBottom = '1px solid var(--border, rgba(255,255,255,0.1))';
-    section.appendChild(heading);
-
-    const cardsContainer = document.createElement('div');
-    section.appendChild(cardsContainer);
-
-    container.appendChild(section);
-
-    renderMemberIncidentCards(name, cardsContainer);
-  });
+  renderIncidentTimesReport(container, {titleEl: document.getElementById('task-view-title')});
 }
 
 function _retiredBuildIncidentTimesReport() {
@@ -13890,76 +14484,6 @@ function editIncidentTimestamp(logId) {
     }
   };
   btnContainer.appendChild(clearBtn);
-}
-
-function addIncidentRow() {
-  const bundle = loadBundle();
-  const roster = bundle.pages.page3 || [];
-  const memberNames = roster.map(m => m[0]).filter(Boolean).sort();
-
-  if (memberNames.length === 0) {
-    alert("No members found in the roster (Page 3).");
-    return;
-  }
-
-  const popup = createPopup('Add Member to Report');
-  const content = popup.querySelector('.popup-content');
-  const btnContainer = popup.querySelector('.popup-buttons');
-
-  const container = document.createElement('div');
-  container.className = 'popup-input-container';
-  container.style.flexDirection = 'column';
-  container.style.gap = '15px';
-  container.style.marginBottom = '20px';
-
-  const label = document.createElement('label');
-  label.textContent = 'Select Member';
-  label.style.display = 'block';
-  label.style.marginBottom = '5px';
-
-  const select = document.createElement('select');
-  select.className = 'pill-input';
-  select.style.width = '100%';
-  memberNames.forEach(name => {
-    const opt = document.createElement('option');
-    opt.value = name;
-    opt.textContent = name;
-    select.appendChild(opt);
-  });
-
-  container.appendChild(label);
-  container.appendChild(select);
-  content.insertBefore(container, btnContainer);
-
-  const addBtn = document.createElement('button');
-  addBtn.className = 'popup-btn primary';
-  addBtn.textContent = 'Add Row';
-  addBtn.onclick = async () => {
-    const memberName = select.value;
-    if (!memberName) return;
-
-    // Add a new incident set (page3 row) for the selected member, matching the
-    // "Add Incident Row" card affordance used in the mobile/member-report views.
-    const page3 = bundle.pages.page3 || [];
-    const memberRows = page3.filter(r => r[0] === memberName);
-    const firstRow = memberRows[0];
-    const newRow = firstRow ? [...firstRow] : Array(14).fill('');
-    newRow[0] = memberName;
-    // Clear incident times in the new row (indexes 9-12)
-    newRow[9] = '';
-    newRow[10] = '';
-    newRow[11] = '';
-    newRow[12] = '';
-    // Clear old sets JSON if it exists
-    if (newRow[13]) newRow[13] = '';
-
-    page3.push(newRow);
-    saveBundle(bundle);
-
-    closePopup(popup);
-    buildIncidentTimesReport();
-  };
-  btnContainer.appendChild(addBtn);
 }
 
 function addIncidentTimestamp(memberName, columnKey) {
@@ -15295,6 +15819,8 @@ function printSearchFile() {
         .map(num => `<div class="print-section">${getTaskFormPrintHTML(num, forms[num])}</div>`)
         .join('');
     const icReportHTML = getIcReportPrintHTML(bundle);
+    // The Incident Times Report, compactly (only members/days with times).
+    const incidentTimesHTML = getIncidentTimesPrintHTML(bundle, {compact: true});
 
     const printWindow = window.open('', '_blank');
     if (!printWindow) {
@@ -15330,6 +15856,7 @@ function printSearchFile() {
         .chart-label { font-size: 9pt; font-weight: bold; margin-bottom: 5px; color: #555; text-align: center; }
         .chart-svg-wrap { flex: 1; min-height: 140px; }
         ${IC_REPORT_PRINT_STYLES}
+        ${INCIDENT_TIMES_PRINT_STYLES}
         .task-form { border: 2px solid #000; padding: 15px; margin-bottom: 20px; position: relative; }
         .form-header { display: flex; justify-content: space-between; border-bottom: 2px solid #000; margin-bottom: 15px; padding-bottom: 5px; }
         .form-section { margin-bottom: 12px; }
@@ -15387,6 +15914,9 @@ function printSearchFile() {
                 </thead>
                 <tbody id="sl-body"></tbody>
             </table>
+
+            <!-- Incident Times Report (compact: one table per day) -->
+            ${incidentTimesHTML}
         </div>
 
         <!-- Activity Log -->
@@ -16487,6 +17017,11 @@ document.addEventListener('DOMContentLoaded', async () => {
   // Every 5 minutes (unless turned off in Settings) re-fetch the CalTopo map
   // and point out shapes that are not imported as segments or marked unwanted.
   startUnaccountedMapFeatureChecks();
+
+  // Keep the PSRc segment colors on CalTopo current: at most once per cooldown,
+  // at least once per heartbeat, and right now if this page switch comes after
+  // the cooldown (see refreshCalTopoAssignmentOverlayIfEnabled).
+  startCalTopoColorSyncTicker();
 
   // Auto-save every 5 minutes to the file list on the home page
   setInterval(() => {
@@ -18137,6 +18672,8 @@ async function caltopo_request(btn = null, options = {}) {
         if (isMapsPage()) {
           const urlParams = new URLSearchParams(window.location.search);
           const activeTab = urlParams.get('tab') || 'map';
+          // Shapes are known now: the color-sync countdown can show itself.
+          renderCalTopoColorSyncCountdown();
           renderUnaccountedFeaturesPanel();
           if (activeTab === 'features') {
             renderFeaturesList();
@@ -18778,7 +19315,10 @@ function buildMapsPage() {
     <div id="map-view-container" style="display: ${activeTab === 'map' ? 'block' : 'none'};">
       <section id="map-view-section" class="table-card" style="display: none; padding: 0; overflow: hidden; height: 75vh; position: relative; margin-top: 20px; border-radius: 16px;">
         <div class="table-tools" style="padding: 15px; background: var(--header-bg); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center;">
-          <h2 id="current-map-title" style="margin: 0; font-size: 1.2rem;">Map View</h2>
+          <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+            <h2 id="current-map-title" style="margin: 0; font-size: 1.2rem;">Map View</h2>
+            <span id="caltopo-color-sync-countdown" class="mini-pill" style="display: none; padding: 3px 10px; font-size: 0.75rem;" title="Time until the PSRc segment colors are next pushed to CalTopo (at most once per cooldown, at least once per heartbeat - see Settings)."></span>
+          </div>
           <div class="tool-actions" style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
             <label style="display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; cursor: pointer;" title="Colors the CalTopo assignment shapes by PSRc, draws segments being searched in the active-search style, and appends a summary of each finished task (date/time, team and members, tracks, sweep width) to the shape's description.">
               <span>PSRc Assignment Colors</span>
@@ -18950,6 +19490,8 @@ function buildMapsPage() {
                 alert(error.message || 'Unable to update CalTopo assignment colors.');
             } finally {
                 caltopoAssignmentOverlayToggle.disabled = false;
+                // The countdown pill follows the toggle at once.
+                renderCalTopoColorSyncCountdown();
             }
         };
         caltopoAssignmentOverlayToggle.dataset.bound = 'true';
@@ -20559,6 +21101,8 @@ function performSyncUIRefresh() {
     else if (isMapsPage()) buildMapsPage();
     else if (isUploadsPage()) buildUploadsPage();
     else buildStandardTable();
+    // Pages with their own script (mobile-status.html) redraw on this.
+    try { document.dispatchEvent(new CustomEvent('sar-data-refreshed')); } catch (e) {}
 }
 
 function refreshSyncUI() {

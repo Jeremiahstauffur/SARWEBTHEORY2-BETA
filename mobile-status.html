@@ -6,8 +6,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Mobile Status Update | Search & Rescue Theory Software</title>
   <!-- theme-boot.js must be the first thing in <head>, before the stylesheet: it reads the theme hint cookie, puts <html> in the right theme and paints the 80% boot overlay + spinner before anything else is rendered (preferences themselves come from the server after login). -->
-  <script src="theme-boot.js?v=20260913"></script>
-  <link rel="stylesheet" href="styles.css?v=20260913" />
+  <script src="theme-boot.js?v=20260915"></script>
+  <link rel="stylesheet" href="styles.css?v=20260915" />
   <style>
     .mobile-status-container {
       padding: calc(15px * var(--space-scale, 1));
@@ -117,7 +117,8 @@
         </div>
 
         <div id="status-history-container">
-          <h2 style="font-size: 1rem; margin-bottom: calc(10px * var(--space-scale, 1)); color: var(--muted); text-transform: uppercase;">Incident Times</h2>
+          <!-- The day buttons of the Incident Times Report are drawn into this title (see renderIncidentTimesReport in app.js). -->
+          <h2 id="incident-times-title" class="incident-times-title" style="font-size: 1rem; margin-bottom: calc(10px * var(--space-scale, 1)); color: var(--muted); text-transform: uppercase;">Incident Times</h2>
           <div id="incident-times-container" class="incident-times-container">
             <div style="text-align: center; opacity: 0.5; padding: calc(20px * var(--space-scale, 1));">Select a member to view incident times</div>
           </div>
@@ -157,9 +158,9 @@
     </nav>
   </div>
 
-  <script src="map-segment-utils.js?v=20260913"></script>
-  <script src="sync-delta.js?v=20260913"></script>
-  <script src="app.js?v=20260913"></script>
+  <script src="map-segment-utils.js?v=20260915"></script>
+  <script src="sync-delta.js?v=20260915"></script>
+  <script src="app.js?v=20260915"></script>
   <script>
     // Local script for mobile-status page logic. The case is read from the
     // server on every page load (nothing is kept on the device), so this waits
@@ -226,19 +227,32 @@
           renderIncidentTimes(selectedMember);
           renderHistory(selectedMember);
         } else {
+          const dayTabs = document.getElementById('incident-day-tabs');
+          if (dayTabs) dayTabs.remove();
           document.getElementById('incident-times-container').innerHTML = '<div style="text-align: center; opacity: 0.5; padding: calc(20px * var(--space-scale, 1));">Select a member to view incident times</div>';
           statusList.innerHTML = '<div style="text-align: center; opacity: 0.5; padding: calc(20px * var(--space-scale, 1));">Select a member to view history</div>';
         }
       };
 
+      // The member's row of the Incident Times Report for the open day, with
+      // the day buttons (date / "Day N" / "+") next to the "Incident Times" title.
       function renderIncidentTimes(memberName) {
         const container = document.getElementById('incident-times-container');
-        if (typeof renderMemberIncidentCards === 'function') {
-            renderMemberIncidentCards(memberName, container);
+        if (typeof renderIncidentTimesReport === 'function') {
+            renderIncidentTimesReport(container, {memberName, titleEl: document.getElementById('incident-times-title')});
         } else {
-            container.innerHTML = '<div style="text-align: center; color: #eb5757;">Error: renderMemberIncidentCards not found in app.js</div>';
+            container.innerHTML = '<div style="text-align: center; color: #eb5757;">Error: renderIncidentTimesReport not found in app.js</div>';
         }
       }
+
+      // Another device's edits arrived (app.js polls the case): redraw the
+      // selected member's times and history.
+      document.addEventListener('sar-data-refreshed', () => {
+        const selectedMember = dropdown.value;
+        if (!selectedMember) return;
+        renderIncidentTimes(selectedMember);
+        renderHistory(selectedMember);
+      });
 
       function renderHistory(memberName) {
         const b = loadBundle();

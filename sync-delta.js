@@ -88,7 +88,9 @@
         segmentActiveSearchBorderColor: 'settings_page',
         segmentActiveSearchBorderWidth: 'settings_page',
         mapUnaccountedAutoCheck: 'settings_page',
-        mapFeatureTypeFilters: 'settings_page'
+        mapFeatureTypeFilters: 'settings_page',
+        caltopoColorSyncHeartbeatMinutes: 'settings_page',
+        caltopoColorSyncCooldownSeconds: 'settings_page'
     };
 
     const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);

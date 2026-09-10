@@ -139,7 +139,11 @@ bundle = {
   `activity_log_entries`, `declined_assignment_features`, `lpb_ipp` (the case's IPP, derived from the
   bundle section by `syncLostPersonIppTable`), `user_assets`, `users`, `user_settings`, `user_buckets`,
   `store`. Not per case: `lpb_default_distances` (category × terrain miles, **edited by hand in the DB**,
-  seeded 0.5/1.0/1.5/2.0) and `lpb_user_distances` (a login's edited values, username only).
+  seeded 0.5/1.0/1.5/2.0) and `lpb_user_distances` (a login's edited values, username only). Both
+  distance tables have `id` — a unique **five-digit** `AUTO_INCREMENT` primary key from `LPB_FIRST_ROW_ID`
+  (10000) — with the old composite key kept as a `UNIQUE KEY`; `ensureLpbRowIds` adds/repairs it on every
+  start, so never write those tables with `REPLACE` (delete+insert changes the id) or `INSERT IGNORE`
+  (an ignored insert still burns a number).
 - `INTERNAL_STORE_KEYS` (`bundle`, `all-files`, `user-<pin>` presence pings) are **never** a CASE #.
 - **Lost Person Behavior** (`lostPersonBehavior`): the pure maths (`resolveLpbBracket`,
   `getLpbSegmentAdjustment`, `buildLpbContext`, centroid/haversine) lives in `map-segment-utils.js`;
@@ -156,12 +160,21 @@ bundle = {
   percentage becomes `--geek-space-scale` inline on `<html>` (`html.geek-mode` maps it onto
   `--space-scale`); the boot hint cookie carries it as `pad<percent>`. Plan:
   `.junie/plans/geek-mode-per-user-compact-panels.md`.
+- **CalTopo color sync limits** are two login-preference bundle keys mirrored like `parCheckFrequency`
+  (`LOGIN_PREFERENCE_KEYS`, `settings_page`): `caltopoColorSyncHeartbeatMinutes` (default 1, "push at
+  least every") and `caltopoColorSyncCooldownSeconds` (default 10, "never more often than"; clamped to
+  the heartbeat by `getCalTopoColorSyncSettings`, which the sanitizer, the scheduler and the Settings
+  page all use). The clock behind them is **not** case data: `sessionStorage[CALTOPO_COLOR_SYNC_LAST_PUSH_STORAGE_KEY]`
+  holds this tab's last push attempt (deliberately per tab, survives page navigation), and
+  `maps[0].caltopoAssignmentOverlayState.updatedAt` is the case's record of the last push that *changed*
+  a shape (a hint other devices read as a lower bound). Plan: `.junie/plans/caltopo-color-sync-rate-limit.md`.
 
 **Nothing is persisted on the device.** The case lives in memory for the page lifetime; the device
 keeps only login cookies/sessionStorage and the sync-server URL. The `*_STORAGE_KEY` constants are
 mostly keys into the **per-user server settings** (`GET/PUT /api/auth/settings`) or the in-memory
 store, and `LEGACY_LOCAL_STORAGE_KEYS` is wiped at startup. Do not reintroduce localStorage caching
-of case data.
+of case data. (`sessionStorage` is allowed for per-tab *clocks and flags* only — `sar-open-case-popup`,
+the color-sync last-push time — never for case content.)
 
 ---
 
@@ -207,7 +220,7 @@ overrides), `/api/health`, `/api/proxy` + `/api/call` (CalTopo, signed server-si
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260913`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260915`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
 - **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
@@ -228,6 +241,12 @@ overrides), `/api/health`, `/api/proxy` + `/api/call` (CalTopo, signed server-si
   static guard: every `*_STORAGE_KEY` / `*_INTERVAL_MS` identifier used must be declared.
 - **New bundle key?** Add it to `sanitizeBundle()`, to `sync-delta.js` maps if it should mirror to a
   table, and to `buildStructuredPlan` on the server if it needs its own table.
+- **CalTopo color push = `updateCalTopoAssignmentOverlay(true)`, always through the scheduler.** Ask for
+  it with `refreshCalTopoAssignmentOverlayIfEnabled()` (cooldown gate, one pending timer, heartbeat via
+  `startCalTopoColorSyncTicker`); never add a second `setTimeout` path. The push **saves the case only
+  when a shape's local style/description/class actually changed** (`changedLocally`): the heartbeat
+  re-POSTs identical colors every minute and must not churn the heavy `maps` section on every device.
+  Automatic pushes stay silent (`console.warn`); only the Maps page toggle may `alert`.
 - **New server table?** Create it in `initDatabaseSchema` (MySQL DDL, `ENGINE=InnoDB … utf8mb4`),
   add to `COLLECTION_TABLES`/`SINGLE_TABLES` so `/api/v1/tables` exposes it, include it in the
   whole-case delete, and extend `test_structured_tables.js`.
@@ -327,6 +346,26 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   (`sortLabel.textContent = …`) cannot be abbreviated in JS without touching every builder — hide it
   with `.geek-full` and show a static `.geek-abbr` sibling instead.
   (plan: `geek-mode-per-user-compact-panels.md`)
+- **2026-09-09 — CalTopo color push rate-limited (10 s cooldown / 1 min heartbeat).** Two traps found on
+  the way. (1) `updateCalTopoAssignmentOverlay` used to `saveBundle` on *every* push; with a heartbeat
+  that would have re-saved the heavy `maps` section every minute on every device (each `/state` poll
+  then re-downloads it everywhere). Rule: a periodic re-push saves only on a real local change
+  (compare `captureCalTopoFeatureStyle` before/after). (2) `runCalTopoAssignmentOverlayRefresh` tested
+  `typeof refreshCalTopoIframe === 'function'` — that is a closure inside `buildMapsPage`, so the branch
+  was dead at global scope; it was removed rather than "fixed" (a 10 s iframe reload would be unusable).
+  Testing: `test_caltopo_color_sync_schedule.js` drives `Date`/`setTimeout`/`setInterval` from a manual
+  clock (`createClock().advance(ms)`) — copy it for any timer-based feature instead of the `setTimeout:
+  () => 0` stubs (which silently never fire). (plan: `caltopo-color-sync-rate-limit.md`)
+- **2026-09-09 — Hand-edited table rows were not editable in the DB UI.** Symptom: the planner could not
+  edit single rows of `lpb_default_distances`. Cause: the table had only a composite primary key
+  `(category, terrain)`; the database UI wants a single-column key to address a row. Rule: a table meant
+  to be edited by hand gets a numeric `id` primary key (`ensureLpbRowIds`: `information_schema` check →
+  one `ALTER TABLE … DROP PRIMARY KEY, ADD COLUMN id … AUTO_INCREMENT, ADD PRIMARY KEY (id), ADD UNIQUE
+  KEY (…)` → shift ids `< 10000` up by `max(10000, hi + 1) − lo` so they cannot collide). Chain
+  create → migrate → seed with promises (`runAsync().then(…)`), never as parallel `db.run` calls. Seed with
+  `INSERT … SELECT … WHERE NOT EXISTS` and upsert with `INSERT … ON DUPLICATE KEY UPDATE` to keep the ids
+  stable. `test_lpb_server.js` simulates the pre-id table shape and MySQL's numbering-from-1 behaviour.
+  (plan: `lost-person-behavior-psr-adjustment.md`, Step 5)
 
 ---
 
@@ -360,6 +399,11 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   Assignment Colors`) and the Home dashboard were left as they are. `bundle.geekMode` is still listed in
   `sync-delta.js` / `buildStructuredPlan` (`settings_page`) as a legacy key that is never written.
   The percentage input accepts 0–100; 100 removes every scaled padding entirely (allowed on purpose).
+- CalTopo color sync follow-ups: the last-push clock is per **tab** (`sessionStorage`), so two tabs of
+  the same device — or two devices — each heartbeat on their own schedule; the case's `updatedAt` hint
+  only stops them re-pushing right after another device's *changing* push, so identical no-change
+  pushes can double up. Accepted (CalTopo tolerates it); a shared per-login clock in `user_settings`
+  would close it. The countdown pill therefore shows *this tab's* schedule, not a fleet-wide one.
 
 ---
 

@@ -3,7 +3,9 @@
 // Covers the distance endpoints (GET/PUT /api/lpb/distances: planner defaults
 // + per-login overrides), the lpb_ipp marker table that follows
 // bundle.lostPersonBehavior.ipp through row batches, the whole-case delete,
-// and the seeding of lpb_default_distances after its CREATE TABLE.
+// the seeding of lpb_default_distances after its CREATE TABLE, and the
+// five-digit `id` every row of the two distance tables carries (including the
+// in-place migration of tables created before the column existed).
 //
 // The MySQL pool is replaced with a tiny in-memory stand-in that also records
 // every statement, so the test runs without a database and can assert which
@@ -21,6 +23,7 @@ const TEST_USER = {username: 'Team Alpha', pin: '2468', password: 'ignored'};
 
 const store = new Map();               // "bucket\u0000key" -> {value, userName, userPin, updatedAt}
 const tables = new Map();              // table -> array of row objects
+const schema = new Map();              // distance table -> {hasId, nextId}: its id column + AUTO_INCREMENT counter
 const log = [];                        // every statement issued: {sql, params}
 
 const tableRows = (table) => {
@@ -28,10 +31,28 @@ const tableRows = (table) => {
     return tables.get(table);
 };
 
+// The composite key each distance table had before the id column arrived (and
+// keeps as its UNIQUE key).
+const DISTANCE_KEYS = {
+    lpb_default_distances: ['category', 'terrain'],
+    lpb_user_distances: ['username', 'category', 'terrain']
+};
+
+// A distance table that is not listed here yet is from before the id column
+// existed: no id, and MySQL will number its rows from 1 when the column is
+// added.
+const idState = (table) => {
+    if (!schema.has(table)) schema.set(table, {hasId: false, nextId: 1});
+    return schema.get(table);
+};
+
+const rowIds = (table) => tableRows(table).map(r => r.id).filter(id => typeof id === 'number');
+
 // mysql2 returns DECIMAL columns as strings; the pre-seeded rows mimic that.
 // A planner row exists for one terrain only, so the other three combinations
 // have to be filled from the seed placeholders. The pre-seeded override has a
-// single bracket set (p50) and the rest NULL.
+// single bracket set (p50) and the rest NULL. Neither table has an id column
+// yet, like a database from before this column existed.
 tables.set('lpb_default_distances', [
     {category: 'Mental Illness', terrain: 'Mtn Temperate', p25: '0.7', p50: '1.4', p75: '2.6', p95: '5.1', updatedAt: 'x'}
 ]);
@@ -41,6 +62,8 @@ tables.set('lpb_user_distances', [
 ]);
 
 const norm = (sql) => sql.replace(/\s+/g, ' ').trim();
+// Stored the way MySQL hands DECIMAL back: as strings (NULL stays null).
+const dec = (v) => v === null || v === undefined ? null : String(v);
 
 const query = (rawSql, params, cb) => {
     const sql = norm(rawSql);
@@ -48,21 +71,76 @@ const query = (rawSql, params, cb) => {
     log.push({sql, params: p.slice()});
     let m;
 
-    // ---- schema (only exercised by the initDatabaseSchema check) ----
-    if (/^CREATE TABLE IF NOT EXISTS `lpb_default_distances`/.test(sql)) {
-        // Answer asynchronously so the test can see whether the seed INSERTs
-        // wait for the CREATE or race it.
-        setImmediate(() => cb(null, {affectedRows: 0}));
-        return;
+    // ---- schema (only exercised by the initDatabaseSchema checks) ----
+    if ((m = sql.match(/^CREATE TABLE IF NOT EXISTS `(lpb_default_distances|lpb_user_distances)` \(/))) {
+        // A distance table that does not exist yet is created in its new shape,
+        // id column included; an existing one is left exactly as it is.
+        if (!tables.has(m[1])) {
+            tables.set(m[1], []);
+            schema.set(m[1], {hasId: true, nextId: 10000});
+        }
+        if (m[1] === 'lpb_default_distances') {
+            // Answer asynchronously so the test can see whether the seed
+            // INSERTs wait for the CREATE or race it.
+            setImmediate(() => cb(null, {affectedRows: 0}));
+            return;
+        }
+        return cb(null, {affectedRows: 0});
     }
     if (/^CREATE TABLE/.test(sql)) {
         return cb(null, {affectedRows: 0});
     }
-    if (/^INSERT IGNORE INTO `lpb_default_distances` \(category, terrain, p25, p50, p75, p95, updatedAt\)/.test(sql)) {
+    if (/^SELECT COLUMN_NAME AS columnName FROM information_schema\.COLUMNS WHERE TABLE_SCHEMA = DATABASE\(\) AND TABLE_NAME = \? AND COLUMN_NAME = \?$/.test(sql)) {
+        return cb(null, (p[1] === 'id' && idState(p[0]).hasId) ? [{columnName: 'id'}] : []);
+    }
+    if ((m = sql.match(/^ALTER TABLE `(\w+)` DROP PRIMARY KEY, ADD COLUMN id INT UNSIGNED NOT NULL AUTO_INCREMENT FIRST, ADD PRIMARY KEY \(id\), ADD UNIQUE KEY `uq_(\w+)` \(([^)]+)\), AUTO_INCREMENT = (\d+)$/))) {
+        // Like InnoDB in the unhelpful case: the existing rows are numbered from
+        // 1 in key order and the AUTO_INCREMENT option only says where new
+        // rows continue.
+        assert.strictEqual(m[2], m[1], 'the unique key is named after its table');
+        assert.deepStrictEqual(m[3].split(', '), DISTANCE_KEYS[m[1]], 'the old composite key becomes the unique key');
+        const state = idState(m[1]);
+        assert.strictEqual(state.hasId, false, 'the id column is only ever added once');
+        const keys = DISTANCE_KEYS[m[1]];
+        const rows = tableRows(m[1]);
+        const keyOf = (row) => keys.map(k => String(row[k])).join('\u0000');
+        rows.sort((a, b) => keyOf(a).localeCompare(keyOf(b)));
+        rows.forEach((row, index) => { row.id = index + 1; });
+        state.hasId = true;
+        state.nextId = Math.max(Number(m[4]), rows.length + 1);
+        return cb(null, {affectedRows: rows.length});
+    }
+    if ((m = sql.match(/^SELECT MIN\(id\) AS lo, MAX\(id\) AS hi FROM `(\w+)`$/))) {
+        assert.strictEqual(idState(m[1]).hasId, true, `${m[1]} has no id column to read`);
+        const ids = rowIds(m[1]);
+        return cb(null, [{lo: ids.length ? Math.min(...ids) : null, hi: ids.length ? Math.max(...ids) : null}]);
+    }
+    if ((m = sql.match(/^UPDATE `(\w+)` SET id = id \+ \? WHERE id < \?$/))) {
+        let changed = 0;
+        tableRows(m[1]).forEach((row) => {
+            if (row.id < p[1]) { row.id += p[0]; changed++; }
+        });
+        // MySQL would refuse the statement with a duplicate-key error.
+        const ids = rowIds(m[1]);
+        assert.strictEqual(new Set(ids).size, ids.length, `the id shift on ${m[1]} must not collide`);
+        return cb(null, {affectedRows: changed});
+    }
+    if ((m = sql.match(/^ALTER TABLE `(\w+)` AUTO_INCREMENT = (\d+)$/))) {
+        // MySQL never lowers the counter below (highest id + 1).
+        const state = idState(m[1]);
+        const ids = rowIds(m[1]);
+        state.nextId = Math.max(Number(m[2]), ids.length ? Math.max(...ids) + 1 : 0);
+        return cb(null, {affectedRows: 0});
+    }
+    if (/^INSERT INTO `lpb_default_distances` \(category, terrain, p25, p50, p75, p95, updatedAt\) SELECT \?, \?, \?, \?, \?, \?, \? FROM DUAL WHERE NOT EXISTS \(SELECT 1 FROM `lpb_default_distances` WHERE category = \? AND terrain = \?\)$/.test(sql)) {
+        assert.deepStrictEqual(p.slice(7, 9), p.slice(0, 2), 'the NOT EXISTS test names the row being seeded');
         const rows = tableRows('lpb_default_distances');
-        if (!rows.some(r => r.category === p[0] && r.terrain === p[1])) {
-            rows.push({category: p[0], terrain: p[1], p25: p[2], p50: p[3], p75: p[4], p95: p[5], updatedAt: p[6]});
+        if (rows.some(r => r.category === p[0] && r.terrain === p[1])) {
+            // Nothing inserted: unlike INSERT IGNORE this uses no id.
+            return cb(null, {affectedRows: 0});
         }
+        const state = idState('lpb_default_distances');
+        rows.push({id: state.nextId++, category: p[0], terrain: p[1], p25: dec(p[2]), p50: dec(p[3]), p75: dec(p[4]), p95: dec(p[5]), updatedAt: p[6]});
         return cb(null, {affectedRows: 1});
     }
 
@@ -105,12 +183,16 @@ const query = (rawSql, params, cb) => {
     if (/^SELECT category, terrain, p25, p50, p75, p95 FROM `lpb_user_distances` WHERE username = \?$/.test(sql)) {
         return cb(null, tableRows('lpb_user_distances').filter(r => r.username === p[0]).map(r => ({...r})));
     }
-    if (/^REPLACE INTO `lpb_user_distances` \(username, category, terrain, p25, p50, p75, p95, updatedAt\) VALUES \(\?, \?, \?, \?, \?, \?, \?, \?\)$/.test(sql)) {
-        const kept = tableRows('lpb_user_distances').filter(r => !(r.username === p[0] && r.category === p[1] && r.terrain === p[2]));
-        // Stored the way MySQL hands DECIMAL back: as strings (NULL stays null).
-        const dec = (v) => v === null || v === undefined ? null : String(v);
-        kept.push({username: p[0], category: p[1], terrain: p[2], p25: dec(p[3]), p50: dec(p[4]), p75: dec(p[5]), p95: dec(p[6]), updatedAt: p[7]});
-        tables.set('lpb_user_distances', kept);
+    if (/^INSERT INTO `lpb_user_distances` \(username, category, terrain, p25, p50, p75, p95, updatedAt\) VALUES \(\?, \?, \?, \?, \?, \?, \?, \?\) ON DUPLICATE KEY UPDATE p25 = \?, p50 = \?, p75 = \?, p95 = \?, updatedAt = \?$/.test(sql)) {
+        const rows = tableRows('lpb_user_distances');
+        const existing = rows.find(r => r.username === p[0] && r.category === p[1] && r.terrain === p[2]);
+        if (existing) {
+            // The UPDATE half: the row - and its id - stay, the values change.
+            Object.assign(existing, {p25: dec(p[8]), p50: dec(p[9]), p75: dec(p[10]), p95: dec(p[11]), updatedAt: p[12]});
+            return cb(null, {affectedRows: 2});
+        }
+        const state = idState('lpb_user_distances');
+        rows.push({id: state.nextId++, username: p[0], category: p[1], terrain: p[2], p25: dec(p[3]), p50: dec(p[4]), p75: dec(p[5]), p95: dec(p[6]), updatedAt: p[7]});
         return cb(null, {affectedRows: 1});
     }
     if (/^DELETE FROM `lpb_user_distances` WHERE username = \? AND category = \? AND terrain = \?$/.test(sql)) {
@@ -164,7 +246,7 @@ require.cache[require.resolve('mysql2')] = {
 };
 
 const server = require('./sync-server');
-const {app, initDatabaseSchema, LPB_TABLE, LPB_IPP_TABLE, LPB_DEFAULTS_TABLE, LPB_USER_DISTANCES_TABLE} = server;
+const {app, initDatabaseSchema, ensureLpbRowIds, LPB_TABLE, LPB_IPP_TABLE, LPB_DEFAULTS_TABLE, LPB_USER_DISTANCES_TABLE, LPB_FIRST_ROW_ID} = server;
 const {LPB_CATEGORIES, LPB_TERRAINS, LPB_BRACKETS, LPB_SEED_DISTANCES} = require('./map-segment-utils');
 
 // ---------------------------------------------------------------------------
@@ -195,6 +277,11 @@ const call = async (method, path, body) => {
 const tick = () => new Promise((resolve) => setTimeout(resolve, 20));
 const storedBundle = () => JSON.parse(store.get(`${BUCKET}\u0000bundle`).value);
 const statements = (pattern) => log.filter((entry) => pattern.test(entry.sql));
+const isFiveDigitId = (id) => Number.isInteger(id) && id >= 10000 && id <= 99999;
+const seedInsert = /^INSERT INTO `lpb_default_distances` \(category, terrain, p25, p50, p75, p95, updatedAt\) SELECT/;
+const addIdColumn = /^ALTER TABLE `(\w+)` DROP PRIMARY KEY, ADD COLUMN id/;
+const overrideUpsert = /^INSERT INTO `lpb_user_distances` .* ON DUPLICATE KEY UPDATE/;
+const overrideRow = (terrain, username = TEST_USER.username) => tableRows('lpb_user_distances').find(r => r.username === username && r.terrain === terrain);
 const ippRows = () => tableRows(LPB_IPP_TABLE).filter(r => r.username === TEST_USER.username && r.search_case === FILE_NAME);
 const overridesFor = (body, terrain) => (body.overrides['Mental Illness'] || {})[terrain];
 
@@ -232,11 +319,11 @@ const run = async () => {
     await check('the default-distance seed rows are written only after their CREATE TABLE completes', async () => {
         log.length = 0;
         initDatabaseSchema();
-        const seedInsert = /^INSERT IGNORE INTO `lpb_default_distances`/;
         assert.ok(statements(/^CREATE TABLE IF NOT EXISTS `lpb_default_distances`/).length === 1, 'the table is created');
         assert.ok(statements(/^CREATE TABLE IF NOT EXISTS `lpb_user_distances`/).length === 1);
         assert.ok(statements(/^CREATE TABLE IF NOT EXISTS `lpb_ipp`/).length === 1);
         assert.strictEqual(statements(seedInsert).length, 0, 'no seed INSERT may race the CREATE');
+        assert.strictEqual(statements(addIdColumn).length, 0, 'no migration may race the CREATE either');
         await tick();
         const inserts = statements(seedInsert);
         assert.strictEqual(inserts.length, LPB_CATEGORIES.length * LPB_TERRAINS.length);
@@ -247,12 +334,77 @@ const run = async () => {
         inserts.forEach((entry) => {
             assert.deepStrictEqual(entry.params.slice(2, 6), [LPB_SEED_DISTANCES.p25, LPB_SEED_DISTANCES.p50, LPB_SEED_DISTANCES.p75, LPB_SEED_DISTANCES.p95]);
         });
-        // INSERT IGNORE never replaced the planner's own row.
+        assert.strictEqual(statements(/^INSERT IGNORE/).length, 0, 'the seed no longer burns AUTO_INCREMENT numbers with INSERT IGNORE');
+        // The seed never replaced the planner's own row.
         const planner = tableRows('lpb_default_distances').find(r => r.terrain === 'Mtn Temperate');
-        assert.strictEqual(planner.p25, '0.7');
+        assert.deepStrictEqual([planner.p25, planner.p50, planner.p75, planner.p95], ['0.7', '1.4', '2.6', '5.1']);
+    });
+
+    await check('tables from before the id column existed are migrated in place before the seed runs', async () => {
+        assert.strictEqual(LPB_FIRST_ROW_ID, 10000);
+        // Both distance tables were given the column, exactly once each.
+        const altered = statements(addIdColumn).map((entry) => entry.sql.match(addIdColumn)[1]).sort();
+        assert.deepStrictEqual(altered, [LPB_DEFAULTS_TABLE, LPB_USER_DISTANCES_TABLE]);
+        const firstAlter = log.findIndex((entry) => addIdColumn.test(entry.sql) && entry.sql.includes(`\`${LPB_DEFAULTS_TABLE}\``));
+        const firstSeed = log.findIndex((entry) => seedInsert.test(entry.sql));
+        assert.ok(firstAlter !== -1 && firstAlter < firstSeed, 'the defaults table is migrated before it is seeded');
+        // MySQL numbered the pre-existing rows from 1; they were pushed up into
+        // the five-digit range (shift = 10000 - lowest id) and the counter set
+        // so new rows follow on.
+        const shifts = statements(/^UPDATE `(\w+)` SET id = id \+ \? WHERE id < \?$/);
+        assert.deepStrictEqual(shifts.map((entry) => entry.params), [[9999, 10000], [9999, 10000]]);
+        assert.strictEqual(statements(/^ALTER TABLE `(\w+)` AUTO_INCREMENT = 10000$/).length, 2);
+
+        // Defaults: the planner's row kept its values and became 10000; the
+        // three seeded terrains follow in LPB_TERRAINS order.
+        const defaults = tableRows(LPB_DEFAULTS_TABLE);
+        assert.strictEqual(defaults.length, LPB_CATEGORIES.length * LPB_TERRAINS.length);
+        defaults.forEach((row) => assert.ok(isFiveDigitId(row.id), `${row.terrain} has a five-digit id (got ${row.id})`));
+        assert.strictEqual(new Set(defaults.map(r => r.id)).size, defaults.length, 'every row has its own id');
+        const byTerrain = Object.fromEntries(defaults.map(r => [r.terrain, r.id]));
+        assert.deepStrictEqual(byTerrain, {'Mtn Temperate': 10000, 'Flat Temperate': 10001, 'Dry': 10002, 'Urban': 10003});
+        assert.strictEqual(defaults.find(r => r.id === 10000).p25, '0.7');
+
+        // Overrides: both logins' rows kept their values and got 10000 / 10001
+        // (numbered in key order: "Somebody Else" sorts before "Team Alpha").
+        const overrides = tableRows(LPB_USER_DISTANCES_TABLE);
+        assert.deepStrictEqual(overrides.map(r => [r.id, r.username, r.terrain, r.p25, r.p50]), [
+            [10000, 'Somebody Else', 'Dry', '9.9', null],
+            [10001, TEST_USER.username, 'Mtn Temperate', null, '1.2']
+        ]);
+    });
+
+    await check('a later start finds the id columns and leaves both tables alone', async () => {
+        const before = JSON.stringify([tableRows(LPB_DEFAULTS_TABLE), tableRows(LPB_USER_DISTANCES_TABLE)]);
+        log.length = 0;
+        initDatabaseSchema();
+        await tick();
+        assert.strictEqual(statements(/^ALTER TABLE/).length, 0, 'no ALTER on a table that already has the column');
+        assert.strictEqual(statements(/^UPDATE `lpb_/).length, 0, 'ids are not shifted again');
+        assert.strictEqual(statements(seedInsert).length, LPB_CATEGORIES.length * LPB_TERRAINS.length, 'the seed is still offered');
+        assert.strictEqual(JSON.stringify([tableRows(LPB_DEFAULTS_TABLE), tableRows(LPB_USER_DISTANCES_TABLE)]), before, 'nothing changed');
         // The stand-in now holds a seeded row for the other terrains; drop them
         // again so the endpoint checks below exercise the seed fallback.
-        tables.set('lpb_default_distances', tableRows('lpb_default_distances').filter(r => r.terrain === 'Mtn Temperate'));
+        tables.set(LPB_DEFAULTS_TABLE, tableRows(LPB_DEFAULTS_TABLE).filter(r => r.terrain === 'Mtn Temperate'));
+    });
+
+    await check('ensureLpbRowIds moves low ids clear of five-digit ids that are already in use', async () => {
+        // A start that died between adding the column and shifting the rows,
+        // followed by a new row: ids 1, 2 and 10000 side by side.
+        tables.set('lpb_scratch', [{k: 'a', id: 1}, {k: 'b', id: 2}, {k: 'c', id: 10000}]);
+        schema.set('lpb_scratch', {hasId: true, nextId: 10001});
+        log.length = 0;
+        await ensureLpbRowIds('lpb_scratch', ['k']);
+        assert.strictEqual(statements(/^ALTER TABLE `lpb_scratch` DROP PRIMARY KEY/).length, 0, 'the column is not added twice');
+        assert.deepStrictEqual(statements(/^UPDATE `lpb_scratch`/).map((entry) => entry.params), [[10000, 10000]]);
+        assert.deepStrictEqual(tableRows('lpb_scratch').map(r => [r.k, r.id]), [['a', 10001], ['b', 10002], ['c', 10000]]);
+        assert.strictEqual(schema.get('lpb_scratch').nextId, 10003, 'new rows continue after the highest id');
+        // An empty table needs nothing at all.
+        tables.set('lpb_empty', []);
+        schema.set('lpb_empty', {hasId: true, nextId: 10000});
+        log.length = 0;
+        await ensureLpbRowIds('lpb_empty', ['k']);
+        assert.strictEqual(statements(/^(ALTER|UPDATE)/).length, 0);
     });
 
     console.log('\nGET /api/lpb/distances');
@@ -296,13 +448,43 @@ const run = async () => {
         assert.deepStrictEqual(resp.body.override, {p25: 0.4, p50: 1.3});
         // No planner row for Flat Temperate: the untouched brackets fall back to the seed.
         assert.deepStrictEqual(resp.body.effective, {p25: 0.4, p50: 1.3, p75: LPB_SEED_DISTANCES.p75, p95: LPB_SEED_DISTANCES.p95});
-        const writes = statements(/^REPLACE INTO `lpb_user_distances`/);
+        const writes = statements(overrideUpsert);
         assert.strictEqual(writes.length, 1);
+        assert.strictEqual(statements(/^REPLACE INTO `lpb_user_distances`/).length, 0, 'no REPLACE: it would hand the row a new id');
         assert.deepStrictEqual(writes[0].params.slice(0, 7), [TEST_USER.username, 'Mental Illness', 'Flat Temperate', 0.4, 1.3, null, null]);
         assert.ok(/^\d{4}-\d{2}-\d{2}T/.test(writes[0].params[7]), 'updatedAt is an ISO stamp');
+        assert.deepStrictEqual(writes[0].params.slice(8, 12), [0.4, 1.3, null, null], 'the UPDATE half carries the same values');
+        assert.strictEqual(writes[0].params[12], writes[0].params[7]);
         const read = await call('GET', '/api/lpb/distances');
         assert.deepStrictEqual(overridesFor(read.body, 'Flat Temperate'), {p25: 0.4, p50: 1.3});
         assert.deepStrictEqual(overridesFor(read.body, 'Mtn Temperate'), {p50: 1.2}, 'other terrains are untouched');
+        // The new row continues the five-digit ids after the migrated ones.
+        assert.strictEqual(overrideRow('Flat Temperate').id, 10002);
+    });
+
+    await check('saving the same terrain again updates the row in place and keeps its id', async () => {
+        const before = overrideRow('Flat Temperate').id;
+        const resp = await call('PUT', '/api/lpb/distances', {
+            category: 'mentalIllness',
+            terrain: 'Flat Temperate',
+            values: {p25: '0.44', p50: 1.26, p75: 2.5, p95: null}
+        });
+        assert.strictEqual(resp.status, 200);
+        assert.deepStrictEqual(resp.body.override, {p25: 0.4, p50: 1.3, p75: 2.5});
+        const row = overrideRow('Flat Temperate');
+        assert.strictEqual(row.id, before);
+        assert.deepStrictEqual([row.p25, row.p50, row.p75, row.p95], ['0.4', '1.3', '2.5', null]);
+        assert.strictEqual(tableRows(LPB_USER_DISTANCES_TABLE).filter(r => r.username === TEST_USER.username && r.terrain === 'Flat Temperate').length, 1);
+        assert.strictEqual(overrideRow('Mtn Temperate').id, 10001, 'the migrated row is untouched');
+        // Blanking one bracket again is also an in-place update.
+        const back = await call('PUT', '/api/lpb/distances', {
+            category: 'mentalIllness',
+            terrain: 'Flat Temperate',
+            values: {p25: '0.44', p50: 1.26, p75: '', p95: null}
+        });
+        assert.deepStrictEqual(back.body.override, {p25: 0.4, p50: 1.3});
+        assert.strictEqual(overrideRow('Flat Temperate').id, before);
+        assert.strictEqual(overrideRow('Flat Temperate').p75, null);
     });
 
     await check('all-blank values remove the override row and fall back to the planner defaults', async () => {
@@ -315,7 +497,7 @@ const run = async () => {
         assert.strictEqual(resp.status, 200);
         assert.strictEqual(resp.body.override, null);
         assert.deepStrictEqual(resp.body.effective, {p25: 0.7, p50: 1.4, p75: 2.6, p95: 5.1});
-        assert.strictEqual(statements(/^REPLACE INTO `lpb_user_distances`/).length, 0);
+        assert.strictEqual(statements(overrideUpsert).length, 0);
         const deletes = statements(/^DELETE FROM `lpb_user_distances` WHERE username = \? AND category = \? AND terrain = \?$/);
         assert.strictEqual(deletes.length, 1);
         assert.deepStrictEqual(deletes[0].params, [TEST_USER.username, 'Mental Illness', 'Mtn Temperate']);

@@ -21,6 +21,8 @@ const sampleBundle = {
     showTips: true,
     background: 'assets/us-night.jpg',
     parCheckFrequency: 20,
+    caltopoColorSyncHeartbeatMinutes: 5,
+    caltopoColorSyncCooldownSeconds: 30,
     activityLog: [
         {type: 'New Search File', message: 'created', ts: 1},
         {type: 'Edit', message: 'changed region', ts: 2}
@@ -138,6 +140,8 @@ check('settings_page: single record captures settings', () => {
     const plan = buildStructuredPlan(sampleBundle, 'x');
     assert.strictEqual(plan.singles.settings_page.theme, 'dark');
     assert.strictEqual(plan.singles.settings_page.parCheckFrequency, 20);
+    assert.strictEqual(plan.singles.settings_page.caltopoColorSyncHeartbeatMinutes, 5);
+    assert.strictEqual(plan.singles.settings_page.caltopoColorSyncCooldownSeconds, 30);
 });
 
 check('lost_person_behavior: single record captured together with the IPP marker', () => {

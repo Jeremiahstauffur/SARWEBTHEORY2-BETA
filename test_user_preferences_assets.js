@@ -587,7 +587,7 @@ const run = async () => {
             return {title, scope, kind: pill.querySelector('.setting-scope-pill-kind').textContent, name: name.textContent,
                 user: pill.classList.contains('setting-scope-pill--user'), login: pill.classList.contains('setting-scope-pill--login')};
         });
-        assert.ok(pills.length >= 11, `all panels are tagged (${pills.length})`);
+        assert.ok(pills.length >= 12, `all panels are tagged (${pills.length})`);
         ['Theme', 'Geek Mode'].forEach((title) => {
             const pill = pills.find(p => p.title === title);
             assert.strictEqual(pill.scope, 'user', `${title} is a per-user setting`);
@@ -595,7 +595,7 @@ const run = async () => {
             assert.strictEqual(pill.user, true);
         });
         ['Delete Mode', 'Background Image', 'Application Logo', 'Tips Display', 'Par Check Frequency', 'Map Feature Check',
-            'Segment Color Scale', 'CalTopo Proxy Settings', 'Data Synchronization'].forEach((title) => {
+            'CalTopo Color Sync', 'Segment Color Scale', 'CalTopo Proxy Settings', 'Data Synchronization'].forEach((title) => {
             const pill = pills.find(p => p.title === title);
             assert.ok(pill, `${title} is tagged`);
             assert.strictEqual(pill.scope, 'login', `${title} is a per-login setting`);
@@ -716,7 +716,7 @@ const run = async () => {
         assert.ok(/id="personnel-sort-label" class="geek-full"[^>]*>[^<]*<\/span>\s*<span class="geek-abbr"[^>]*>By Team<\/span>/.test(page3), 'Personnel: the sort switch gets a short label');
         const page4 = fs.readFileSync(path.join(__dirname, 'page4.html'), 'utf8');
         assert.ok(/id="sort-label" class="geek-full"[^>]*>[^<]*<\/span>\s*<span class="geek-abbr"[^>]*>Newest First<\/span>/.test(page4), 'Search Log: the sort switch gets a short label');
-        ['Delete Mode', 'Background', 'Logo', 'Tips', 'PAR', 'Map Check', 'Geek'].forEach((title) => {
+        ['Delete Mode', 'Background', 'Logo', 'Tips', 'PAR', 'Map Check', 'Color Sync', 'Geek'].forEach((title) => {
             assert.ok(settingsHtml.includes(`data-geek-compact data-geek-title="${title}"`), `Settings: a panel condenses to "${title}"`);
         });
         assert.ok(/data-setting-scope="user" data-geek-compact>\s*<h2>Theme<\/h2>/.test(settingsHtml), 'Settings: the Theme panel condenses to its two short labels');
