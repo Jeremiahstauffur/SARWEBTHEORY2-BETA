@@ -6,8 +6,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Segments | Search & Rescue Theory Software</title>
   <!-- theme-boot.js must be the first thing in <head>, before the stylesheet: it reads the theme hint cookie, puts <html> in the right theme and paints the 80% boot overlay + spinner before anything else is rendered (preferences themselves come from the server after login). -->
-  <script src="theme-boot.js?v=20260910"></script>
-  <link rel="stylesheet" href="styles.css?v=20260910" />
+  <script src="theme-boot.js?v=20260913"></script>
+  <link rel="stylesheet" href="styles.css?v=20260913" />
 </head>
 <body data-page="page2">
   <div class="site-shell">
@@ -50,8 +50,9 @@
       </section>
 
       <section class="table-card">
+        <!-- data-geek-compact / data-geek-title: in Geek Mode each panel collapses to the short title plus its switch (styles.css, "Geek Mode"). -->
         <div class="home-grid" style="margin-bottom: calc(24px * var(--space-scale, 1));">
-          <div class="home-panel">
+          <div class="home-panel" data-geek-compact data-geek-title="Sort by PSRc">
             <h2>Sorting</h2>
             <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Enable sorting to automatically rank segments by their PSR values.
@@ -61,11 +62,25 @@
                 <input type="checkbox" id="sort-toggle">
                 <span class="slider"></span>
               </label>
-              <span id="sort-label">Sort by PSR (Descending)</span>
+              <span id="sort-label" class="geek-full">Sort by PSR (Descending)</span>
             </div>
           </div>
 
-          <div class="home-panel">
+          <div class="home-panel" id="lpb-panel" data-geek-compact data-geek-title="LPB">
+            <h2>Lost Person Behavior</h2>
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
+              Apply or lift the PSRi adjustment from the Incident page's Lost Person Behavior settings. Switching it off keeps everything entered there.
+            </p>
+            <div class="home-row">
+              <label class="toggle-switch">
+                <input type="checkbox" id="lpb-toggle" checked>
+                <span class="slider"></span>
+              </label>
+              <span id="lpb-label" class="lpb-status geek-full">Lost Person Behavior</span>
+            </div>
+          </div>
+
+          <div class="home-panel" data-geek-compact>
             <h2>Actions</h2>
             <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Import segments from a JSON file to quickly populate your table.
@@ -108,9 +123,9 @@
         </a>
     </nav>
   </div>
-  <script src="map-segment-utils.js?v=20260910"></script>
-  <script src="sync-delta.js?v=20260910"></script>
-  <script src="app.js?v=20260910"></script>
+  <script src="map-segment-utils.js?v=20260913"></script>
+  <script src="sync-delta.js?v=20260913"></script>
+  <script src="app.js?v=20260913"></script>
 
     <div class="notification-sidebar" id="notif-sidebar">
       <div class="notification-header">

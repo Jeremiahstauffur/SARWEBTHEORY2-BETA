@@ -71,6 +71,7 @@
     // Top-level bundle keys that make up the single-record structured tables.
     const SINGLE_TABLE_KEYS = {
         profile: 'profile',
+        lostPersonBehavior: 'lost_person_behavior',
         theme: 'settings_page',
         showTips: 'settings_page',
         geekMode: 'settings_page',

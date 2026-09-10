@@ -17,8 +17,12 @@
   --space-scale: 1;
 }
 
+/* Geek Mode. app.js (applyGeekMode) and theme-boot.js set --geek-space-scale
+   inline on <html> from the padding reduction the login entered on the
+   Settings page (67 % -> 0.33); one third is the fallback for a page that
+   has not been told the percentage yet. */
 html.geek-mode {
-  --space-scale: calc(1 / 3);
+  --space-scale: var(--geek-space-scale, calc(1 / 3));
 }
 
 html.light-mode {
@@ -837,8 +841,15 @@ footer {
   grid-template-columns: 1fr 1fr;
 }
 
+/* Settings page: three equal columns so the small panels are spaced in thirds.
+   Panels marked .full-width still take the whole row (see below). */
+.home-grid.settings-grid {
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+}
+
 @media (max-width: 860px) {
-  .home-grid {
+  .home-grid,
+  .home-grid.settings-grid {
     grid-template-columns: 1fr;
   }
 }
@@ -847,8 +858,9 @@ footer {
   grid-template-columns: 1fr 1fr 1.5fr;
 }
 
+/* Span every column of whichever grid the panel sits in (2, 3, ...). */
 .home-panel.full-width {
-  grid-column: span 3;
+  grid-column: 1 / -1;
 }
 
 @media (max-width: 860px) {
@@ -3534,4 +3546,514 @@ tr.log-sweeps-due::after {
     padding-bottom: calc(7px * var(--space-scale, 1));
     font-size: 0.85rem;
   }
+}
+
+/* Incident page: "Lost Person Behavior" section. The heading carries the
+   shared IPP control (Import IPP button / imported marker pill); below it one
+   accordion row per category (switch, name and - once the switch is on - the
+   terrain dropdown on the same line) with the four-column distance graph. */
+.lpb-section {
+  margin-top: calc(28px * var(--space-scale, 1));
+}
+
+.lpb-section-title-row {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  flex-wrap: wrap;
+  margin-bottom: calc(6px * var(--space-scale, 1));
+}
+
+.lpb-section-header h2 {
+  margin: 0;
+  font-size: 1.2rem;
+}
+
+.lpb-section-ipp {
+  display: flex;
+  align-items: center;
+  min-width: 0;
+}
+
+.lpb-section-header p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.5;
+}
+
+.lpb-category.accordion-container {
+  margin-top: calc(14px * var(--space-scale, 1));
+}
+
+.lpb-category-header {
+  gap: 12px;
+}
+
+/* Switch, name and terrain stay on one line; only a narrow (mobile) screen
+   lets the terrain drop under the name (see the media query below). */
+.lpb-category-controls {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  flex-wrap: nowrap;
+  flex: 1;
+  min-width: 0;
+}
+
+.lpb-category-label {
+  font-weight: 700;
+  font-size: 1.05rem;
+  white-space: nowrap;
+}
+
+/* The terrain dropdown stays tucked away (no width, no opacity) until the
+   category switch is on. */
+.lpb-category-extras {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-wrap: nowrap;
+  max-width: 0;
+  opacity: 0;
+  overflow: hidden;
+  pointer-events: none;
+  transition: max-width 0.35s ease, opacity 0.25s ease;
+}
+
+.lpb-category-extras.is-visible {
+  max-width: 100%;
+  opacity: 1;
+  overflow: visible;
+  pointer-events: auto;
+}
+
+/* The extras, when hidden, must not reserve the flex gap either. */
+.lpb-category-extras:not(.is-visible) {
+  margin-left: -14px;
+}
+
+.lpb-terrain-select.pill-input {
+  min-height: 38px;
+  min-width: 170px;
+  padding-top: calc(6px * var(--space-scale, 1));
+  padding-bottom: calc(6px * var(--space-scale, 1));
+  cursor: pointer;
+}
+
+.lpb-import-ipp-btn.clear-btn {
+  white-space: nowrap;
+}
+
+.lpb-ipp-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  max-width: 100%;
+  min-height: 38px;
+  padding: calc(4px * var(--space-scale, 1)) calc(6px * var(--space-scale, 1)) calc(4px * var(--space-scale, 1)) calc(14px * var(--space-scale, 1));
+  border-radius: 999px;
+  border: 1px solid rgba(var(--accent-rgb), 0.35);
+  background: rgba(var(--accent-rgb), 0.1);
+  font-size: 0.9rem;
+}
+
+.lpb-ipp-pill-label {
+  font-size: 0.7rem;
+  font-weight: 800;
+  letter-spacing: 0.06em;
+  color: var(--accent);
+}
+
+.lpb-ipp-pill-name {
+  font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 220px;
+}
+
+.lpb-ipp-action {
+  appearance: none;
+  border: 1px solid var(--pill-border);
+  background: var(--pill-bg);
+  color: var(--muted);
+  border-radius: 999px;
+  padding: 2px 10px;
+  font-size: 0.75rem;
+  cursor: pointer;
+  line-height: 1.4;
+}
+
+.lpb-ipp-action:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+
+.lpb-ipp-remove {
+  padding: 2px 8px;
+  font-size: 0.95rem;
+}
+
+.lpb-ipp-remove:hover {
+  color: #eb5757;
+  border-color: rgba(235, 87, 87, 0.5);
+}
+
+/* The distance graph: y axis from 0 mi to the largest distance, one column per
+   bracket, the click-to-edit value (and its reset button) under the label. */
+.lpb-chart {
+  display: flex;
+  gap: 14px;
+  padding: calc(18px * var(--space-scale, 1)) calc(20px * var(--space-scale, 1)) calc(20px * var(--space-scale, 1));
+}
+
+.lpb-chart-axis {
+  display: flex;
+  flex-direction: column;
+  justify-content: space-between;
+  height: 170px;
+  min-width: 52px;
+  text-align: right;
+  font-size: 0.72rem;
+  color: var(--muted);
+  padding-right: 6px;
+  border-right: 1px solid var(--line);
+}
+
+.lpb-chart-columns {
+  flex: 1;
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.lpb-chart-col {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+
+.lpb-chart-bar-wrap {
+  width: 100%;
+  height: 170px;
+  display: flex;
+  align-items: flex-end;
+  justify-content: center;
+  border-bottom: 1px solid var(--line);
+}
+
+.lpb-chart-bar {
+  width: 58%;
+  max-width: 76px;
+  min-height: 0;
+  border-radius: 10px 10px 0 0;
+  background: linear-gradient(180deg, rgba(var(--accent-rgb), 0.95), rgba(var(--accent-rgb), 0.45));
+  box-shadow: 0 0 0 1px rgba(var(--accent-rgb), 0.35);
+  transition: height 0.35s ease;
+}
+
+.lpb-chart-col-label {
+  font-weight: 800;
+  font-size: 0.95rem;
+}
+
+.lpb-chart-value-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 100%;
+}
+
+.lpb-chart-value {
+  display: inline-block;
+  min-width: 68px;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px dashed var(--pill-border);
+  background: var(--pill-bg);
+  color: var(--text);
+  font-size: 0.9rem;
+  text-align: center;
+  cursor: text;
+  outline: none;
+  white-space: nowrap;
+}
+
+.lpb-chart-value:hover {
+  border-color: rgba(var(--accent-rgb), 0.6);
+}
+
+.lpb-chart-value:focus {
+  border-style: solid;
+  background: var(--pill-focus);
+  border-color: rgba(var(--accent-rgb), 0.65);
+  box-shadow: 0 0 0 3px rgba(var(--accent-rgb), 0.16);
+}
+
+.lpb-chart-value.is-edited {
+  border-style: solid;
+  border-color: rgba(var(--accent-rgb), 0.55);
+  background: rgba(var(--accent-rgb), 0.1);
+}
+
+.lpb-chart-value.is-empty {
+  color: var(--muted);
+  font-style: italic;
+}
+
+.lpb-reset-btn.reset-pill-btn {
+  flex-shrink: 0;
+}
+
+/* "Import IPP" marker picker */
+.lpb-marker-popup {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.lpb-marker-list {
+  flex: 1;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  min-height: 120px;
+  max-height: 50vh;
+}
+
+.lpb-marker-row {
+  appearance: none;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  width: 100%;
+  padding: calc(10px * var(--space-scale, 1)) calc(16px * var(--space-scale, 1));
+  border-radius: 999px;
+  border: 1px solid var(--pill-border);
+  background: var(--pill-bg);
+  color: var(--text);
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.2s ease, border-color 0.2s ease;
+}
+
+.lpb-marker-row:hover:not(:disabled) {
+  background: var(--pill-focus);
+  border-color: rgba(var(--accent-rgb), 0.65);
+}
+
+.lpb-marker-row:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+
+.lpb-marker-name {
+  font-weight: 600;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.lpb-marker-coords {
+  color: var(--muted);
+  font-size: 0.8rem;
+  font-family: monospace;
+  white-space: nowrap;
+}
+
+.lpb-marker-empty {
+  color: var(--muted);
+  font-size: 0.92rem;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-start;
+}
+
+.lpb-marker-empty p {
+  margin: 0;
+}
+
+/* Segments page: the Lost Person Behavior panel's status line, and the small
+   bracket tag riding the top-right border of a PSRi pill while the adjustment
+   is applied. */
+.lpb-status {
+  color: var(--muted);
+  font-size: 0.9rem;
+}
+
+.lpb-status.lpb-status-active {
+  color: var(--text);
+}
+
+/* Room above the pill for the half of the tag that sits outside it, taken
+   back with the negative margin so the row stays as tall as its neighbours. */
+.psr-cell-container.has-lpb-tag {
+  overflow: visible;
+  padding-top: 7px;
+  margin-top: -7px;
+}
+
+.psri-bracket-tag {
+  position: absolute;
+  top: 7px;
+  right: 14px;
+  transform: translateY(-50%);
+  z-index: 3;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  line-height: 1.5;
+  white-space: nowrap;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+@media (max-width: 768px) {
+  .lpb-category-controls {
+    flex-wrap: wrap;
+  }
+
+  .lpb-category-extras.is-visible {
+    flex-basis: 100%;
+  }
+
+  .lpb-terrain-select.pill-input {
+    width: 100%;
+  }
+
+  .lpb-chart {
+    padding-left: calc(10px * var(--space-scale, 1));
+    padding-right: calc(10px * var(--space-scale, 1));
+  }
+
+  .lpb-chart-columns {
+    gap: 6px;
+  }
+
+  .lpb-chart-value {
+    min-width: 56px;
+    padding: 4px 8px;
+    font-size: 0.82rem;
+  }
+
+  .lpb-ipp-pill-name {
+    max-width: 120px;
+  }
+}
+
+/* ---------------------------------------------------------------------------
+   Geek Mode (html.geek-mode, a login preference - see applyGeekMode in app.js).
+
+   1. Padding. Everything written as calc(Npx * var(--space-scale)) already
+      shrinks with the percentage; the pills, labels and text fields below are
+      additionally freed from the fixed minimum height that would otherwise
+      hold them open at their normal size.
+   2. Condensed panels. A .home-panel marked data-geek-compact drops its
+      heading and description and shows only its controls in one line, with
+      the short title from data-geek-title in front ("LPB", "Sort by PSRc").
+      A long label marked .geek-full gives way to its .geek-abbr sibling
+      (used where the wording, not the whole panel, is what gets shortened:
+      the Personnel / Search Log sort switches, the Theme panel). The grid
+      holding the panels becomes a wrapping row so a condensed panel is only
+      as wide - and as tall - as its content.
+   --------------------------------------------------------------------------- */
+html.geek-mode .pill-cell,
+html.geek-mode .pill-input,
+html.geek-mode .psr-cell-container {
+  min-height: calc(46px * var(--space-scale, 1));
+}
+
+html.geek-mode .header-pill {
+  min-height: calc(42px * var(--space-scale, 1));
+}
+
+.geek-abbr {
+  display: none;
+}
+
+html.geek-mode .geek-full {
+  display: none !important;
+}
+
+html.geek-mode .geek-abbr {
+  display: inline;
+}
+
+html.geek-mode .home-grid {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: flex-start;
+  gap: calc(20px * var(--space-scale, 1)) calc(12px * var(--space-scale, 1));
+}
+
+html.geek-mode .home-grid > .home-panel {
+  flex: 1 1 320px;
+  min-width: 0;
+}
+
+html.geek-mode .home-grid > .home-panel.full-width {
+  flex: 1 1 100%;
+}
+
+html.geek-mode .home-grid > .home-panel[data-geek-compact] {
+  flex: 0 0 auto;
+}
+
+html.geek-mode .home-panel[data-geek-compact] {
+  display: inline-flex;
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: calc(10px * var(--space-scale, 1)) 12px;
+  width: auto;
+  max-width: 100%;
+  padding: calc(18px * var(--space-scale, 1)) calc(24px * var(--space-scale, 1));
+}
+
+html.geek-mode .home-panel[data-geek-compact] > h2,
+html.geek-mode .home-panel[data-geek-compact] > h3,
+html.geek-mode .home-panel[data-geek-compact] > p {
+  display: none;
+}
+
+html.geek-mode .home-panel[data-geek-compact][data-geek-title]::before {
+  content: attr(data-geek-title);
+  font-weight: 700;
+  font-size: 0.95rem;
+  white-space: nowrap;
+}
+
+html.geek-mode .home-panel[data-geek-compact] .home-row,
+html.geek-mode .home-panel[data-geek-compact] .home-actions {
+  gap: 8px;
+  margin: 0 !important;
+}
+
+/* Settings page: the "saved for" pill leaves the panel corner and sits at the
+   end of the condensed line, so the panel needs no extra room at the top. */
+html.geek-mode .home-panel[data-geek-compact].has-scope-pill {
+  padding-top: calc(18px * var(--space-scale, 1));
+}
+
+html.geek-mode .home-panel[data-geek-compact] .setting-scope-pill {
+  position: static;
+  order: 99;
+  max-width: none;
+}
+
+/* Incident page: the Lost Person Behavior section keeps its controls but
+   loses the explanatory paragraph (its heading reads "LPB"). */
+html.geek-mode .lpb-section-header p {
+  display: none;
 }

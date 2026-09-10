@@ -532,7 +532,385 @@
         return `${text} ${verb} on the map but not imported as ${list.length === 1 ? 'a segment' : 'segments'}.`;
     }
 
+    // ------------------------------------------------------------------
+    // Lost Person Behavior (LPB).
+    //
+    // On the Incident page the planner switches on a lost-person category
+    // (today: Mental Illness), picks the terrain and imports the IPP marker
+    // from the CalTopo map. Every category x terrain carries four distances
+    // in miles (to a tenth): how far 25 / 50 / 75 / 95 % of such subjects were
+    // found from the IPP. A segment whose centre lies within one of those
+    // distances falls into the smallest bracket that still contains it, and
+    // its PSR share is divided by that bracket's probability (a segment in the
+    // 25 % bracket gets four times its share, one in the 50 % bracket twice).
+    // Segments farther out than the 95 % distance, and segments without a
+    // shape on the map, keep their normal PSR. Everything here is pure so the
+    // website, the server (seeding and validating the distance tables) and
+    // the tests share one implementation.
+    // ------------------------------------------------------------------
+
+    const LPB_CATEGORIES = [
+        {key: 'mentalIllness', label: 'Mental Illness'}
+    ];
+    const LPB_TERRAINS = ['Mtn Temperate', 'Flat Temperate', 'Dry', 'Urban'];
+    const LPB_DEFAULT_TERRAIN = LPB_TERRAINS[0];
+    const LPB_BRACKETS = [
+        {key: 'p25', percent: 25},
+        {key: 'p50', percent: 50},
+        {key: 'p75', percent: 75},
+        {key: 'p95', percent: 95}
+    ];
+    // Placeholder miles seeded into lpb_default_distances for every category x
+    // terrain; the real numbers are entered in that table by the planner.
+    const LPB_SEED_DISTANCES = {p25: 0.5, p50: 1.0, p75: 1.5, p95: 2.0};
+    const EARTH_RADIUS_MILES = 3958.7613;
+
+    // A category by its bundle key ("mentalIllness") or its table label
+    // ("Mental Illness"); null when unknown.
+    function getLpbCategory(value) {
+        const text = String(value || '').trim().toLowerCase();
+        if (!text) return null;
+        return LPB_CATEGORIES.find(cat => cat.key.toLowerCase() === text || cat.label.toLowerCase() === text) || null;
+    }
+
+    function isLpbTerrain(value) {
+        return LPB_TERRAINS.includes(String(value || '').trim());
+    }
+
+    function normalizeLpbTerrain(value) {
+        const text = String(value || '').trim();
+        return LPB_TERRAINS.includes(text) ? text : LPB_DEFAULT_TERRAIN;
+    }
+
+    // A distance as typed or stored ("0.75", "1 mi", 1.25): miles rounded to a
+    // tenth, or null when it is not a positive number.
+    function normalizeLpbDistanceMiles(value) {
+        if (value === null || value === undefined || value === '') return null;
+        const match = String(value).replace(/,/g, '').match(/-?\d*\.?\d+/);
+        if (!match) return null;
+        const miles = parseFloat(match[0]);
+        if (!Number.isFinite(miles) || miles <= 0) return null;
+        return Math.round(miles * 10) / 10;
+    }
+
+    // {p25, p50, p75, p95} keeping only the brackets that hold a valid
+    // distance; null when none does.
+    function normalizeLpbDistances(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        const out = {};
+        let any = false;
+        LPB_BRACKETS.forEach(bracket => {
+            const miles = normalizeLpbDistanceMiles(value[bracket.key]);
+            if (miles !== null) {
+                out[bracket.key] = miles;
+                any = true;
+            }
+        });
+        return any ? out : null;
+    }
+
+    function isCompleteLpbDistances(value) {
+        const distances = normalizeLpbDistances(value);
+        return !!distances && LPB_BRACKETS.every(bracket => typeof distances[bracket.key] === 'number');
+    }
+
+    // "0.5 mi" - how every distance is shown; '' for an invalid one.
+    function formatLpbMiles(value) {
+        const miles = normalizeLpbDistanceMiles(value);
+        return miles === null ? '' : `${miles.toFixed(1)} mi`;
+    }
+
+    function toFiniteNumber(value) {
+        const num = typeof value === 'number' ? value : parseFloat(value);
+        return Number.isFinite(num) ? num : null;
+    }
+
+    function normalizeLatLng(lat, lng) {
+        const latitude = toFiniteNumber(lat);
+        const longitude = toFiniteNumber(lng);
+        if (latitude === null || longitude === null || Math.abs(latitude) > 90 || Math.abs(longitude) > 180) return null;
+        return {lat: latitude, lng: longitude};
+    }
+
+    // The IPP as kept in the search file: which CalTopo marker it came from and
+    // where it is; null when there is none or the position is unusable.
+    function normalizeLpbIpp(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        const position = normalizeLatLng(value.lat, value.lng);
+        if (!position) return null;
+        const out = {
+            featureId: String(value.featureId || '').trim(),
+            featureName: String(value.featureName || '').trim(),
+            lat: position.lat,
+            lng: position.lng
+        };
+        if (typeof value.importedAt === 'string' && value.importedAt) out.importedAt = value.importedAt;
+        if (typeof value.importedBy === 'string' && value.importedBy) out.importedBy = value.importedBy;
+        return out;
+    }
+
+    // The Lost Person Behavior section of a search file in canonical form:
+    // every known category is present (off unless switched on), the PSR
+    // adjustment is applied unless the Segments page switched it off, and the
+    // distances of a category are the four values the case actually uses (a
+    // copy of the login's values at the time the category / terrain was
+    // chosen, so every device computes the same PSR).
+    function normalizeLostPersonBehavior(value) {
+        const src = (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
+        const rawCategories = (src.categories && typeof src.categories === 'object' && !Array.isArray(src.categories)) ? src.categories : {};
+        const categories = {};
+        LPB_CATEGORIES.forEach(cat => {
+            const raw = (rawCategories[cat.key] && typeof rawCategories[cat.key] === 'object' && !Array.isArray(rawCategories[cat.key])) ? rawCategories[cat.key] : {};
+            categories[cat.key] = {
+                enabled: raw.enabled === true,
+                terrain: normalizeLpbTerrain(raw.terrain),
+                distances: normalizeLpbDistances(raw.distances)
+            };
+        });
+        return {
+            psrAdjustmentEnabled: src.psrAdjustmentEnabled !== false,
+            ipp: normalizeLpbIpp(src.ipp),
+            categories
+        };
+    }
+
+    function meanLngLat(points) {
+        const list = (Array.isArray(points) ? points : []).filter(p => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+        if (!list.length) return null;
+        let lng = 0;
+        let lat = 0;
+        list.forEach(p => { lng += p[0]; lat += p[1]; });
+        return [lng / list.length, lat / list.length];
+    }
+
+    // Area centroid of one lon/lat ring (closed or open), worked out on a local
+    // plane around the first vertex like polygonAreaAcres. Falls back to the
+    // vertex mean for a degenerate ring.
+    function ringCentroidLngLat(ring) {
+        const pts = (Array.isArray(ring) ? ring : []).filter(p => Array.isArray(p) && Number.isFinite(p[0]) && Number.isFinite(p[1]));
+        if (!pts.length) return null;
+        const first = pts[0];
+        const last = pts[pts.length - 1];
+        const isClosed = pts.length > 1 && first[0] === last[0] && first[1] === last[1];
+        const n = isClosed ? pts.length - 1 : pts.length;
+        if (n < 3) return meanLngLat(pts.slice(0, n));
+        const lonRef = first[0];
+        const latRef = first[1];
+        const k = Math.cos(latRef * Math.PI / 180);
+        let area = 0;
+        let cx = 0;
+        let cy = 0;
+        for (let i = 0; i < n; i++) {
+            const p1 = pts[i];
+            const p2 = pts[(i + 1) % n];
+            const x1 = (p1[0] - lonRef) * k;
+            const y1 = p1[1] - latRef;
+            const x2 = (p2[0] - lonRef) * k;
+            const y2 = p2[1] - latRef;
+            const cross = x1 * y2 - x2 * y1;
+            area += cross;
+            cx += (x1 + x2) * cross;
+            cy += (y1 + y2) * cross;
+        }
+        if (Math.abs(area) < 1e-14) return meanLngLat(pts.slice(0, n));
+        cx /= (3 * area);
+        cy /= (3 * area);
+        return [cx / k + lonRef, cy + latRef];
+    }
+
+    // Every centre a geometry contributes, weighted by area for polygons so a
+    // collection of shapes is centred on its ground, not on its stray points.
+    function collectGeometryCenters(geometry, out) {
+        if (!geometry || typeof geometry !== 'object') return;
+        const type = String(geometry.type || '');
+        const coords = geometry.coordinates;
+        if (type === 'Point') {
+            if (Array.isArray(coords) && Number.isFinite(coords[0]) && Number.isFinite(coords[1])) out.push({point: [coords[0], coords[1]], weight: 0});
+        } else if (type === 'MultiPoint' || type === 'LineString') {
+            const mean = meanLngLat(coords);
+            if (mean) out.push({point: mean, weight: 0});
+        } else if (type === 'MultiLineString') {
+            (Array.isArray(coords) ? coords : []).forEach(line => {
+                const mean = meanLngLat(line);
+                if (mean) out.push({point: mean, weight: 0});
+            });
+        } else if (type === 'Polygon') {
+            const centroid = Array.isArray(coords) ? ringCentroidLngLat(coords[0]) : null;
+            if (centroid) out.push({point: centroid, weight: Math.max(polygonAreaAcres([coords[0]]), 1e-9)});
+        } else if (type === 'MultiPolygon') {
+            (Array.isArray(coords) ? coords : []).forEach(polygon => {
+                const centroid = Array.isArray(polygon) ? ringCentroidLngLat(polygon[0]) : null;
+                if (centroid) out.push({point: centroid, weight: Math.max(polygonAreaAcres([polygon[0]]), 1e-9)});
+            });
+        } else if (type === 'GeometryCollection') {
+            (Array.isArray(geometry.geometries) ? geometry.geometries : []).forEach(member => collectGeometryCenters(member, out));
+        }
+    }
+
+    // The centre of a GeoJSON geometry as [lng, lat]: the point itself, the
+    // area centroid of a polygon (area-weighted across several), or the vertex
+    // mean of a line. null when there is nothing usable.
+    function geometryCenterLngLat(geometry) {
+        const centers = [];
+        collectGeometryCenters(geometry, centers);
+        if (!centers.length) return null;
+        const weighted = centers.filter(c => c.weight > 0);
+        const list = weighted.length ? weighted : centers.map(c => ({point: c.point, weight: 1}));
+        let total = 0;
+        let lng = 0;
+        let lat = 0;
+        list.forEach(c => {
+            total += c.weight;
+            lng += c.point[0] * c.weight;
+            lat += c.point[1] * c.weight;
+        });
+        return total > 0 ? [lng / total, lat / total] : null;
+    }
+
+    // The centre of a fetched CalTopo feature as {lat, lng}. Markers without
+    // GeoJSON geometry are read from their position attribute.
+    function getFeatureCenter(feature) {
+        let center = geometryCenterLngLat(feature && feature.geometry);
+        if (!center) {
+            const attrs = feature?.attributes || feature?.properties || {};
+            const pos = attrs.position || attrs.coordinates;
+            if (Array.isArray(pos) && Number.isFinite(pos[0]) && Number.isFinite(pos[1])) {
+                center = [pos[0], pos[1]];
+            } else if (pos && typeof pos === 'object') {
+                const lng = toFiniteNumber(pos.lng !== undefined ? pos.lng : pos.lon);
+                const lat = toFiniteNumber(pos.lat);
+                if (lng !== null && lat !== null) center = [lng, lat];
+            }
+        }
+        if (!center) return null;
+        return normalizeLatLng(center[1], center[0]);
+    }
+
+    // Great-circle distance in miles between two {lat, lng}; null when either
+    // position is unusable.
+    function haversineMiles(a, b) {
+        const from = a ? normalizeLatLng(a.lat, a.lng) : null;
+        const to = b ? normalizeLatLng(b.lat, b.lng) : null;
+        if (!from || !to) return null;
+        const toRad = deg => deg * Math.PI / 180;
+        const dLat = toRad(to.lat - from.lat);
+        const dLng = toRad(to.lng - from.lng);
+        const h = Math.sin(dLat / 2) * Math.sin(dLat / 2)
+            + Math.cos(toRad(from.lat)) * Math.cos(toRad(to.lat)) * Math.sin(dLng / 2) * Math.sin(dLng / 2);
+        return 2 * EARTH_RADIUS_MILES * Math.asin(Math.min(1, Math.sqrt(h)));
+    }
+
+    // The fetched CalTopo shape a Segments row was imported from: by the id in
+    // column 9, else by name (the segment name alone or "Region - Segment").
+    function findFeatureForSegmentRow(features, row) {
+        if (!Array.isArray(features) || !Array.isArray(row)) return null;
+        const rowId = String(row[9] || '').trim();
+        if (rowId && !isSyntheticFeatureId(rowId)) {
+            const byId = features.find(feature => getFeatureIdentity(feature).id === rowId);
+            if (byId) return byId;
+        }
+        const names = [
+            normalizeSegmentName(row[1]),
+            normalizeSegmentName(formatSegmentAssignmentLabel(row[0], row[1]))
+        ].filter(Boolean);
+        if (!names.length) return null;
+        return features.find(feature => names.includes(normalizeSegmentName(getFeatureDisplayName(feature)))) || null;
+    }
+
+    // The bracket a distance from the IPP falls into: the smallest of the four
+    // distances that is at least as far (equal distances go to the smaller
+    // percentage). Beyond the 95 % distance there is no bracket (null) and the
+    // PSR is left alone. `factor` is what the PSR share is multiplied by
+    // (100 / percent: dividing by the bracket's probability).
+    function resolveLpbBracket(distanceMiles, distances) {
+        const distance = toFiniteNumber(distanceMiles);
+        const table = normalizeLpbDistances(distances);
+        if (distance === null || distance < 0 || !table) return null;
+        let best = null;
+        LPB_BRACKETS.forEach(bracket => {
+            const limit = table[bracket.key];
+            if (typeof limit !== 'number' || limit < distance) return;
+            if (!best || limit < best.distance || (limit === best.distance && bracket.percent < best.percent)) {
+                best = {key: bracket.key, percent: bracket.percent, distance: limit, factor: 100 / bracket.percent};
+            }
+        });
+        return best;
+    }
+
+    // Everything the PSR maths needs from a search file, worked out once per
+    // recalculation. `active` is false - with a `reason` - when the adjustment
+    // is switched off on the Segments page ('disabled'), no category is on
+    // ('no-category'), the category has no complete set of distances
+    // ('no-distances') or no IPP was imported ('no-ipp'). With several
+    // categories on, the first one in LPB_CATEGORIES order is used.
+    function buildLpbContext(bundle) {
+        const lpb = normalizeLostPersonBehavior(bundle && bundle.lostPersonBehavior);
+        const map = bundle && Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+        const features = map && Array.isArray(map.features) ? map.features : [];
+        const context = {active: false, reason: '', lpb, features, ipp: lpb.ipp, category: null, terrain: '', distances: null};
+        if (!lpb.psrAdjustmentEnabled) {
+            context.reason = 'disabled';
+            return context;
+        }
+        const category = LPB_CATEGORIES.find(cat => lpb.categories[cat.key] && lpb.categories[cat.key].enabled) || null;
+        if (!category) {
+            context.reason = 'no-category';
+            return context;
+        }
+        const entry = lpb.categories[category.key];
+        context.category = category;
+        context.terrain = entry.terrain;
+        context.distances = entry.distances;
+        if (!isCompleteLpbDistances(entry.distances)) {
+            context.reason = 'no-distances';
+            return context;
+        }
+        if (!lpb.ipp) {
+            context.reason = 'no-ipp';
+            return context;
+        }
+        context.active = true;
+        return context;
+    }
+
+    // How the Lost Person Behavior settings change one Segments row:
+    //   null                                   - the adjustment is not active
+    //   {matched: false, factor: 1}            - no shape on the map for this row
+    //   {matched: true, distanceMiles, bracket, factor}
+    //                                          - bracket is null beyond the 95 %
+    //                                            distance (factor stays 1)
+    function getLpbSegmentAdjustment(row, context) {
+        if (!context || !context.active) return null;
+        const feature = findFeatureForSegmentRow(context.features, row);
+        const center = feature ? getFeatureCenter(feature) : null;
+        if (!center) return {matched: false, distanceMiles: null, bracket: null, factor: 1};
+        const distanceMiles = haversineMiles(center, context.ipp);
+        const bracket = resolveLpbBracket(distanceMiles, context.distances);
+        return {matched: true, distanceMiles, bracket, factor: bracket ? bracket.factor : 1};
+    }
+
     return {
+        LPB_CATEGORIES,
+        LPB_TERRAINS,
+        LPB_DEFAULT_TERRAIN,
+        LPB_BRACKETS,
+        LPB_SEED_DISTANCES,
+        getLpbCategory,
+        isLpbTerrain,
+        normalizeLpbTerrain,
+        normalizeLpbDistanceMiles,
+        normalizeLpbDistances,
+        isCompleteLpbDistances,
+        formatLpbMiles,
+        normalizeLpbIpp,
+        normalizeLostPersonBehavior,
+        geometryCenterLngLat,
+        getFeatureCenter,
+        haversineMiles,
+        findFeatureForSegmentRow,
+        resolveLpbBracket,
+        buildLpbContext,
+        getLpbSegmentAdjustment,
         getFeatureTypeKey,
         getCalTopoApiObjectType,
         captureCalTopoFeatureStyle,

@@ -118,6 +118,10 @@ bundle = {
   },
   forms: {...}, uploads: [...], maps: [...], activityLog: [...],
   profile: {...}, permanentPersonnel: {...}, parChecks: {...},
+  lostPersonBehavior: {           // Incident page "Lost Person Behavior" (canonical, see below)
+    psrAdjustmentEnabled, ipp: {featureId, featureName, lat, lng, ...} | null,
+    categories: { mentalIllness: {enabled, terrain, distances: {p25, p50, p75, p95} | null} }
+  },
   theme, showTips, geekMode, background, deleteMode, parCheckFrequency, ...settings keys,
   lastModified                    // recomputed every save; never diffed
 }
@@ -131,9 +135,27 @@ bundle = {
   `bucketToCaseNumber()`. Isolation is per **login username**, not per PIN. Keep the suffix logic in one place.
 - Server "structured tables" mirror the bundle per `(username, search_case)`:
   `COLLECTION_TABLES` = regions, segments, personnel, search_log, uploaded_files, maps_settings,
-  forms, activity_log; `SINGLE_TABLES` = profile, settings_page. Plus `activity_log_entries`,
-  `declined_assignment_features`, `user_assets`, `users`, `user_settings`, `user_buckets`, `store`.
+  forms, activity_log; `SINGLE_TABLES` = profile, settings_page, lost_person_behavior. Plus
+  `activity_log_entries`, `declined_assignment_features`, `lpb_ipp` (the case's IPP, derived from the
+  bundle section by `syncLostPersonIppTable`), `user_assets`, `users`, `user_settings`, `user_buckets`,
+  `store`. Not per case: `lpb_default_distances` (category × terrain miles, **edited by hand in the DB**,
+  seeded 0.5/1.0/1.5/2.0) and `lpb_user_distances` (a login's edited values, username only).
 - `INTERNAL_STORE_KEYS` (`bundle`, `all-files`, `user-<pin>` presence pings) are **never** a CASE #.
+- **Lost Person Behavior** (`lostPersonBehavior`): the pure maths (`resolveLpbBracket`,
+  `getLpbSegmentAdjustment`, `buildLpbContext`, centroid/haversine) lives in `map-segment-utils.js`;
+  `recalculateEverything()` multiplies a segment's *initial share* by `100 / bracket%` (25 % → ×4), so
+  PSRi, PSRc and Search Log PSR move together. Beyond the 95 % distance, or with no CalTopo shape for the
+  row (`findFeatureForSegmentRow`: column 9 id, else name), the factor is 1. The **case** holds its own
+  copy of the four distances (seeded from the login's `lpb_user_distances` ∪ defaults when a category
+  is switched on / terrain changes) so every device computes the same PSR. Plan:
+  `.junie/plans/lost-person-behavior-psr-adjustment.md`.
+- **Geek Mode** is *not* a bundle key. It lives in the login's `user_settings` preference record
+  (`sar-user-preferences-v1`) **per user account**: `geekModeByUser[<getAccountName>] = {enabled,
+  paddingPercent}`, with the login-level `geekMode` / `geekPaddingPercent` as the fallback for an
+  account without an entry (`getGeekModeRecord`, `saveGeekModePreference`, `applyGeekMode`). The
+  percentage becomes `--geek-space-scale` inline on `<html>` (`html.geek-mode` maps it onto
+  `--space-scale`); the boot hint cookie carries it as `pad<percent>`. Plan:
+  `.junie/plans/geek-mode-per-user-compact-panels.md`.
 
 **Nothing is persisted on the device.** The case lives in memory for the page lifetime; the device
 keeps only login cookies/sessionStorage and the sync-server URL. The `*_STORAGE_KEY` constants are
@@ -176,7 +198,8 @@ overwritten/deleted by the Super-Admin (403 otherwise). `DELETE /api/v1/:bucket`
 
 Key endpoints: `/api/auth/{register,login,history,settings,assets[/:kind]}`,
 `/api/v1/:bucket/{rows,state,activity,declined-assignments,page/:page,all-files,latest,:key}`,
-`/api/v1/tables[/:table]?case=`, `/api/health`, `/api/proxy` + `/api/call` (CalTopo, signed server-side).
+`/api/v1/tables[/:table]?case=`, `GET/PUT /api/lpb/distances` (login-scoped LPB distance defaults +
+overrides), `/api/health`, `/api/proxy` + `/api/call` (CalTopo, signed server-side).
 
 ---
 
@@ -184,9 +207,18 @@ Key endpoints: `/api/auth/{register,login,history,settings,assets[/:kind]}`,
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260910`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260913`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
+- **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
+  columns (Settings), `.dashboard-grid` is `1fr 1fr 1.5fr` (Home). `.home-panel.full-width` spans
+  `1 / -1` so it fills any of them; all collapse to one column at `max-width: 860px` (the mobile breakpoint).
+  In Geek Mode `.home-grid` becomes a wrapping flex row (`styles.css`, "Geek Mode" block at the end).
+- **Geek Mode markup:** a toggle/button panel that should condense gets `data-geek-compact` (and
+  `data-geek-title="LPB"` for the short title shown via `::before`); a long label that should be
+  swapped gets `class="geek-full"` with a `<span class="geek-abbr">` sibling. Nothing else is
+  needed — CSS does the rest. Spacing must be written `calc(Npx * var(--space-scale, 1))` to follow
+  the percentage; a fixed `min-height` needs its own `html.geek-mode` override (see `.pill-cell`).
 - **Theme:** toggle classes on `document.documentElement`, target `html.light-mode` in CSS. Inline
   `--accent`/`--accent-rgb` on `<html>` must win over the class palette.
 - **Code style:** 4-space indent in `app.js`/server (some older blocks are 2-space — match the
@@ -272,6 +304,29 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   Rule: `theme-boot.js` is the first tag in `<head>` and injects its own critical CSS
   (`#sar-boot-style`); `test_user_preferences_assets.js` pins the order and that `styles.css` has no
   `sar-booting::` rules. Bump `?v=` when touching it.
+- **2026-09-09 — vm-sandbox tests and `deepStrictEqual`.** Symptom: an object that printed identically
+  to the expectation failed `assert.deepStrictEqual`. Cause: objects created inside the `vm` context
+  have the context's `Object.prototype`, and `deepStrictEqual` compares prototypes. Rule: pass sandbox
+  values through `JSON.parse(JSON.stringify(...))` (`plain()` in the tests) before deep-equal asserts.
+  Also: `computeBundleChanges` descends one level into a top-level object, so a new section like
+  `lostPersonBehavior` travels as `['lostPersonBehavior', '<key>']` changes — `describeChangeTarget`
+  maps them by `path[0]`, so server mirrors must key off the section, not the full path.
+  (plan: `lost-person-behavior-psr-adjustment.md`)
+- **2026-09-09 — Settings full-width panels overflowed the grid.** Cause: `.home-panel.full-width` used
+  `grid-column: span 3` while `.home-grid` had only 2 columns, so the browser created an implicit
+  third column. Rule: full-width panels use `grid-column: 1 / -1`; give a page its own grid modifier
+  (`settings-grid`) instead of changing the shared `.home-grid` column count.
+- **2026-09-09 — Geek Mode scope.** "Per login" was not enough: several people share one login
+  username and pick themselves from the accounts list, and not all of them want the dense layout.
+  Rule: a *look-and-feel* preference is scoped to the **selected user account** (`data-setting-scope=
+  "user"`), but stored in the login's `user_settings` record keyed by account name
+  (`geekModeByUser`) — the account records in `bundle.accounts` are per case, so writing it there
+  (as the theme is) would make it forget itself in the next CASE #. `test_user_preferences_assets.js`
+  parses `settings.html` with a regex that expects `data-setting-scope` to be the *first* attribute
+  after `class`; put new panel attributes after it. Also: a dynamic label set by a table builder
+  (`sortLabel.textContent = …`) cannot be abbreviated in JS without touching every builder — hide it
+  with `.geek-full` and show a static `.geek-abbr` sibling instead.
+  (plan: `geek-mode-per-user-compact-panels.md`)
 
 ---
 
@@ -290,6 +345,21 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   `activity_log` change). Par checks currently live only as activity-log text + `bundle.parChecks`.
 - `.junie/plans/deletion-aware-lww-sync.md` is an empty placeholder — unknown whether that work happened.
 - Two `patch*.js` families and scratch files clutter the root; safe to delete only with the user's OK.
+- **Pre-existing test failures (not caused by the LPB session, verified against `HEAD`):**
+  `test_custom_search_task.js` ("segment sweep width is carried over like a normal search": `''` vs
+  `'40 ft'`) and `test_ic_report.js` ("the subtitle shows the case # without .json": `No case selected`).
+  Neither is in `package.json` `scripts.test`, which is why `npm test` still passes.
+- Lost Person Behavior follow-ups: `lpb_default_distances` holds the 0.5/1.0/1.5/2.0 placeholders until
+  the planner enters Koester's numbers; only **Mental Illness** exists — a new category is one entry in
+  `LPB_CATEGORIES` (`map-segment-utils.js`) plus a seeded row per terrain; with several categories on,
+  `buildLpbContext` uses the first enabled one (no combining rule was specified).
+- Segment centres come from the fetched CalTopo shape (`maps[0].features`); a segment typed by hand
+  without a linked/like-named shape is never adjusted — the PSRi tooltip says so.
+- Geek Mode follow-ups: only the Segments, Personnel, Search Log, Incident (LPB heading/paragraph) and
+  Settings toggle areas are marked up for condensing; the Maps page toggles (`PSRc Overlay`, `PSRc
+  Assignment Colors`) and the Home dashboard were left as they are. `bundle.geekMode` is still listed in
+  `sync-delta.js` / `buildStructuredPlan` (`settings_page`) as a legacy key that is never written.
+  The percentage input accepts 0–100; 100 removes every scaled padding entirely (allowed on purpose).
 
 ---
 

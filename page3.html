@@ -6,8 +6,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Personnel | Search & Rescue Theory Software</title>
   <!-- theme-boot.js must be the first thing in <head>, before the stylesheet: it reads the theme hint cookie, puts <html> in the right theme and paints the 80% boot overlay + spinner before anything else is rendered (preferences themselves come from the server after login). -->
-  <script src="theme-boot.js?v=20260910"></script>
-  <link rel="stylesheet" href="styles.css?v=20260910" />
+  <script src="theme-boot.js?v=20260913"></script>
+  <link rel="stylesheet" href="styles.css?v=20260913" />
 </head>
 <body data-page="page3">
   <div class="site-shell">
@@ -67,14 +67,16 @@
                     <input type="checkbox" id="on-scene-toggle">
                     <span class="slider"></span>
                   </label>
-                  <span id="on-scene-label">Filter: All Members</span>
+                  <span id="on-scene-label" class="geek-full">Filter: All Members</span>
+                  <span class="geek-abbr" title="Filter: on-scene members only">On Scene</span>
                 </div>
                 <div style="display: flex; align-items: center; gap: 10px;">
                   <label class="toggle-switch">
                     <input type="checkbox" id="personnel-sort-toggle">
                     <span class="slider"></span>
                   </label>
-                  <span id="personnel-sort-label">Sort: Name</span>
+                  <span id="personnel-sort-label" class="geek-full">Sort: Name</span>
+                  <span class="geek-abbr" title="Sort: team then name">By Team</span>
                 </div>
               </div>
               <div class="tool-actions">
@@ -205,9 +207,9 @@
         </a>
     </nav>
   </div>
-  <script src="map-segment-utils.js?v=20260910"></script>
-  <script src="sync-delta.js?v=20260910"></script>
-  <script src="app.js?v=20260910"></script>
+  <script src="map-segment-utils.js?v=20260913"></script>
+  <script src="sync-delta.js?v=20260913"></script>
+  <script src="app.js?v=20260913"></script>
 
     <div class="notification-sidebar" id="notif-sidebar">
       <div class="notification-header">

@@ -6,6 +6,7 @@ const fs = require('fs');
 const path = require('path');
 const mysql = require('mysql2');
 const syncDelta = require('./sync-delta');
+const mapSegmentUtils = require('./map-segment-utils');
 
 const createCredentialHelperFallback = () => {
     const serverEnvironmentState = {
@@ -446,6 +447,76 @@ const initDatabaseSchema = () => {
             declined_at VARCHAR(64),
             PRIMARY KEY (username, search_case, feature_key)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+        // ------------------------------------------------------------------
+        // Lost Person Behavior (see the section of the same name below).
+        // ------------------------------------------------------------------
+
+        // How far from the IPP a lost person of a behaviour category is found,
+        // per terrain type: the 25 / 50 / 75 / 95 % distances in miles. This is
+        // the table the planner edits by hand in the database (no UI writes
+        // it). Every known category x terrain is seeded once with placeholder
+        // miles so the website always finds a complete set; INSERT IGNORE
+        // never overwrites a row the planner already entered. The seed is
+        // chained onto the CREATE's callback because the pool may otherwise
+        // run the INSERTs before the table exists.
+        db.run(`CREATE TABLE IF NOT EXISTS \`${LPB_DEFAULTS_TABLE}\` (
+            category VARCHAR(191) NOT NULL,
+            terrain VARCHAR(64) NOT NULL,
+            p25 DECIMAL(6,1),
+            p50 DECIMAL(6,1),
+            p75 DECIMAL(6,1),
+            p95 DECIMAL(6,1),
+            updatedAt VARCHAR(64),
+            PRIMARY KEY (category, terrain)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`, (err) => {
+            if (err) {
+                console.error(`[DB] could not create ${LPB_DEFAULTS_TABLE}:`, err.message);
+                return;
+            }
+            const seed = mapSegmentUtils.LPB_SEED_DISTANCES;
+            const nowIso = new Date().toISOString();
+            mapSegmentUtils.LPB_CATEGORIES.forEach((category) => {
+                mapSegmentUtils.LPB_TERRAINS.forEach((terrain) => {
+                    db.run(`INSERT IGNORE INTO \`${LPB_DEFAULTS_TABLE}\` (category, terrain, p25, p50, p75, p95, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+                        [category.label, terrain, seed.p25, seed.p50, seed.p75, seed.p95, nowIso]);
+                });
+            });
+        });
+
+        // A login's own version of those distances, edited on the Settings
+        // page. Tied to the login username only (never to a CASE #) so the
+        // edits follow the user onto every device and every case. A NULL
+        // bracket means "no override - use the planner's default".
+        db.run(`CREATE TABLE IF NOT EXISTS \`${LPB_USER_DISTANCES_TABLE}\` (
+            username VARCHAR(191) NOT NULL,
+            category VARCHAR(191) NOT NULL,
+            terrain VARCHAR(64) NOT NULL,
+            p25 DECIMAL(6,1) NULL,
+            p50 DECIMAL(6,1) NULL,
+            p75 DECIMAL(6,1) NULL,
+            p95 DECIMAL(6,1) NULL,
+            updatedAt VARCHAR(64),
+            PRIMARY KEY (username, category, terrain)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+        // The IPP (initial planning point) of a case: which CalTopo marker it
+        // was imported from and where it is, one row per (login, CASE #). It
+        // is derived from bundle.lostPersonBehavior.ipp every time the search
+        // file is saved (see syncLostPersonIppTable) and disappears again when
+        // the IPP is cleared, so the row always matches the search file.
+        db.run(`CREATE TABLE IF NOT EXISTS \`${LPB_IPP_TABLE}\` (
+            username VARCHAR(191) NOT NULL,
+            search_case VARCHAR(191) NOT NULL,
+            feature_id VARCHAR(255),
+            feature_name VARCHAR(255),
+            latitude DOUBLE,
+            longitude DOUBLE,
+            imported_by VARCHAR(255),
+            imported_at VARCHAR(64),
+            updatedAt VARCHAR(64),
+            PRIMARY KEY (username, search_case)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     });
 };
 
@@ -463,8 +534,9 @@ const COLLECTION_TABLES = [
 
 // Tables that hold a single record per (username, search_case).
 const SINGLE_TABLES = [
-    'profile',        // Incident / profile page
-    'settings_page'   // Settings page values
+    'profile',              // Incident / profile page
+    'lost_person_behavior', // Lost Person Behavior settings + IPP (= LPB_TABLE)
+    'settings_page'         // Settings page values
 ];
 
 // Every structured table that can be read back by the website.
@@ -475,6 +547,21 @@ const ACTIVITY_ENTRIES_TABLE = 'activity_log_entries';
 
 // "Declined for now" New Assignment notifications (one row per feature).
 const DECLINED_ASSIGNMENTS_TABLE = 'declined_assignment_features';
+
+// Lost Person Behavior (see the "Lost Person Behavior" section below).
+// lost_person_behavior is the per-case mirror of bundle.lostPersonBehavior and
+// sits in SINGLE_TABLES above, so it gets the generic single-record schema, is
+// served by /api/v1/tables and is wiped by the whole-case delete like the rest.
+const LPB_TABLE = 'lost_person_behavior';
+// The distance table the planner maintains by hand: one row per behaviour
+// category x terrain type with the 25 / 50 / 75 / 95 % distances in miles.
+const LPB_DEFAULTS_TABLE = 'lpb_default_distances';
+// A login's own edits to those distances (a NULL bracket = use the default),
+// tied to the login username only - never to a CASE #.
+const LPB_USER_DISTANCES_TABLE = 'lpb_user_distances';
+// The IPP marker of a case, one row per (login, CASE #), derived from the
+// search file whenever it is saved.
+const LPB_IPP_TABLE = 'lpb_ipp';
 
 // Per-login images from the Settings page (see initDatabaseSchema).
 const USER_ASSETS_TABLE = 'user_assets';
@@ -550,8 +637,17 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
     const formsObj = bundle.forms && typeof bundle.forms === 'object' ? bundle.forms : {};
     const formsArr = Object.keys(formsObj).map((key) => ({ key, value: formsObj[key] }));
 
+    // The Lost Person Behavior section is optional (files from older builds
+    // never had it). Only a file that carries it gets its IPP mirrored into
+    // lpb_ipp - with lostPersonIpp null when the IPP is missing or unusable, so
+    // the row is removed again - and a file without it leaves that table alone.
+    const lpb = bundle.lostPersonBehavior;
+    const hasLostPersonBehavior = !!(lpb && typeof lpb === 'object' && !Array.isArray(lpb));
+
     return {
         searchCase,
+        hasLostPersonBehavior,
+        lostPersonIpp: hasLostPersonBehavior ? mapSegmentUtils.normalizeLpbIpp(lpb.ipp) : null,
         collections: {
             regions: collection(regionRows, (row) => ({ label: Array.isArray(row) ? row[0] : '', data: row })),
             segments: collection(pages.page2, (row) => ({ label: Array.isArray(row) ? row[0] : '', data: row })),
@@ -564,6 +660,7 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
         },
         singles: {
             profile: bundle.profile || {},
+            lost_person_behavior: bundle.lostPersonBehavior || {},
             settings_page: {
                 theme: bundle.theme,
                 showTips: bundle.showTips,
@@ -585,6 +682,26 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
             }
         }
     };
+};
+
+// Keep the IPP marker of a case in its own table (lpb_ipp, one row per login
+// and CASE #) besides the JSON mirror in lost_person_behavior, so the database
+// answers "where is the IPP of this case" without parsing the search file.
+// A file without a Lost Person Behavior section issues no SQL at all (older
+// files, bookkeeping payloads); a file whose IPP is gone or unusable loses its
+// row, so the table always reflects the current search file.
+const syncLostPersonIppTable = async (username, searchCase, plan, nowIso) => {
+    if (!username || !searchCase || !plan || !plan.hasLostPersonBehavior) { return; }
+    const ipp = plan.lostPersonIpp;
+    if (!ipp) {
+        await runAsync(`DELETE FROM \`${LPB_IPP_TABLE}\` WHERE username = ? AND search_case = ?`, [username, searchCase]);
+        return;
+    }
+    await runAsync(
+        `REPLACE INTO \`${LPB_IPP_TABLE}\` (username, search_case, feature_id, feature_name, latitude, longitude, imported_by, imported_at, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+        [username, searchCase, toLabel(ipp.featureId) || null, toLabel(ipp.featureName) || null, ipp.lat, ipp.lng,
+            toLabel(ipp.importedBy) || null, ipp.importedAt ? String(ipp.importedAt).slice(0, 64) : null, nowIso]
+    );
 };
 
 // Break a saved bundle into the structured tables above, tagged with the
@@ -614,6 +731,8 @@ const decomposeBundleToTables = async (username, fallbackCase, bundle) => {
             [username, searchCase, JSON.stringify(singles[table] ?? {}), nowIso]
         );
     }
+
+    await syncLostPersonIppTable(username, searchCase, plan, nowIso);
 };
 
 // Write ONE row of a row-collection table. The collection tables key on an
@@ -696,6 +815,12 @@ const applyChangesToTables = async (username, fallbackCase, bundle, changes) => 
             `REPLACE INTO \`${table}\` (username, search_case, data, updatedAt) VALUES (?, ?, ?, ?)`,
             [username, searchCase, JSON.stringify(singles[table] ?? {}), nowIso]
         );
+    }
+
+    // A change anywhere under bundle.lostPersonBehavior may have moved or
+    // cleared the IPP; the marker table follows the JSON mirror.
+    if (singlesToWrite.has(LPB_TABLE)) {
+        await syncLostPersonIppTable(username, searchCase, plan, nowIso);
     }
 };
 
@@ -862,6 +987,14 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports.USER_ASSETS_TABLE = USER_ASSETS_TABLE;
     module.exports.USER_ASSET_KINDS = USER_ASSET_KINDS;
     module.exports.DECLINED_ASSIGNMENTS_TABLE = DECLINED_ASSIGNMENTS_TABLE;
+    module.exports.LPB_TABLE = LPB_TABLE;
+    module.exports.LPB_DEFAULTS_TABLE = LPB_DEFAULTS_TABLE;
+    module.exports.LPB_USER_DISTANCES_TABLE = LPB_USER_DISTANCES_TABLE;
+    module.exports.LPB_IPP_TABLE = LPB_IPP_TABLE;
+    module.exports.syncLostPersonIppTable = syncLostPersonIppTable;
+    // The schema builder is exposed so a test can check the seed rows are
+    // written after (not alongside) the CREATE they depend on.
+    module.exports.initDatabaseSchema = initDatabaseSchema;
     module.exports.activityEntryId = activityEntryId;
     module.exports.collectActivityEntryChanges = collectActivityEntryChanges;
     module.exports.isInternalStoreKey = isInternalStoreKey;
@@ -1330,6 +1463,10 @@ const getAsync = (sql, params = []) => new Promise((resolve, reject) => {
     db.get(sql, params, (err, row) => err ? reject(err) : resolve(row));
 });
 
+const allAsync = (sql, params = []) => new Promise((resolve, reject) => {
+    db.all(sql, params, (err, rows) => err ? reject(err) : resolve(rows || []));
+});
+
 // Serialize every write for one bucket so a read-modify-write of the stored
 // bundle can never lose a concurrent device's row.
 const bucketWriteQueues = new Map();
@@ -1616,6 +1753,172 @@ app.delete('/api/v1/:bucket/declined-assignments/:featureKey', authMiddleware, (
         });
 });
 
+// ---------------------------------------------------------------------------
+// Lost Person Behavior
+// ---------------------------------------------------------------------------
+// How far from the IPP a lost person of a behaviour category is usually found,
+// per terrain type, as the 25 / 50 / 75 / 95 % distances in miles. The planner
+// keeps the base numbers in lpb_default_distances by hand; a login may replace
+// single brackets on the Settings page, and those edits live in
+// lpb_user_distances under the login username only - so they apply to every
+// case and every device of that login, never to another login. The website
+// always receives the complete picture: a default for every category x terrain
+// (the seed placeholder standing in for a row the table does not have) plus
+// this login's overrides. The IPP itself travels inside the search file
+// (bundle.lostPersonBehavior.ipp) and is mirrored into lpb_ipp on every save
+// (see syncLostPersonIppTable); there is no separate endpoint for it.
+//   GET /api/lpb/distances  -> {categories, terrains, brackets, defaults, overrides}
+//   PUT /api/lpb/distances  body {category, terrain, values: {p25, p50, p75, p95}}
+
+// The four brackets of a table row as numbers. mysql2 hands DECIMAL columns
+// back as strings, and anything that is not a positive number becomes null.
+const lpbRowDistances = (row) => {
+    const out = {};
+    mapSegmentUtils.LPB_BRACKETS.forEach((bracket) => {
+        out[bracket.key] = mapSegmentUtils.normalizeLpbDistanceMiles(row ? row[bracket.key] : null);
+    });
+    return out;
+};
+
+// Only the brackets that hold a value; null when none does.
+const lpbDefinedDistances = (distances) => {
+    const out = {};
+    mapSegmentUtils.LPB_BRACKETS.forEach((bracket) => {
+        if (distances && typeof distances[bracket.key] === 'number') { out[bracket.key] = distances[bracket.key]; }
+    });
+    return Object.keys(out).length ? out : null;
+};
+
+// The (category label, terrain) a table row belongs to; null for a row whose
+// category or terrain the website does not know.
+const lpbRowKey = (row) => {
+    const category = mapSegmentUtils.getLpbCategory(row && row.category);
+    const terrain = String((row && row.terrain) || '').trim();
+    if (!category || !mapSegmentUtils.isLpbTerrain(terrain)) { return null; }
+    return {label: category.label, terrain};
+};
+
+// defaults[category label][terrain] for every known combination: the
+// planner's row when there is one, else the seed placeholders.
+const buildLpbDefaults = (rows) => {
+    const defaults = {};
+    mapSegmentUtils.LPB_CATEGORIES.forEach((category) => {
+        defaults[category.label] = {};
+        mapSegmentUtils.LPB_TERRAINS.forEach((terrain) => {
+            defaults[category.label][terrain] = {...mapSegmentUtils.LPB_SEED_DISTANCES};
+        });
+    });
+    (rows || []).forEach((row) => {
+        const key = lpbRowKey(row);
+        if (key) { defaults[key.label][key.terrain] = lpbRowDistances(row); }
+    });
+    return defaults;
+};
+
+// overrides[category label][terrain] = only the brackets this login replaced.
+const buildLpbOverrides = (rows) => {
+    const overrides = {};
+    (rows || []).forEach((row) => {
+        const key = lpbRowKey(row);
+        const defined = key ? lpbDefinedDistances(lpbRowDistances(row)) : null;
+        if (!defined) { return; }
+        if (!overrides[key.label]) { overrides[key.label] = {}; }
+        overrides[key.label][key.terrain] = defined;
+    });
+    return overrides;
+};
+
+// Bracket by bracket: the login's override, else the planner's default, else
+// the seed placeholder - the numbers the login actually works with.
+const effectiveLpbDistances = (override, defaults) => {
+    const out = {};
+    mapSegmentUtils.LPB_BRACKETS.forEach((bracket) => {
+        const own = override ? override[bracket.key] : null;
+        const base = defaults ? defaults[bracket.key] : null;
+        out[bracket.key] = typeof own === 'number' ? own
+            : (typeof base === 'number' ? base : mapSegmentUtils.LPB_SEED_DISTANCES[bracket.key]);
+    });
+    return out;
+};
+
+// Everything the Settings page needs to show and edit the distances.
+app.get('/api/lpb/distances', authMiddleware, async (req, res) => {
+    const username = req.user.username;
+    try {
+        const defaultRows = await allAsync(`SELECT category, terrain, p25, p50, p75, p95 FROM \`${LPB_DEFAULTS_TABLE}\``);
+        const userRows = await allAsync(`SELECT category, terrain, p25, p50, p75, p95 FROM \`${LPB_USER_DISTANCES_TABLE}\` WHERE username = ?`, [username]);
+        res.json({
+            categories: mapSegmentUtils.LPB_CATEGORIES,
+            terrains: mapSegmentUtils.LPB_TERRAINS,
+            brackets: mapSegmentUtils.LPB_BRACKETS,
+            defaults: buildLpbDefaults(defaultRows),
+            overrides: buildLpbOverrides(userRows)
+        });
+    } catch (err) {
+        console.error('[LPB] distances read failed:', err.message);
+        res.status(500).json({error: 'Failed to read Lost Person Behavior distances'});
+    }
+});
+
+// One category x terrain of this login's overrides. Each bracket is either a
+// distance in miles (kept to a tenth) or empty - null / '' / left out - which
+// means "use the default" for that bracket; a row with every bracket empty is
+// removed so the login is back on the planner's numbers. `category` may be
+// the bundle key ("mentalIllness") or the label; the label is what is stored.
+app.put('/api/lpb/distances', authMiddleware, async (req, res) => {
+    const username = req.user.username;
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const category = mapSegmentUtils.getLpbCategory(body.category);
+    const terrain = String(body.terrain || '').trim();
+    if (!category) {
+        return res.status(400).json({error: 'Unknown Lost Person Behavior category'});
+    }
+    if (!mapSegmentUtils.isLpbTerrain(terrain)) {
+        return res.status(400).json({error: 'Unknown terrain type'});
+    }
+    const values = body.values && typeof body.values === 'object' && !Array.isArray(body.values) ? body.values : {};
+    const override = {};
+    for (const bracket of mapSegmentUtils.LPB_BRACKETS) {
+        const raw = values[bracket.key];
+        if (raw === null || raw === undefined || raw === '') {
+            override[bracket.key] = null;
+            continue;
+        }
+        const miles = mapSegmentUtils.normalizeLpbDistanceMiles(raw);
+        if (miles === null) {
+            return res.status(400).json({error: `The ${bracket.percent}% distance must be a positive number of miles`});
+        }
+        override[bracket.key] = miles;
+    }
+
+    const stored = lpbDefinedDistances(override);
+    const nowIso = new Date().toISOString();
+    try {
+        if (stored) {
+            await runAsync(
+                `REPLACE INTO \`${LPB_USER_DISTANCES_TABLE}\` (username, category, terrain, p25, p50, p75, p95, updatedAt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+                [username, category.label, terrain, override.p25, override.p50, override.p75, override.p95, nowIso]
+            );
+        } else {
+            await runAsync(
+                `DELETE FROM \`${LPB_USER_DISTANCES_TABLE}\` WHERE username = ? AND category = ? AND terrain = ?`,
+                [username, category.label, terrain]
+            );
+        }
+        const defaults = buildLpbDefaults(await allAsync(`SELECT category, terrain, p25, p50, p75, p95 FROM \`${LPB_DEFAULTS_TABLE}\``));
+        res.json({
+            success: true,
+            category: category.label,
+            terrain,
+            override: stored,
+            effective: effectiveLpbDistances(override, defaults[category.label][terrain])
+        });
+    } catch (err) {
+        console.error('[LPB] distances write failed:', err.message);
+        res.status(500).json({error: 'Failed to save Lost Person Behavior distances'});
+    }
+});
+
 // Read back a single page of the stored search file.
 app.get('/api/v1/:bucket/page/:page', authMiddleware, async (req, res) => {
     const {bucket, page} = req.params;
@@ -1799,9 +2102,9 @@ app.delete('/api/v1/:bucket', authMiddleware, async (req, res) => {
             await runAsync("DELETE FROM user_buckets WHERE username = ? AND bucket = ?", [userName, bucket]);
             // 3) Structured rows for the specific CASE # (never the shared 'bundle'
             //    store key, which is common to every case), including the per-entry
-            //    activity log rows.
+            //    activity log rows, the declined assignments and the IPP marker.
             for (const searchCase of searchCases) {
-                for (const table of [...STRUCTURED_TABLES, ACTIVITY_ENTRIES_TABLE, DECLINED_ASSIGNMENTS_TABLE]) {
+                for (const table of [...STRUCTURED_TABLES, ACTIVITY_ENTRIES_TABLE, DECLINED_ASSIGNMENTS_TABLE, LPB_IPP_TABLE]) {
                     await runAsync(`DELETE FROM \`${table}\` WHERE username = ? AND search_case = ?`, [userName, searchCase]);
                 }
             }

@@ -6,8 +6,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Settings | Search & Rescue Theory Software</title>
   <!-- theme-boot.js must be the first thing in <head>, before the stylesheet: it reads the theme hint cookie, puts <html> in the right theme and paints the 80% boot overlay + spinner before anything else is rendered (preferences themselves come from the server after login). -->
-  <script src="theme-boot.js?v=20260910"></script>
-  <link rel="stylesheet" href="styles.css?v=20260910" />
+  <script src="theme-boot.js?v=20260913"></script>
+  <link rel="stylesheet" href="styles.css?v=20260913" />
 </head>
 <body data-page="settings">
   <div class="site-shell">
@@ -46,8 +46,9 @@
       </section>
 
       <section class="table-card home-card">
-        <div class="home-grid">
-          <div class="home-panel" data-setting-scope="login">
+        <!-- data-geek-compact / data-geek-title: in Geek Mode a panel collapses to the short title plus its controls (styles.css, "Geek Mode"); a .geek-full label gives way to its .geek-abbr sibling. -->
+        <div class="home-grid settings-grid">
+          <div class="home-panel" data-setting-scope="login" data-geek-compact data-geek-title="Delete Mode">
             <h2>Delete Mode</h2>
             <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               When ON, rows are deleted immediately. When OFF, you will be asked for confirmation.
@@ -57,11 +58,11 @@
                 <input type="checkbox" id="delete-mode-toggle">
                 <span class="slider"></span>
               </label>
-              <span id="delete-mode-label">Delete Mode is OFF</span>
+              <span id="delete-mode-label" class="geek-full">Delete Mode is OFF</span>
             </div>
           </div>
 
-          <div class="home-panel" data-setting-scope="login">
+          <div class="home-panel" data-setting-scope="login" data-geek-compact data-geek-title="Background">
             <h2>Background Image</h2>
             <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Choose a new background image for the application. The image is stored on the server under your login and shown instead of the default until you choose Use Default.
@@ -75,7 +76,7 @@
             </div>
           </div>
 
-          <div class="home-panel" data-setting-scope="login">
+          <div class="home-panel" data-setting-scope="login" data-geek-compact data-geek-title="Logo">
             <h2>Application Logo</h2>
             <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Choose a logo to display in the header. The image is stored on the server under your login and kept until you choose Remove Logo.
@@ -89,7 +90,7 @@
             </div>
           </div>
 
-          <div class="home-panel" data-setting-scope="user">
+          <div class="home-panel" data-setting-scope="user" data-geek-compact>
             <h2>Theme</h2>
             <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Switch between Dark Mode and Light Mode.
@@ -99,7 +100,8 @@
                 <input type="checkbox" id="theme-toggle">
                 <span class="slider"></span>
               </label>
-              <span id="theme-label">Dark Mode</span>
+              <span id="theme-label" class="geek-full">Dark Mode</span>
+              <span class="geek-abbr" title="Light Mode when on, Dark Mode when off">Light Mode</span>
             </div>
             <p style="margin: calc(20px * var(--space-scale, 1)) 0 calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               When ON, the site's accent color uses your personal highlight color. When OFF, the default blue accent is used.
@@ -109,11 +111,12 @@
                 <input type="checkbox" id="highlight-accent-toggle">
                 <span class="slider"></span>
               </label>
-              <span id="highlight-accent-label">Use My Highlight Color is OFF</span>
+              <span id="highlight-accent-label" class="geek-full">Use My Highlight Color is OFF</span>
+              <span class="geek-abbr" title="Use My Highlight Color as the site accent">My Highlight</span>
             </div>
           </div>
 
-          <div class="home-panel" data-setting-scope="login">
+          <div class="home-panel" data-setting-scope="login" data-geek-compact data-geek-title="Tips">
             <h2>Tips Display</h2>
             <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               When ON, informational text tips are displayed throughout the site. When OFF, they are hidden.
@@ -123,22 +126,23 @@
                 <input type="checkbox" id="tips-toggle">
                 <span class="slider"></span>
               </label>
-              <span id="tips-label">Tips are ON</span>
+              <span id="tips-label" class="geek-full">Tips are ON</span>
             </div>
           </div>
 
-          <div class="home-panel" data-setting-scope="login">
+          <div class="home-panel" data-setting-scope="login" data-geek-compact data-geek-title="PAR">
             <h2>Par Check Frequency</h2>
             <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
               Set the reminder frequency for Par Checks in minutes. Default is 20 minutes.
             </p>
             <div class="home-row">
               <input type="number" id="par-freq-input" class="pill-cell" style="width: 80px; text-align: center;" min="1" step="1">
-              <span id="par-freq-label" style="margin-left: calc(10px * var(--space-scale, 1));">minutes</span>
+              <span id="par-freq-label" class="geek-full" style="margin-left: calc(10px * var(--space-scale, 1));">minutes</span>
+              <span class="geek-abbr" title="Par check reminder frequency in minutes">min</span>
             </div>
           </div>
 
-          <div class="home-panel" data-setting-scope="login">
+          <div class="home-panel" data-setting-scope="login" data-geek-compact data-geek-title="Map Check">
             <h2>Map Feature Check</h2>
             <p style="margin-bottom: 15px; color: var(--muted); font-size: 0.95rem;">
               When ON, the app re-fetches the CalTopo map every 5 minutes and sends a notification naming any
@@ -150,7 +154,31 @@
                 <input type="checkbox" id="map-auto-check-toggle">
                 <span class="slider"></span>
               </label>
-              <span id="map-auto-check-label">Automatic check is ON</span>
+              <span id="map-auto-check-label" class="geek-full">Automatic check is ON</span>
+            </div>
+          </div>
+
+          <div class="home-panel" data-setting-scope="user" data-geek-compact data-geek-title="Geek">
+            <h2>Geek Mode</h2>
+            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
+              When ON, the padding of every pill button, label and text field across the site is reduced by the percentage
+              below, and the toggle panels on every page (Sorting, Lost Person Behavior, Actions, these settings) collapse to
+              short titles next to their switches. When OFF, the standard spacing and full descriptions are used. Kept for
+              the selected user, so people sharing this login each get their own choice.
+            </p>
+            <div class="home-row" style="margin-bottom: calc(15px * var(--space-scale, 1));">
+              <label class="toggle-switch">
+                <input type="checkbox" id="geek-mode-toggle">
+                <span class="slider"></span>
+              </label>
+              <span id="geek-mode-label" class="geek-full">Geek Mode is OFF</span>
+            </div>
+            <div class="home-row">
+              <input class="pill-cell no-spinner-number-input" id="geek-padding-input" inputmode="numeric" max="100" min="0"
+                     step="1" style="width: 90px; text-align: center;" type="number" value="67"
+                     title="Percentage taken off the padding of pill buttons, labels and text fields while Geek Mode is on">
+              <span id="geek-padding-label" class="geek-full">% less padding on pill buttons, labels and text fields</span>
+              <span class="geek-abbr" title="Percentage taken off the padding of pill buttons, labels and text fields">% less padding</span>
             </div>
           </div>
 
@@ -219,20 +247,6 @@
               </label>
             </div>
             <div id="segment-search-opacity-label" style="margin-top: 10px; font-size: 0.85rem; color: var(--muted);"></div>
-          </div>
-
-          <div class="home-panel" data-setting-scope="login">
-            <h2>Geek Mode</h2>
-            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
-              When ON, padding and margins across the site are reduced to one third of their normal size for a denser layout. When OFF, the standard spacing is used.
-            </p>
-            <div class="home-row">
-              <label class="toggle-switch">
-                <input type="checkbox" id="geek-mode-toggle">
-                <span class="slider"></span>
-              </label>
-              <span id="geek-mode-label">Geek Mode is OFF</span>
-            </div>
           </div>
 
           <div class="home-panel full-width" data-setting-scope="login">
@@ -312,9 +326,9 @@
         </a>
     </nav>
   </div>
-  <script src="map-segment-utils.js?v=20260910"></script>
-  <script src="sync-delta.js?v=20260910"></script>
-  <script src="app.js?v=20260910"></script>
+  <script src="map-segment-utils.js?v=20260913"></script>
+  <script src="sync-delta.js?v=20260913"></script>
+  <script src="app.js?v=20260913"></script>
 
     <div class="notification-sidebar" id="notif-sidebar">
       <div class="notification-header">

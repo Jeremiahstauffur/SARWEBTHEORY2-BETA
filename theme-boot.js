@@ -9,8 +9,9 @@
 //
 //   1. app.js leaves a small hint cookie ("sar-ui-hint") with the theme it
 //      last applied for this login. It is read here so the very first paint is
-//      already in the right theme. It holds no data - only "light"/"dark" and
-//      whether Geek Mode was on - and app.js overwrites it on every load.
+//      already in the right theme. It holds no data - only "light"/"dark",
+//      whether Geek Mode was on and its padding reduction ("pad67") - and
+//      app.js overwrites it on every load.
 //   2. The canvas colour, the overlay and the spinner are injected here as an
 //      inline <style>, so they apply even while styles.css is still on its way
 //      (a stylesheet loaded later would otherwise leave a white or dark flash),
@@ -31,7 +32,19 @@
 
     var flags = hint.split(',');
     if (flags.indexOf('light') !== -1) html.classList.add('light-mode');
-    if (flags.indexOf('geek') !== -1) html.classList.add('geek-mode');
+    if (flags.indexOf('geek') !== -1) {
+        html.classList.add('geek-mode');
+        // "pad<percent>": how much Geek Mode takes off every padding. Written
+        // as the --space-scale factor app.js will set again (applyGeekMode),
+        // so the compact layout is already right on the first paint.
+        for (var i = 0; i < flags.length; i++) {
+            var pad = /^pad(\d{1,3})$/.exec(flags[i]);
+            if (pad && html.style && html.style.setProperty) {
+                var percent = Math.min(100, Math.max(0, parseInt(pad[1], 10)));
+                html.style.setProperty('--geek-space-scale', String(Math.round((100 - percent) * 10) / 1000));
+            }
+        }
+    }
 
     // Critical CSS: the page's own canvas colour per theme (what shows before
     // styles.css has arrived) and the boot overlay + spinner. Kept here, not in

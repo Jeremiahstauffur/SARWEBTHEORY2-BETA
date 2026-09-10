@@ -14,6 +14,12 @@
 //     and then switching to light.
 //   * Every Settings panel carries a pill naming who it is saved for: the
 //     selected user (per-account settings) or the username that is logged in.
+//   * Geek Mode lives in the login's record too, but per USER ACCOUNT (people
+//     sharing a login username each keep their own choice); its padding
+//     reduction percentage is stored with it, applied to <html> as
+//     --geek-space-scale, carried in the boot hint so the first paint is
+//     already compact, and the toggle panels are marked up so styles.css can
+//     condense them to short titles.
 //
 // The real app.js runs in a sandbox (fake DOM, in-memory store) against the
 // real sync-server.js, whose MySQL pool is replaced by an in-memory stand-in.
@@ -181,9 +187,14 @@ const BG_DATA = 'data:image/jpeg;base64,/9j/4AAQSkZJRgABAQAAAQABAAD/2wBDAP//////
 // A small fake element with a working classList, dataset and children.
 function makeElement(tag = 'div') {
     const classes = new Set();
+    const styleProps = {};
     const el = {
         tagName: tag.toUpperCase(),
-        style: {setProperty() {}, removeProperty() {}},
+        style: {
+            setProperty(name, value) { styleProps[name] = String(value); },
+            removeProperty(name) { delete styleProps[name]; },
+            getPropertyValue(name) { return Object.prototype.hasOwnProperty.call(styleProps, name) ? styleProps[name] : ''; }
+        },
         dataset: {},
         classList: {
             add: (...names) => names.forEach(n => classes.add(n)),
@@ -273,7 +284,7 @@ function buildSettingsDom(body) {
     logo.style.display = 'none';
     body.appendChild(logo);
     const panels = [];
-    const re = /<div class="home-panel[^"]*" data-setting-scope="(user|login)">\s*(?:<div[^>]*>\s*)?<h2[^>]*>([^<]+)<\/h2>/g;
+    const re = /<div class="home-panel[^"]*" data-setting-scope="(user|login)"[^>]*>\s*(?:<div[^>]*>\s*)?<h2[^>]*>([^<]+)<\/h2>/g;
     let m;
     while ((m = re.exec(settingsHtml))) {
         const panel = makeElement('div');
@@ -461,9 +472,14 @@ const run = async () => {
     });
 
     await check('the hint cookie puts the page in light mode (and Geek Mode) before the first paint, under the boot overlay', () => {
-        const light = createSandbox({baseUrl, cookies: {'sar-ui-hint': 'light,geek'}});
+        const light = createSandbox({baseUrl, cookies: {'sar-ui-hint': 'light,geek,pad50'}});
         assert.ok(light.__html.classList.contains('light-mode'), 'light-mode is on before app.js ran');
         assert.ok(light.__html.classList.contains('geek-mode'));
+        assert.strictEqual(light.__html.style.getPropertyValue('--geek-space-scale'), '0.5', 'the padding reduction from the hint is applied before the first paint');
+        const legacy = createSandbox({baseUrl, cookies: {'sar-ui-hint': 'dark,geek'}});
+        assert.ok(legacy.__html.classList.contains('geek-mode'), 'a hint without a percentage still switches Geek Mode on');
+        assert.strictEqual(legacy.__html.style.getPropertyValue('--geek-space-scale'), '', 'and leaves the one-third fallback in styles.css in force');
+        assert.ok(/html\.geek-mode \{\s*--space-scale: var\(--geek-space-scale, calc\(1 \/ 3\)\);/.test(stylesSource), 'styles.css reads the percentage from --geek-space-scale');
         assert.ok(light.__html.classList.contains('sar-booting'), 'the overlay is up');
         const injected = light.document.head.children.find(c => c.id === 'sar-boot-style');
         assert.ok(injected, 'the overlay/canvas CSS is injected into <head> by theme-boot.js');
@@ -557,7 +573,9 @@ const run = async () => {
         assert.strictEqual(settings.__dom.logo.style.display, '');
         assert.ok(String(settings.document.body.style.backgroundImage).includes(BG_DATA), 'the uploaded background photo is used instead of the default');
         await waitFor(() => !settings.__html.classList.contains('sar-booting'), 'the boot overlay to be removed');
-        assert.strictEqual(settings.__cookies['sar-ui-hint'], 'dark,geek', 'the hint for the next page load names the applied theme and Geek Mode');
+        assert.strictEqual(settings.__cookies['sar-ui-hint'], 'dark,geek,pad67', 'the hint for the next page load names the applied theme, Geek Mode and its padding reduction');
+        assert.strictEqual(settings.__html.style.getPropertyValue('--geek-space-scale'), '0.33', 'a login without a stored percentage gets the one-third default');
+        assert.strictEqual(String(settings.__byId['geek-padding-input'].value), '67');
     });
 
     await check('every Settings panel carries a pill naming who it is saved for', () => {
@@ -570,12 +588,14 @@ const run = async () => {
                 user: pill.classList.contains('setting-scope-pill--user'), login: pill.classList.contains('setting-scope-pill--login')};
         });
         assert.ok(pills.length >= 11, `all panels are tagged (${pills.length})`);
-        const theme = pills.find(p => p.title === 'Theme');
-        assert.strictEqual(theme.scope, 'user', 'the theme is a per-user setting');
-        assert.strictEqual(theme.kind, 'User');
-        assert.strictEqual(theme.user, true);
+        ['Theme', 'Geek Mode'].forEach((title) => {
+            const pill = pills.find(p => p.title === title);
+            assert.strictEqual(pill.scope, 'user', `${title} is a per-user setting`);
+            assert.strictEqual(pill.kind, 'User');
+            assert.strictEqual(pill.user, true);
+        });
         ['Delete Mode', 'Background Image', 'Application Logo', 'Tips Display', 'Par Check Frequency', 'Map Feature Check',
-            'Segment Color Scale', 'Geek Mode', 'CalTopo Proxy Settings', 'Data Synchronization'].forEach((title) => {
+            'Segment Color Scale', 'CalTopo Proxy Settings', 'Data Synchronization'].forEach((title) => {
             const pill = pills.find(p => p.title === title);
             assert.ok(pill, `${title} is tagged`);
             assert.strictEqual(pill.scope, 'login', `${title} is a per-login setting`);
@@ -613,13 +633,99 @@ const run = async () => {
         assert.strictEqual(settings.loadBundle().parCheckFrequency, 30, 'the open case follows');
     });
 
-    await check('Geek Mode is a login preference applied to <html> and remembered in the hint', async () => {
+    // Geek Mode is stored per user account inside the login's record; Alex is
+    // the selected user from here on (see the pill check above).
+    const alexGeek = () => (storedPreferences().geekModeByUser || {}).Alex || {};
+
+    await check('the Geek Mode padding percentage is stored for the selected user and applied to <html> at once', async () => {
+        assert.strictEqual(settings.getAccountName(settings.getCurrentUser()), 'Alex');
+        const input = settings.__byId['geek-padding-input'];
+        input.value = '50';
+        input.onchange();
+        await waitFor(() => alexGeek().paddingPercent === 50, 'geekPaddingPercent to reach user_settings under Alex');
+        assert.strictEqual(alexGeek().enabled, true, 'the switch state travels with it (Alex inherited the login default ON)');
+        assert.strictEqual(storedPreferences().geekMode, true, 'the login-level fallback is left alone');
+        assert.strictEqual(storedPreferences().geekPaddingPercent, undefined);
+        assert.strictEqual(settings.__html.style.getPropertyValue('--geek-space-scale'), '0.5', 'half the padding is taken away');
+        assert.strictEqual(settings.__cookies['sar-ui-hint'], 'dark,geek,pad50');
+        assert.strictEqual(settings.getGeekPaddingPercent(), 50);
+        assert.match(settings.__byId['settings-status'].textContent, /reduced by 50%/);
+        // Out-of-range and unusable entries are clamped / rejected, never stored.
+        input.value = '250';
+        input.onchange();
+        await waitFor(() => alexGeek().paddingPercent === 100, 'the percentage to be clamped to 100');
+        assert.strictEqual(String(input.value), '100');
+        assert.strictEqual(settings.__html.style.getPropertyValue('--geek-space-scale'), '0');
+        input.value = 'abc';
+        input.onchange();
+        assert.strictEqual(String(input.value), '100', 'an unusable entry falls back to the stored value');
+        assert.strictEqual(alexGeek().paddingPercent, 100);
+        input.value = '50';
+        input.onchange();
+        await waitFor(() => alexGeek().paddingPercent === 50, 'the percentage to be stored again');
+        assert.ok(!Object.prototype.hasOwnProperty.call(settings.loadBundle(), 'geekPaddingPercent'), 'the percentage is never written into the case');
+    });
+
+    await check('Geek Mode is kept per user account in the database and remembered in the hint', async () => {
         const geek = settings.__byId['geek-mode-toggle'];
         geek.checked = false;
         geek.onchange();
-        await waitFor(() => storedPreferences().geekMode === false, 'geekMode to reach user_settings');
+        await waitFor(() => alexGeek().enabled === false, 'geekMode to reach user_settings under Alex');
         assert.ok(!settings.__html.classList.contains('geek-mode'));
+        assert.strictEqual(settings.__html.style.getPropertyValue('--geek-space-scale'), '', 'the inline scale goes with the class');
         assert.strictEqual(settings.__cookies['sar-ui-hint'], 'dark');
+        assert.ok(!Object.prototype.hasOwnProperty.call(settings.loadBundle(), 'geekMode'), 'Geek Mode is never written into the case');
+        assert.strictEqual(alexGeek().paddingPercent, 50, 'switching Geek Mode off keeps the percentage for next time');
+        assert.strictEqual(storedPreferences().geekMode, true, 'the login-level fallback still says ON for everyone else');
+        // Another person on the same login username is not affected by Alex's choice.
+        settings.setCurrentUser({username: 'Sam', pin: '2000'});
+        assert.deepStrictEqual(JSON.parse(JSON.stringify(settings.getGeekModeRecord())), {enabled: true, paddingPercent: 67}, 'Sam gets the login default, not Alex\'s setting');
+        assert.strictEqual(settings.__cookies['sar-ui-hint'], 'dark,geek,pad67', 'picking an account refreshes the boot hint for the reload');
+        settings.applyGeekMode();
+        assert.ok(settings.__html.classList.contains('geek-mode'), 'Geek Mode is on for Sam');
+        assert.strictEqual(settings.__html.style.getPropertyValue('--geek-space-scale'), '0.33');
+        settings.buildSettingsPage();
+        assert.strictEqual(settings.__byId['geek-mode-toggle'].checked, true, 'the Settings page shows Sam\'s value');
+        assert.strictEqual(String(settings.__byId['geek-padding-input'].value), '67');
+        // Back to Alex: still off, still 50 %.
+        settings.setCurrentUser({username: 'Alex', pin: '1400'});
+        assert.strictEqual(settings.__cookies['sar-ui-hint'], 'dark');
+        settings.applyGeekMode();
+        assert.ok(!settings.__html.classList.contains('geek-mode'));
+        settings.buildSettingsPage();
+        assert.strictEqual(settings.__byId['geek-mode-toggle'].checked, false);
+        assert.strictEqual(String(settings.__byId['geek-padding-input'].value), '50');
+        geek.checked = true;
+        geek.onchange();
+        await waitFor(() => alexGeek().enabled === true, 'geekMode to reach user_settings again');
+        assert.strictEqual(settings.__cookies['sar-ui-hint'], 'dark,geek,pad50', 'switching it back on applies the stored percentage');
+        assert.strictEqual(settings.__html.style.getPropertyValue('--geek-space-scale'), '0.5');
+        geek.checked = false;
+        geek.onchange();
+        await waitFor(() => alexGeek().enabled === false, 'geekMode to be off again');
+        assert.strictEqual(Object.keys(storedPreferences().geekModeByUser).join(','), 'Alex', 'only accounts that changed something get an entry');
+    });
+
+    await check('the toggle panels are marked up for the condensed Geek Mode layout', () => {
+        const page2 = fs.readFileSync(path.join(__dirname, 'page2.html'), 'utf8');
+        assert.ok(/<div class="home-panel" data-geek-compact data-geek-title="Sort by PSRc">\s*<h2>Sorting<\/h2>/.test(page2), 'Segments: Sorting condenses to "Sort by PSRc"');
+        assert.ok(/<div class="home-panel" id="lpb-panel" data-geek-compact data-geek-title="LPB">\s*<h2>Lost Person Behavior<\/h2>/.test(page2), 'Segments: Lost Person Behavior condenses to "LPB"');
+        assert.ok(/<div class="home-panel" data-geek-compact>\s*<h2>Actions<\/h2>/.test(page2), 'Segments: Actions keeps only its buttons');
+        assert.ok(/id="sort-label" class="geek-full"/.test(page2) && /id="lpb-label" class="lpb-status geek-full"/.test(page2), 'the long labels are hidden in Geek Mode');
+        const page3 = fs.readFileSync(path.join(__dirname, 'page3.html'), 'utf8');
+        assert.ok(/id="personnel-sort-label" class="geek-full"[^>]*>[^<]*<\/span>\s*<span class="geek-abbr"[^>]*>By Team<\/span>/.test(page3), 'Personnel: the sort switch gets a short label');
+        const page4 = fs.readFileSync(path.join(__dirname, 'page4.html'), 'utf8');
+        assert.ok(/id="sort-label" class="geek-full"[^>]*>[^<]*<\/span>\s*<span class="geek-abbr"[^>]*>Newest First<\/span>/.test(page4), 'Search Log: the sort switch gets a short label');
+        ['Delete Mode', 'Background', 'Logo', 'Tips', 'PAR', 'Map Check', 'Geek'].forEach((title) => {
+            assert.ok(settingsHtml.includes(`data-geek-compact data-geek-title="${title}"`), `Settings: a panel condenses to "${title}"`);
+        });
+        assert.ok(/data-setting-scope="user" data-geek-compact>\s*<h2>Theme<\/h2>/.test(settingsHtml), 'Settings: the Theme panel condenses to its two short labels');
+        assert.ok(/id="geek-padding-input"[^>]*type="number"/.test(settingsHtml), 'the percentage pill sits in the Geek Mode panel');
+        assert.ok(/html\.geek-mode \.home-panel\[data-geek-compact\] > h2,\s*html\.geek-mode \.home-panel\[data-geek-compact\] > h3,\s*html\.geek-mode \.home-panel\[data-geek-compact\] > p \{\s*display: none;/.test(stylesSource), 'styles.css hides the heading and description of a condensed panel');
+        assert.ok(/html\.geek-mode \.home-panel\[data-geek-compact\]\[data-geek-title\]::before \{\s*content: attr\(data-geek-title\);/.test(stylesSource), 'styles.css shows the short title');
+        assert.ok(/html\.geek-mode \.geek-full \{\s*display: none !important;/.test(stylesSource) && /html\.geek-mode \.geek-abbr \{\s*display: inline;/.test(stylesSource), 'styles.css swaps long labels for short ones');
+        assert.ok(/html\.geek-mode \.home-grid \{\s*display: flex;\s*flex-wrap: wrap;/.test(stylesSource), 'the panel grid becomes a wrapping row so condensed panels shrink in width');
+        assert.ok(/html\.geek-mode \.pill-cell,\s*html\.geek-mode \.pill-input,\s*html\.geek-mode \.psr-cell-container \{\s*min-height: calc\(46px \* var\(--space-scale, 1\)\);/.test(stylesSource), 'pills and text fields shrink with their padding');
     });
 
     await check('the theme toggle changes the selected user\'s account theme and the hint for the next page', async () => {

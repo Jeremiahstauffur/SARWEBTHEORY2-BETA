@@ -226,6 +226,244 @@ function normalizeSegmentNameForMatch(value) {
         : String(value || '').trim().toLowerCase();
 }
 
+// ---------------------------------------------------------------------------
+// Lost Person Behavior (LPB).
+//
+// The Incident page's "Lost Person Behavior" section switches on a lost-person
+// category (Mental Illness today), picks the terrain and imports the IPP marker
+// from the CalTopo map. The maths (segment centre, distance to the IPP, which
+// 25/50/75/95 % bracket it falls into, the PSR factor) lives in
+// map-segment-utils.js so the server and the tests share it; these wrappers
+// only fall back to "not active" on a page that loads app.js without it.
+//
+// What the case stores (bundle.lostPersonBehavior, mirrored to the
+// lost_person_behavior table and - for the IPP - lpb_ipp on the server):
+//   psrAdjustmentEnabled  the Segments page switch; off keeps every setting
+//                         but leaves the PSR values alone
+//   ipp                   {featureId, featureName, lat, lng, importedAt, importedBy}
+//   categories.<key>      {enabled, terrain, distances: {p25, p50, p75, p95}}
+// The four distances of a category are copied INTO the case (from the login's
+// values on the server, see loadLpbDistances) when the category is switched on
+// or its terrain changes, and edited in place afterwards. Every device
+// therefore computes the PSR from the same numbers; a login's own edits live
+// on the server (lpb_user_distances) and only seed the next case / terrain.
+// ---------------------------------------------------------------------------
+const LPB_CATEGORIES_FALLBACK = [{key: 'mentalIllness', label: 'Mental Illness'}];
+const LPB_TERRAINS_FALLBACK = ['Mtn Temperate', 'Flat Temperate', 'Dry', 'Urban'];
+const LPB_BRACKETS_FALLBACK = [
+    {key: 'p25', percent: 25},
+    {key: 'p50', percent: 50},
+    {key: 'p75', percent: 75},
+    {key: 'p95', percent: 95}
+];
+const LPB_SEED_DISTANCES_FALLBACK = {p25: 0.5, p50: 1.0, p75: 1.5, p95: 2.0};
+
+function getLpbCategories() {
+    const utils = getMapSegmentUtils();
+    return Array.isArray(utils.LPB_CATEGORIES) ? utils.LPB_CATEGORIES : LPB_CATEGORIES_FALLBACK;
+}
+
+function getLpbTerrains() {
+    const utils = getMapSegmentUtils();
+    return Array.isArray(utils.LPB_TERRAINS) ? utils.LPB_TERRAINS : LPB_TERRAINS_FALLBACK;
+}
+
+function getLpbBrackets() {
+    const utils = getMapSegmentUtils();
+    return Array.isArray(utils.LPB_BRACKETS) ? utils.LPB_BRACKETS : LPB_BRACKETS_FALLBACK;
+}
+
+function normalizeLpbDistanceMiles(value) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.normalizeLpbDistanceMiles === 'function') return utils.normalizeLpbDistanceMiles(value);
+    const miles = parseFloat(String(value === undefined || value === null ? '' : value).replace(/[^0-9.\-]/g, ''));
+    return Number.isFinite(miles) && miles > 0 ? Math.round(miles * 10) / 10 : null;
+}
+
+function formatLpbMiles(value) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.formatLpbMiles === 'function') return utils.formatLpbMiles(value);
+    const miles = normalizeLpbDistanceMiles(value);
+    return miles === null ? '' : `${miles.toFixed(1)} mi`;
+}
+
+// The section in canonical form (see the block comment above). Without the
+// shared module the object is kept as it is, so nothing a fuller page saved is
+// thrown away by a page that cannot interpret it.
+function normalizeLostPersonBehavior(value) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.normalizeLostPersonBehavior === 'function') return utils.normalizeLostPersonBehavior(value);
+    if (value && typeof value === 'object' && !Array.isArray(value)) return value;
+    return {psrAdjustmentEnabled: true, ipp: null, categories: {}};
+}
+
+function getLostPersonBehavior(bundle) {
+    return normalizeLostPersonBehavior((bundle || loadBundle()).lostPersonBehavior);
+}
+
+// Everything the PSR maths needs, worked out once per recalculation; `active`
+// is false when the Segments switch is off, no category is on, the category has
+// no complete distances or no IPP was imported (see buildLpbContext in
+// map-segment-utils.js for `reason`).
+function buildLpbContext(bundle) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.buildLpbContext === 'function') return utils.buildLpbContext(bundle);
+    return {active: false, reason: 'unavailable', lpb: normalizeLostPersonBehavior(bundle && bundle.lostPersonBehavior), features: [], ipp: null, category: null, terrain: '', distances: null};
+}
+
+// null when the adjustment is not active; otherwise {matched, distanceMiles,
+// bracket, factor} for one Segments row (factor 1 beyond the 95 % distance and
+// for a segment without a shape on the map).
+function getLpbSegmentAdjustment(row, context) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.getLpbSegmentAdjustment === 'function' ? utils.getLpbSegmentAdjustment(row, context) : null;
+}
+
+// The PSR factor of one Segments row under the current settings (1 when the
+// adjustment is not active or does not reach this segment).
+function getLpbPsrFactor(row, context) {
+    const adjustment = getLpbSegmentAdjustment(row, context);
+    return adjustment && Number.isFinite(adjustment.factor) && adjustment.factor > 0 ? adjustment.factor : 1;
+}
+
+// The login's distance tables from the server (GET /api/lpb/distances):
+//   defaults   what the database holds for every category x terrain
+//   overrides  the brackets this login edited (lpb_user_distances)
+// Read once per page load by the Incident page; `effective` merges the two.
+let _lpbDistances = null;
+let _lpbDistancesPromise = null;
+
+function getLpbDistancesApiUrl() {
+    const serverUrl = getSyncServerUrl();
+    if (!serverUrl || !getUserCredentials()) return '';
+    return `${serverUrl.replace(/\/$/, '')}/api/lpb/distances`;
+}
+
+function normalizeLpbDistanceTable(raw) {
+    const out = {};
+    if (!raw || typeof raw !== 'object') return out;
+    Object.keys(raw).forEach(category => {
+        const terrains = raw[category];
+        if (!terrains || typeof terrains !== 'object') return;
+        out[category] = {};
+        Object.keys(terrains).forEach(terrain => {
+            const values = terrains[terrain];
+            if (!values || typeof values !== 'object') return;
+            const entry = {};
+            getLpbBrackets().forEach(bracket => {
+                const miles = normalizeLpbDistanceMiles(values[bracket.key]);
+                if (miles !== null) entry[bracket.key] = miles;
+            });
+            out[category][terrain] = entry;
+        });
+    });
+    return out;
+}
+
+async function loadLpbDistances(options = {}) {
+    if (_lpbDistances && !options.force) return _lpbDistances;
+    if (_lpbDistancesPromise) return _lpbDistancesPromise;
+    const url = getLpbDistancesApiUrl();
+    if (!url) return null;
+    _lpbDistancesPromise = (async () => {
+        try {
+            const resp = await apiFetch(`${url}?_=${Date.now()}`, {headers: getAuthHeaders()});
+            if (!resp.ok) {
+                console.warn(`Could not read the Lost Person Behavior distances from the server (HTTP ${resp.status}).`);
+                return _lpbDistances;
+            }
+            const body = await resp.json();
+            _lpbDistances = {
+                defaults: normalizeLpbDistanceTable(body && body.defaults),
+                overrides: normalizeLpbDistanceTable(body && body.overrides)
+            };
+            return _lpbDistances;
+        } catch (err) {
+            console.warn('Could not read the Lost Person Behavior distances from the server:', err);
+            return _lpbDistances;
+        } finally {
+            _lpbDistancesPromise = null;
+        }
+    })();
+    return _lpbDistancesPromise;
+}
+
+// The database default for one bracket of a category x terrain; the seed
+// value when the server has not answered (yet).
+function getLpbDefaultDistance(categoryLabel, terrain, bracketKey) {
+    const table = _lpbDistances && _lpbDistances.defaults && _lpbDistances.defaults[categoryLabel];
+    const entry = table && table[terrain];
+    if (entry && typeof entry[bracketKey] === 'number') return entry[bracketKey];
+    const utils = getMapSegmentUtils();
+    const seed = utils.LPB_SEED_DISTANCES || LPB_SEED_DISTANCES_FALLBACK;
+    return typeof seed[bracketKey] === 'number' ? seed[bracketKey] : null;
+}
+
+function getLpbDefaultDistances(categoryLabel, terrain) {
+    const out = {};
+    getLpbBrackets().forEach(bracket => {
+        const miles = getLpbDefaultDistance(categoryLabel, terrain, bracket.key);
+        if (miles !== null) out[bracket.key] = miles;
+    });
+    return out;
+}
+
+// The login's own value for a bracket (or null when it never edited it).
+function getLpbOverrideDistance(categoryLabel, terrain, bracketKey) {
+    const table = _lpbDistances && _lpbDistances.overrides && _lpbDistances.overrides[categoryLabel];
+    const entry = table && table[terrain];
+    return entry && typeof entry[bracketKey] === 'number' ? entry[bracketKey] : null;
+}
+
+// What a case starts from when a category is switched on or its terrain
+// changes: the login's edited value where there is one, else the default.
+function getLpbEffectiveDistances(categoryLabel, terrain) {
+    const out = {};
+    getLpbBrackets().forEach(bracket => {
+        const override = getLpbOverrideDistance(categoryLabel, terrain, bracket.key);
+        const miles = override !== null ? override : getLpbDefaultDistance(categoryLabel, terrain, bracket.key);
+        if (miles !== null) out[bracket.key] = miles;
+    });
+    return out;
+}
+
+// Store one edited bracket (miles, or null to go back to the default) in the
+// login's table on the server and in the page's copy. Resolves to true when
+// the server confirmed it.
+async function saveLpbOverrideDistance(categoryLabel, terrain, bracketKey, miles) {
+    const url = getLpbDistancesApiUrl();
+    if (!_lpbDistances) _lpbDistances = {defaults: {}, overrides: {}};
+    const overrides = _lpbDistances.overrides;
+    if (!overrides[categoryLabel]) overrides[categoryLabel] = {};
+    if (!overrides[categoryLabel][terrain]) overrides[categoryLabel][terrain] = {};
+    if (miles === null) {
+        delete overrides[categoryLabel][terrain][bracketKey];
+    } else {
+        overrides[categoryLabel][terrain][bracketKey] = miles;
+    }
+    if (!url) return false;
+    const values = {};
+    getLpbBrackets().forEach(bracket => {
+        const value = overrides[categoryLabel][terrain][bracket.key];
+        values[bracket.key] = typeof value === 'number' ? value : null;
+    });
+    try {
+        const resp = await apiFetch(url, {
+            method: 'PUT',
+            headers: getAuthHeaders(),
+            body: JSON.stringify({category: categoryLabel, terrain, values})
+        });
+        if (!resp.ok) {
+            console.warn(`The server did not store the Lost Person Behavior distance (HTTP ${resp.status}).`);
+            return false;
+        }
+        return true;
+    } catch (err) {
+        console.warn('The server did not store the Lost Person Behavior distance:', err);
+        return false;
+    }
+}
+
 function getSegmentDisplaySettings(bundle) {
     const utils = getMapSegmentUtils();
     if (typeof utils.normalizeSegmentDisplaySettings === 'function') {
@@ -1785,7 +2023,8 @@ async function setServerSetting(key, value) {
 // Two groups of settings are shown on the Settings page (each panel carries a
 // pill naming who it is saved for, see renderSettingScopePills):
 //   * per USER ACCOUNT (the person selected from the accounts list): the theme
-//     and "Use My Highlight Color" - stored on that account;
+//     and "Use My Highlight Color" - stored on that account - and Geek Mode,
+//     stored here per account name (geekModeByUser, see getGeekModeRecord);
 //   * per LOGIN: everything else - stored here.
 // ---------------------------------------------------------------------------
 const USER_PREFERENCES_KEY = 'sar-user-preferences-v1';
@@ -1808,8 +2047,9 @@ const LOGIN_PREFERENCE_KEYS = [
     'segmentActiveSearchBorderWidth'
 ];
 
-// The login's preference record (never null). `geekMode` and the last applied
-// `theme` live here as well; they are not bundle keys.
+// The login's preference record (never null). Geek Mode (`geekModeByUser` plus
+// the login-level `geekMode` / `geekPaddingPercent` fallback) and the last
+// applied `theme` live here as well; they are not bundle keys.
 function getUserPreferences() {
     const prefs = _serverSettings && _serverSettings[USER_PREFERENCES_KEY];
     return prefs && typeof prefs === 'object' && !Array.isArray(prefs) ? prefs : {};
@@ -1865,17 +2105,92 @@ function applyLoginPreferencesToBundle(bundle) {
     return changed;
 }
 
-// Geek Mode (compact spacing) is a login preference applied to <html>.
-function isGeekModeEnabled() {
-    return getUserPreferences().geekMode === true;
+// ---------------------------------------------------------------------------
+// Geek Mode.
+//
+// Kept in the database under the login username (user_settings) - never in the
+// case - and, inside that record, per USER ACCOUNT: several people share one
+// login username, and not all of them want the dense layout. `geekModeByUser`
+// maps the account name (getAccountName of the person picked from the accounts
+// list) to {enabled, paddingPercent}; the login-level `geekMode` /
+// `geekPaddingPercent` keys are what an account without its own entry (and a
+// page with no account picked yet) falls back to, and what older records hold.
+// Applied to <html> as the `geek-mode` class. While it is on:
+//   * every padding / margin written as calc(Npx * var(--space-scale)) shrinks
+//     by the percentage the login entered on the Settings page (the
+//     `--geek-space-scale` custom property set inline below; styles.css falls
+//     back to one third, the reduction Geek Mode had before the percentage);
+//   * the toggle panels marked data-geek-compact (Segments page Sorting / Lost
+//     Person Behavior / Actions, the Settings page panels) collapse to their
+//     short data-geek-title plus the control itself, and labels marked
+//     .geek-full give way to their .geek-abbr sibling - see styles.css.
+// ---------------------------------------------------------------------------
+const GEEK_MODE_DEFAULT_PADDING_PERCENT = 67;
+
+// The Geek Mode settings that apply to `user` (default: the account picked on
+// this device): {enabled, paddingPercent}.
+function getGeekModeRecord(user = getCurrentUser()) {
+    const prefs = getUserPreferences();
+    const byUser = prefs.geekModeByUser && typeof prefs.geekModeByUser === 'object' && !Array.isArray(prefs.geekModeByUser)
+        ? prefs.geekModeByUser : {};
+    const name = getAccountName(user);
+    const own = name && byUser[name] && typeof byUser[name] === 'object' ? byUser[name] : null;
+    return {
+        enabled: own && own.enabled !== undefined ? own.enabled === true : prefs.geekMode === true,
+        paddingPercent: normalizeGeekPaddingPercent(own && own.paddingPercent !== undefined ? own.paddingPercent : prefs.geekPaddingPercent)
+    };
 }
 
-function applyGeekMode(enabled = isGeekModeEnabled()) {
+// Store Geek Mode settings for `user`. With no account picked the login-level
+// fallback is written instead. Returns the save promise (or null).
+function saveGeekModePreference(patch, user = getCurrentUser()) {
+    if (!patch || typeof patch !== 'object') return null;
+    const current = getGeekModeRecord(user);
+    const next = {
+        enabled: patch.enabled !== undefined ? patch.enabled === true : current.enabled,
+        paddingPercent: normalizeGeekPaddingPercent(patch.paddingPercent !== undefined ? patch.paddingPercent : current.paddingPercent, current.paddingPercent)
+    };
+    const name = getAccountName(user);
+    if (!name) return saveUserPreferences({geekMode: next.enabled, geekPaddingPercent: next.paddingPercent});
+    const prefs = getUserPreferences();
+    const byUser = Object.assign({}, prefs.geekModeByUser && typeof prefs.geekModeByUser === 'object' && !Array.isArray(prefs.geekModeByUser) ? prefs.geekModeByUser : {});
+    byUser[name] = next;
+    return saveUserPreferences({geekModeByUser: byUser});
+}
+
+function isGeekModeEnabled() {
+    return getGeekModeRecord().enabled;
+}
+
+// The percentage (0-100, whole number) taken away from every padding. Anything
+// unusable falls back to `fallback`.
+function normalizeGeekPaddingPercent(value, fallback = GEEK_MODE_DEFAULT_PADDING_PERCENT) {
+    const number = typeof value === 'string' ? Number(value.trim()) : Number(value);
+    if (value === '' || value === null || value === undefined || !Number.isFinite(number)) return fallback;
+    return Math.min(100, Math.max(0, Math.round(number)));
+}
+
+function getGeekPaddingPercent() {
+    return getGeekModeRecord().paddingPercent;
+}
+
+// The --space-scale factor a reduction percentage stands for (67 % -> 0.33).
+function geekPaddingPercentToScale(percent) {
+    return String(Math.round((100 - normalizeGeekPaddingPercent(percent)) * 10) / 1000);
+}
+
+function applyGeekMode(enabled = isGeekModeEnabled(), paddingPercent = getGeekPaddingPercent()) {
     const root = document.documentElement;
     if (!root || !root.classList) return;
-    if (enabled) root.classList.add('geek-mode');
-    else root.classList.remove('geek-mode');
-    rememberUiHint();
+    const percent = normalizeGeekPaddingPercent(paddingPercent);
+    if (enabled) {
+        root.classList.add('geek-mode');
+        if (root.style && root.style.setProperty) root.style.setProperty('--geek-space-scale', geekPaddingPercentToScale(percent));
+    } else {
+        root.classList.remove('geek-mode');
+        if (root.style && root.style.removeProperty) root.style.removeProperty('--geek-space-scale');
+    }
+    rememberUiHint(getAppliedTheme(), enabled, percent);
 }
 
 // The theme currently applied to the page ('light' | 'dark').
@@ -1896,9 +2211,11 @@ function getAppliedTheme() {
 // ---------------------------------------------------------------------------
 const UI_HINT_COOKIE = 'sar-ui-hint';
 
-function rememberUiHint(theme = getAppliedTheme(), geek = isGeekModeEnabled()) {
+// The hint is a comma-separated flag list: "light" | "dark", then "geek" and
+// "pad<percent>" (the Geek Mode padding reduction) while Geek Mode is on.
+function rememberUiHint(theme = getAppliedTheme(), geek = isGeekModeEnabled(), paddingPercent = getGeekPaddingPercent()) {
     const flags = [theme === 'light' ? 'light' : 'dark'];
-    if (geek) flags.push('geek');
+    if (geek) flags.push('geek', `pad${normalizeGeekPaddingPercent(paddingPercent)}`);
     try { setCookie(UI_HINT_COOKIE, flags.join(','), 365); } catch (e) { /* ignore */ }
 }
 
@@ -1906,7 +2223,8 @@ function rememberUiHint(theme = getAppliedTheme(), geek = isGeekModeEnabled()) {
 // logging in, before the reload, so the very first page already paints right).
 function rememberUiHintFromPreferences() {
     const prefs = getUserPreferences();
-    rememberUiHint(prefs.theme === 'light' ? 'light' : 'dark', prefs.geekMode === true);
+    const geek = getGeekModeRecord();
+    rememberUiHint(prefs.theme === 'light' ? 'light' : 'dark', geek.enabled, geek.paddingPercent);
 }
 
 let _pageBootFinished = false;
@@ -3480,6 +3798,9 @@ function setCurrentUser(user) {
   if (user) {
     sessionStorage.setItem('sar-current-user', JSON.stringify(user));
     notifyActiveUser(user);
+    // Geek Mode is kept per account: refresh the boot hint so the reload that
+    // follows a pick already paints in this person's layout (theme-boot.js).
+    try { rememberUiHintFromPreferences(); } catch (e) { /* ignore */ }
   } else {
     // Logging out: forget the login AND everything of this user's that the
     // page holds in memory (the open case, queued rows, the settings copy),
@@ -3912,6 +4233,9 @@ function defaultBundle() {
     permanentPersonnel: {},
     // The one IC Report of this CASE # (Forms page, "IC Report" button).
     icReport: defaultIcReport(),
+    // Incident page "Lost Person Behavior": no category on, no IPP yet, and the
+    // PSR adjustment applied as soon as both exist.
+    lostPersonBehavior: normalizeLostPersonBehavior(null),
     accounts: [
       { username: 'Super Admin', pin: '1976', color: 'none', handle: 'Super-Admin', isFileManager: true, theme: 'dark', visiblePages: ['index', 'page2', 'page3', 'page4', 'page5', 'page6', 'page7', 'settings', 'home', 'page8', 'page9', 'page10'] }
     ],
@@ -4102,6 +4426,11 @@ function sanitizeBundle(bundle) {
   const mapUnaccountedAutoCheck = bundle.mapUnaccountedAutoCheck !== false;
   const mapFeatureTypeFilters = getMapFeatureTypeFilters(bundle);
   const icReport = sanitizeIcReport(bundle.icReport);
+  // The Incident page's Lost Person Behavior settings (category switches,
+  // terrain, the case's four distances per category, the imported IPP and the
+  // Segments page's apply switch). Kept in canonical form so two devices never
+  // disagree about the shape they diff.
+  const lostPersonBehavior = normalizeLostPersonBehavior(bundle.lostPersonBehavior);
 
   let accounts = Array.isArray(bundle.accounts) ? bundle.accounts : fallback.accounts;
 
@@ -4227,6 +4556,7 @@ function sanitizeBundle(bundle) {
     mapFeatureTypeFilters,
     permanentPersonnel,
     icReport,
+    lostPersonBehavior,
     accounts: syncedAccounts 
   };
 }
@@ -5418,6 +5748,12 @@ function recalculateEverything() {
   // 1. Recalculate Regions Consensus
   updateConsensusCells(regionsData);
 
+  // Lost Person Behavior (Incident page): a segment within one of the
+  // category's distance brackets of the IPP has its share divided by that
+  // bracket's probability. The factor goes into the initial share, so PSRi,
+  // PSRc and the search log's PSR before/after all move together.
+  const lpbContext = buildLpbContext(bundle);
+
   // Helper for share calculation
   const getInitialShare = (region, area) => {
     const regionRowIndex = (regionsData.rows || []).findIndex(r => r[0] === region);
@@ -5448,9 +5784,9 @@ function recalculateEverything() {
        } else {
           segmentsData[r][5] = '';
        }
-       segmentsData[r][6] = calculatePSR(segmentsData, r, bundle);
+       segmentsData[r][6] = calculatePSR(segmentsData, r, bundle, lpbContext);
        
-       const share = getInitialShare(segmentsData[r][0], parseNumeric(segmentsData[r][2]));
+       const share = getInitialShare(segmentsData[r][0], parseNumeric(segmentsData[r][2])) * getLpbPsrFactor(segmentsData[r], lpbContext);
        segInfoMap.set(`${segmentsData[r][0]}|${segmentsData[r][1]}`, { share });
     }
   }
@@ -5881,7 +6217,9 @@ function buildRegionsTable() {
   }
 }
 
-function calculatePSR(data, rowIndex, bundle) {
+// `lpbContext` (buildLpbContext) is passed in by recalculateEverything so the
+// Lost Person Behavior lookups run once per recalculation, not once per row.
+function calculatePSR(data, rowIndex, bundle, lpbContext = null) {
   const row = data[rowIndex];
   const regionName = row[0];
   const area = parseNumeric(row[2]);
@@ -5912,12 +6250,110 @@ function calculatePSR(data, rowIndex, bundle) {
   if (sumOfAreas <= 0) return '';
 
   // Formula: PSR = ((Sweep * Length ) / Time) * (Consensus * (Area / Sum of Areas)) / (Area / 640)
-  const psr = ((sweep * length ) / timePerSweep) * (consensus * (area / sumOfAreas)) / (area / 640);
+  // The Lost Person Behavior factor (1 / bracket probability, or 1 when the
+  // adjustment is off or does not reach this segment) scales the share.
+  const lpbFactor = getLpbPsrFactor(row, lpbContext || buildLpbContext(bundle));
+  const psr = ((sweep * length ) / timePerSweep) * (consensus * (area / sumOfAreas) * lpbFactor) / (area / 640);
 
   return isFinite(psr) ? psr.toFixed(4) : '';
 }
 
 // updateAllPSRs removed, logic moved to recalculateEverything
+
+// One line for the Segments page's Lost Person Behavior panel saying what the
+// PSR values are (or are not) adjusted by right now.
+function describeLpbStatus(context) {
+  const lpb = context && context.lpb ? context.lpb : normalizeLostPersonBehavior(null);
+  const category = context && context.category ? context.category : null;
+  const categoryText = category ? `${category.label} (${context.terrain})` : '';
+  if (context && context.active) {
+    const ipp = context.ipp || {};
+    return `Applying ${categoryText} from IPP ${ipp.featureName ? `"${ipp.featureName}"` : `(${Number(ipp.lat).toFixed(5)}, ${Number(ipp.lng).toFixed(5)})`}.`;
+  }
+  switch (context && context.reason) {
+    case 'disabled': {
+      const on = getLpbCategories().filter(cat => lpb.categories[cat.key] && lpb.categories[cat.key].enabled).map(cat => cat.label);
+      return on.length
+        ? `Off - PSRi values are not adjusted. ${on.join(', ')} and the IPP stay set on the Incident page.`
+        : 'Off - PSRi values are not adjusted.';
+    }
+    case 'no-category':
+      return 'No lost person category is switched on (Incident page, Lost Person Behavior).';
+    case 'no-distances':
+      return `${categoryText}: enter the four distances on the Incident page first.`;
+    case 'no-ipp':
+      return `${categoryText}: import the IPP marker on the Incident page first.`;
+    default:
+      return 'Lost Person Behavior is not available on this page.';
+  }
+}
+
+// The Segments page switch. It only flips psrAdjustmentEnabled in the case;
+// the category, terrain, distances and IPP entered on the Incident page are
+// kept, so the adjustment can be lifted and re-applied at will.
+function setLpbPsrAdjustmentEnabled(enabled) {
+  const bundle = loadBundle();
+  const lpb = normalizeLostPersonBehavior(bundle.lostPersonBehavior);
+  if (lpb.psrAdjustmentEnabled === !!enabled) return Promise.resolve(false);
+  lpb.psrAdjustmentEnabled = !!enabled;
+  bundle.lostPersonBehavior = lpb;
+  addActivityLogEntry('System', `Lost Person Behavior PSR adjustment switched ${enabled ? 'on' : 'off'} on the Segments page`, bundle);
+  return saveBundle(bundle);
+}
+
+function bindLpbSegmentsPanel(bundle, context) {
+  const toggle = document.getElementById('lpb-toggle');
+  const label = document.getElementById('lpb-label');
+  if (!toggle && !label) return;
+  const lpb = context && context.lpb ? context.lpb : getLostPersonBehavior(bundle);
+  if (toggle) {
+    toggle.checked = lpb.psrAdjustmentEnabled !== false;
+    if (!toggle.dataset.bound) {
+      toggle.dataset.bound = 'true';
+      toggle.onchange = () => {
+        // saveBundle stores the switch at once; the network flush it returns
+        // is not waited for, so the table redraws immediately.
+        setLpbPsrAdjustmentEnabled(toggle.checked);
+        buildSegmentsTable();
+      };
+    }
+  }
+  if (label) {
+    const status = describeLpbStatus(context);
+    label.textContent = status;
+    label.classList.toggle('lpb-status-active', !!(context && context.active));
+    // In Geek Mode the panel shows only "LPB" next to the switch; the status
+    // line stays available as the panel's tooltip.
+    const panel = document.getElementById('lpb-panel');
+    if (panel) panel.title = status;
+  }
+}
+
+// The small tag on the top-right border of a PSRi pill naming the 25/50/75/95 %
+// bracket the segment fell into. Segments the adjustment does not reach (no
+// shape on the map, beyond the 95 % distance) get an explanatory tooltip only.
+function appendLpbBracketTag(container, cell, row, context) {
+  if (!context || !context.active) return;
+  const adjustment = getLpbSegmentAdjustment(row, context);
+  if (!adjustment) return;
+  if (!adjustment.matched) {
+    cell.title = 'Lost Person Behavior: no CalTopo shape was found for this segment, so its PSRi is unchanged.';
+    return;
+  }
+  const miles = Number.isFinite(adjustment.distanceMiles) ? adjustment.distanceMiles.toFixed(1) : '?';
+  if (!adjustment.bracket) {
+    cell.title = `Lost Person Behavior: ${miles} mi from the IPP is beyond the 95% distance, so the PSRi is unchanged.`;
+    return;
+  }
+  const bracket = adjustment.bracket;
+  const tag = document.createElement('span');
+  tag.className = 'psri-bracket-tag';
+  tag.textContent = `${bracket.percent}%`;
+  tag.title = `Lost Person Behavior: ${miles} mi from the IPP falls in the ${bracket.percent}% bracket (within ${formatLpbMiles(bracket.distance)}), so the PSRi is divided by ${bracket.percent}%.`;
+  cell.title = tag.title;
+  container.classList.add('has-lpb-tag');
+  container.appendChild(tag);
+}
 
 function buildSegmentsTable() {
   const tableHead = document.getElementById('table-head');
@@ -5934,6 +6370,12 @@ function buildSegmentsTable() {
     sortToggle.checked = isSegmentsPsrcSortEnabled();
     sortToggle.dataset.bound = 'true';
   }
+
+  // The Lost Person Behavior panel: its switch applies / lifts the PSR
+  // adjustment for the whole case (the Incident page settings stay as they
+  // are), and the PSRi pills below get a bracket tag while it is applied.
+  const lpbContext = buildLpbContext(bundle);
+  bindLpbSegmentsPanel(bundle, lpbContext);
 
   const isPSRDescending = sortToggle && sortToggle.checked;
   if (sortLabel) {
@@ -6146,6 +6588,10 @@ function buildSegmentsTable() {
         });
 
         cellContainer.appendChild(cell);
+
+        if (c === 6) {
+          appendLpbBracketTag(cellContainer, cell, sortedData[r], lpbContext);
+        }
 
         if (c === 7) {
           const sweepsDue = getLogSweepsDue();
@@ -11931,12 +12377,33 @@ function buildSettingsPage() {
       const nextBundle = loadBundle();
       logSettingChange('Geek Mode', wasOn ? 'ON' : 'OFF', geekModeToggle.checked ? 'ON' : 'OFF', nextBundle);
       saveBundle(nextBundle);
-      saveUserPreferences({geekMode: geekModeToggle.checked});
+      saveGeekModePreference({enabled: geekModeToggle.checked});
       applyGeekMode(geekModeToggle.checked);
       if (geekModeLabel) geekModeLabel.textContent = describeGeek(geekModeToggle.checked);
       status.textContent = geekModeToggle.checked
-        ? 'Geek Mode on: compact spacing is used across the site.'
+        ? `Geek Mode on: padding is reduced by ${getGeekPaddingPercent()}% and the toggle panels are condensed across the site.`
         : 'Geek Mode off: standard spacing is used.';
+    };
+  }
+
+  // The percentage Geek Mode takes off every padding. Stored for the selected
+  // user like the switch itself; applied at once when Geek Mode is on.
+  const geekPaddingInput = document.getElementById('geek-padding-input');
+  if (geekPaddingInput) {
+    geekPaddingInput.value = getGeekPaddingPercent();
+    geekPaddingInput.onchange = () => {
+      const previous = getGeekPaddingPercent();
+      const next = normalizeGeekPaddingPercent(geekPaddingInput.value, previous);
+      geekPaddingInput.value = next;
+      if (next === previous) return;
+      const nextBundle = loadBundle();
+      logSettingChange('Geek Mode padding reduction (%)', previous, next, nextBundle);
+      saveBundle(nextBundle);
+      saveGeekModePreference({paddingPercent: next});
+      applyGeekMode(isGeekModeEnabled(), next);
+      status.textContent = isGeekModeEnabled()
+        ? `Geek Mode padding reduced by ${next}%.`
+        : `Padding will be reduced by ${next}% once Geek Mode is switched on.`;
     };
   }
 
@@ -12284,6 +12751,462 @@ function buildProfilePage() {
   addGroup('Physical / Medical', 'lostPersonPhysical', 'textarea');
 
   container.appendChild(form);
+  buildLostPersonBehaviorSection(container);
+}
+
+// ---------------------------------------------------------------------------
+// Incident page: "Lost Person Behavior" section.
+//
+// The section heading carries the IPP control (Import IPP, or the imported
+// marker's pill) because the IPP is the same whichever categories are on.
+// Below it one dropdown-looking row per category (like the Personnel page's
+// team accordions): the switch, the category name and - once it is on - the
+// terrain dropdown on the same line to its right. Under the row the column
+// graph of the four distances (25 / 50 / 75 / 95 %) with a click-to-edit value
+// under each column and a reset button wherever the case's value differs from
+// the database default. See the block comment above getLpbCategories for
+// where each value is stored.
+// ---------------------------------------------------------------------------
+
+function getFeatureCenter(feature) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.getFeatureCenter === 'function' ? utils.getFeatureCenter(feature) : null;
+}
+
+function isCompleteLpbDistances(value) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.isCompleteLpbDistances === 'function') return utils.isCompleteLpbDistances(value);
+    return !!value && getLpbBrackets().every(bracket => normalizeLpbDistanceMiles(value[bracket.key]) !== null);
+}
+
+function lpbCategoryLogName(category, entry) {
+    return `${category.label} (${entry && entry.terrain ? entry.terrain : ''})`;
+}
+
+// Change the section in the open case and save it; `mutate` receives the
+// canonical section and returns the activity-log text (or nothing to log).
+function updateLostPersonBehavior(mutate) {
+    const bundle = loadBundle();
+    const lpb = normalizeLostPersonBehavior(bundle.lostPersonBehavior);
+    const message = mutate(lpb, bundle);
+    bundle.lostPersonBehavior = normalizeLostPersonBehavior(lpb);
+    if (message) addActivityLogEntry('System', message, bundle);
+    saveBundle(bundle);
+    return bundle.lostPersonBehavior;
+}
+
+// Remember the marker as the case's IPP (and, through the server's mirror of
+// this section, in the lpb_ipp table for this login and CASE #).
+function setLostPersonIpp(feature) {
+    const center = getFeatureCenter(feature);
+    if (!center) {
+        showToast('That marker has no usable position.', 'Import IPP');
+        return false;
+    }
+    const identity = getMapFeatureIdentity(feature);
+    const name = getMapFeatureDisplayName(feature);
+    updateLostPersonBehavior((lpb) => {
+        lpb.ipp = {
+            featureId: identity.id || '',
+            featureName: name,
+            lat: center.lat,
+            lng: center.lng,
+            importedAt: new Date().toISOString(),
+            importedBy: getAccountName(getCurrentUser())
+        };
+        return `IPP imported from CalTopo marker "${name}" (${center.lat.toFixed(5)}, ${center.lng.toFixed(5)})`;
+    });
+    return true;
+}
+
+function clearLostPersonIpp() {
+    updateLostPersonBehavior((lpb) => {
+        const previous = lpb.ipp;
+        lpb.ipp = null;
+        return previous ? `IPP "${previous.featureName || 'marker'}" removed` : '';
+    });
+}
+
+// The marker picker behind "Import IPP": the connected CalTopo map's fetched
+// shapes filtered to markers, A-Z, with a search box. Fetches the shapes first
+// when the map has not been fetched yet.
+function showLpbIppMarkerPopup(originElement = null, onDone = null) {
+    const popup = createPopup('Import IPP from CalTopo', originElement);
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+    content.style.display = 'flex';
+    content.style.flexDirection = 'column';
+    content.style.maxHeight = '85vh';
+    content.style.width = '90vw';
+    content.style.maxWidth = '640px';
+
+    const body = document.createElement('div');
+    body.className = 'lpb-marker-popup';
+    body.innerHTML = `
+      <p style="margin-bottom: 12px; opacity: 0.8;">Select the marker on the connected CalTopo map that stands for the Initial Planning Point (IPP). Only markers are listed.</p>
+      <input type="search" class="pill-input lpb-marker-search" placeholder="Search markers..." autocomplete="off" style="min-width: 0; width: 100%; margin-bottom: 12px;">
+      <div class="lpb-marker-list"></div>
+    `;
+    content.insertBefore(body, btnContainer);
+    const search = body.querySelector('.lpb-marker-search');
+    const list = body.querySelector('.lpb-marker-list');
+
+    const finish = () => {
+        closePopup(popup);
+        if (typeof onDone === 'function') onDone();
+    };
+
+    const markersOf = (bundle) => {
+        const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+        const features = map && Array.isArray(map.features) ? map.features : [];
+        return sortMapFeaturesByName(features.filter(feature => getMapFeatureCategoryKey(feature) === 'marker'));
+    };
+
+    const render = () => {
+        const bundle = loadBundle();
+        const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+        list.innerHTML = '';
+        if (!map || !map.id) {
+            list.innerHTML = '<p class="lpb-marker-empty">No CalTopo map is connected. Add the map on the Maps page first.</p>';
+            return;
+        }
+        const fetched = Array.isArray(map.features) && map.features.length > 0;
+        const markers = filterMapFeaturesByName(markersOf(bundle), search.value);
+        if (!fetched) {
+            const wrap = document.createElement('div');
+            wrap.className = 'lpb-marker-empty';
+            wrap.innerHTML = '<p>The map\'s shapes have not been fetched yet.</p>';
+            const fetchBtn = document.createElement('button');
+            fetchBtn.type = 'button';
+            fetchBtn.className = 'clear-btn';
+            fetchBtn.textContent = 'Fetch Shapes';
+            fetchBtn.onclick = async () => {
+                await caltopo_request(fetchBtn, {silent: true});
+                render();
+            };
+            wrap.appendChild(fetchBtn);
+            list.appendChild(wrap);
+            return;
+        }
+        if (!markers.length) {
+            list.innerHTML = search.value.trim()
+                ? '<p class="lpb-marker-empty">No marker matches the search.</p>'
+                : '<p class="lpb-marker-empty">The map has no markers. Add a marker for the IPP in CalTopo, fetch the shapes again on the Maps page and try again.</p>';
+            return;
+        }
+        markers.forEach(feature => {
+            const center = getFeatureCenter(feature);
+            const row = document.createElement('button');
+            row.type = 'button';
+            row.className = 'lpb-marker-row';
+            row.disabled = !center;
+            row.innerHTML = `<span class="lpb-marker-name"></span><span class="lpb-marker-coords"></span>`;
+            row.querySelector('.lpb-marker-name').textContent = getMapFeatureDisplayName(feature);
+            row.querySelector('.lpb-marker-coords').textContent = center
+                ? `${center.lat.toFixed(5)}, ${center.lng.toFixed(5)}`
+                : 'no position';
+            row.onclick = () => {
+                if (setLostPersonIpp(feature)) finish();
+            };
+            list.appendChild(row);
+        });
+    };
+
+    search.addEventListener('input', render);
+    render();
+
+    const cancelBtn = document.createElement('button');
+    cancelBtn.type = 'button';
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = finish;
+    btnContainer.appendChild(cancelBtn);
+}
+
+function buildLostPersonBehaviorSection(container) {
+    if (!container) return;
+    const section = document.createElement('div');
+    section.className = 'lpb-section';
+    section.id = 'lpb-section';
+    container.appendChild(section);
+    renderLostPersonBehaviorSection();
+    // The database defaults and this login's edited values decide where the
+    // reset buttons show; redraw once they are in (unless the planner is in
+    // the middle of something - the next change redraws anyway).
+    loadLpbDistances().then(() => {
+        if (document.getElementById('lpb-section') && !isUserActionActive()) renderLostPersonBehaviorSection();
+    }).catch(() => {});
+}
+
+function renderLostPersonBehaviorSection() {
+    const section = document.getElementById('lpb-section');
+    if (!section) return;
+    const bundle = loadBundle();
+    const lpb = getLostPersonBehavior(bundle);
+    section.innerHTML = `
+      <div class="lpb-section-header">
+        <div class="lpb-section-title-row">
+          <h2><span class="geek-full">Lost Person Behavior</span><span class="geek-abbr">LPB</span></h2>
+          <div class="lpb-section-ipp"></div>
+        </div>
+        <p>Import the IPP marker from the CalTopo map, then switch on what describes the lost person and pick the terrain. Segments within one of the distances below have their PSRi divided by that bracket's percentage (the Segments page has a switch to apply or lift this).</p>
+      </div>
+    `;
+    section.querySelector('.lpb-section-ipp').appendChild(buildLpbIppControl(lpb));
+    getLpbCategories().forEach(category => {
+        section.appendChild(buildLpbCategoryRow(category, lpb));
+    });
+}
+
+// The IPP control beside the section heading: "Import IPP" while the case has
+// none, otherwise the imported marker's pill with change / remove buttons.
+function buildLpbIppControl(lpb) {
+    if (!lpb.ipp) {
+        const importBtn = document.createElement('button');
+        importBtn.type = 'button';
+        importBtn.className = 'clear-btn lpb-import-ipp-btn';
+        importBtn.textContent = 'Import IPP';
+        importBtn.title = 'Pick the IPP marker from the connected CalTopo map';
+        importBtn.onclick = () => showLpbIppMarkerPopup(importBtn, renderLostPersonBehaviorSection);
+        return importBtn;
+    }
+    const pill = document.createElement('span');
+    pill.className = 'lpb-ipp-pill';
+    pill.title = `IPP at ${lpb.ipp.lat.toFixed(5)}, ${lpb.ipp.lng.toFixed(5)}${lpb.ipp.importedBy ? ` - imported by ${lpb.ipp.importedBy}` : ''}`;
+    pill.innerHTML = `<span class="lpb-ipp-pill-label">IPP</span><span class="lpb-ipp-pill-name"></span>`;
+    pill.querySelector('.lpb-ipp-pill-name').textContent = lpb.ipp.featureName || `${lpb.ipp.lat.toFixed(4)}, ${lpb.ipp.lng.toFixed(4)}`;
+    const changeBtn = document.createElement('button');
+    changeBtn.type = 'button';
+    changeBtn.className = 'lpb-ipp-action';
+    changeBtn.textContent = 'change';
+    changeBtn.title = 'Pick another marker as the IPP';
+    changeBtn.onclick = () => showLpbIppMarkerPopup(changeBtn, renderLostPersonBehaviorSection);
+    const removeBtn = document.createElement('button');
+    removeBtn.type = 'button';
+    removeBtn.className = 'lpb-ipp-action lpb-ipp-remove';
+    removeBtn.innerHTML = '&times;';
+    removeBtn.title = 'Remove the IPP';
+    removeBtn.setAttribute('aria-label', 'Remove the IPP');
+    removeBtn.onclick = () => {
+        clearLostPersonIpp();
+        renderLostPersonBehaviorSection();
+    };
+    pill.appendChild(changeBtn);
+    pill.appendChild(removeBtn);
+    return pill;
+}
+
+function buildLpbCategoryRow(category, lpb) {
+    const entry = lpb.categories[category.key] || {enabled: false, terrain: getLpbTerrains()[0], distances: null};
+    const row = document.createElement('div');
+    row.className = `accordion-container lpb-category${entry.enabled ? '' : ' collapsed'}`;
+    row.dataset.category = category.key;
+
+    const header = document.createElement('div');
+    header.className = 'accordion-header lpb-category-header';
+    header.innerHTML = `
+      <div class="lpb-category-controls">
+        <label class="toggle-switch" title="Switch ${category.label} on or off">
+          <input type="checkbox" class="lpb-category-toggle" ${entry.enabled ? 'checked' : ''}>
+          <span class="slider"></span>
+        </label>
+        <span class="lpb-category-label">${category.label}</span>
+        <div class="lpb-category-extras${entry.enabled ? ' is-visible' : ''}"></div>
+      </div>
+      <span class="accordion-icon">
+        <svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="6 9 12 15 18 9"></polyline></svg>
+      </span>
+    `;
+    row.appendChild(header);
+
+    const toggle = header.querySelector('.lpb-category-toggle');
+    toggle.onchange = async () => {
+        const enabled = toggle.checked;
+        // The case's four distances are copied from this login's values (its
+        // edits, else the database defaults) the first time the category is
+        // switched on; switching it off and on again keeps what the case has.
+        if (enabled) await loadLpbDistances();
+        updateLostPersonBehavior((next) => {
+            const target = next.categories[category.key];
+            target.enabled = enabled;
+            if (enabled && !isCompleteLpbDistances(target.distances)) {
+                target.distances = getLpbEffectiveDistances(category.label, target.terrain);
+            }
+            return `Lost Person Behavior: ${lpbCategoryLogName(category, target)} switched ${enabled ? 'on' : 'off'}`;
+        });
+        renderLostPersonBehaviorSection();
+    };
+
+    const extras = header.querySelector('.lpb-category-extras');
+    const terrainSelect = document.createElement('select');
+    terrainSelect.className = 'pill-input lpb-terrain-select';
+    terrainSelect.title = 'Terrain';
+    terrainSelect.setAttribute('aria-label', `${category.label} terrain`);
+    getLpbTerrains().forEach(terrain => {
+        const option = document.createElement('option');
+        option.value = terrain;
+        option.textContent = terrain;
+        if (terrain === entry.terrain) option.selected = true;
+        terrainSelect.appendChild(option);
+    });
+    terrainSelect.onchange = async () => {
+        const terrain = terrainSelect.value;
+        await loadLpbDistances();
+        updateLostPersonBehavior((next) => {
+            const target = next.categories[category.key];
+            const previous = target.terrain;
+            target.terrain = terrain;
+            // A new terrain means a new set of distances: this login's values
+            // for it, else the database defaults.
+            target.distances = getLpbEffectiveDistances(category.label, terrain);
+            return `Lost Person Behavior: ${category.label} terrain changed from ${previous} to ${terrain}`;
+        });
+        renderLostPersonBehaviorSection();
+    };
+    extras.appendChild(terrainSelect);
+
+    // Clicking the row itself folds the graph away and back while the
+    // category is on; the controls inside the row do not fold it.
+    header.onclick = (e) => {
+        if (e.target.closest('input, select, button, label')) return;
+        if (!entry.enabled) return;
+        row.classList.toggle('collapsed');
+    };
+
+    const body = document.createElement('div');
+    body.className = 'accordion-content';
+    body.appendChild(buildLpbDistanceChart(category, entry));
+    row.appendChild(body);
+    return row;
+}
+
+// The column graph: four columns (25 / 50 / 75 / 95 %) scaled from 0 mi to the
+// largest of the four distances, a click-to-edit value under each column and
+// a reset button wherever the case's value is not the database default.
+function buildLpbDistanceChart(category, entry) {
+    const chart = document.createElement('div');
+    chart.className = 'lpb-chart';
+    const distances = entry.distances || {};
+    const brackets = getLpbBrackets();
+    const values = brackets.map(bracket => (typeof distances[bracket.key] === 'number' ? distances[bracket.key] : null));
+    const max = Math.max(0, ...values.filter(v => v !== null));
+
+    const axis = document.createElement('div');
+    axis.className = 'lpb-chart-axis';
+    axis.setAttribute('aria-hidden', 'true');
+    [max, max / 2, 0].forEach(tick => {
+        const span = document.createElement('span');
+        span.textContent = max > 0 ? `${tick.toFixed(1)} mi` : (tick === 0 ? '0 mi' : '');
+        axis.appendChild(span);
+    });
+    chart.appendChild(axis);
+
+    const columns = document.createElement('div');
+    columns.className = 'lpb-chart-columns';
+    chart.appendChild(columns);
+
+    brackets.forEach((bracket, index) => {
+        const value = values[index];
+        const column = document.createElement('div');
+        column.className = 'lpb-chart-col';
+
+        const barWrap = document.createElement('div');
+        barWrap.className = 'lpb-chart-bar-wrap';
+        const bar = document.createElement('div');
+        bar.className = 'lpb-chart-bar';
+        const percent = value !== null && max > 0 ? Math.max(2, (value / max) * 100) : 0;
+        bar.style.height = `${percent}%`;
+        bar.title = value !== null ? `${bracket.percent}% of subjects found within ${formatLpbMiles(value)} of the IPP` : `${bracket.percent}%: no distance entered`;
+        barWrap.appendChild(bar);
+        column.appendChild(barWrap);
+
+        const label = document.createElement('div');
+        label.className = 'lpb-chart-col-label';
+        label.textContent = `${bracket.percent}%`;
+        column.appendChild(label);
+
+        const valueRow = document.createElement('div');
+        valueRow.className = 'lpb-chart-value-row';
+        const defaultMiles = getLpbDefaultDistance(category.label, entry.terrain, bracket.key);
+        const isEdited = value !== null && defaultMiles !== null && value !== defaultMiles;
+
+        const valueEl = document.createElement('span');
+        valueEl.className = `lpb-chart-value${isEdited ? ' is-edited' : ''}${value === null ? ' is-empty' : ''}`;
+        valueEl.contentEditable = 'true';
+        valueEl.spellcheck = false;
+        valueEl.setAttribute('role', 'textbox');
+        valueEl.setAttribute('aria-label', `${category.label} ${bracket.percent}% distance in miles`);
+        valueEl.title = 'Click to edit the distance in miles (to a tenth)';
+        valueEl.textContent = value !== null ? formatLpbMiles(value) : 'enter mi';
+        valueEl.addEventListener('focus', () => {
+            valueEl.textContent = value !== null ? value.toFixed(1) : '';
+            try {
+                const range = document.createRange();
+                range.selectNodeContents(valueEl);
+                const selection = window.getSelection();
+                selection.removeAllRanges();
+                selection.addRange(range);
+            } catch (e) { /* selection is a nicety only */ }
+        });
+        valueEl.addEventListener('keydown', (event) => {
+            if (event.key === 'Enter') {
+                event.preventDefault();
+                valueEl.blur();
+            } else if (event.key === 'Escape') {
+                event.preventDefault();
+                valueEl.textContent = value !== null ? formatLpbMiles(value) : 'enter mi';
+                valueEl.blur();
+            }
+        });
+        valueEl.addEventListener('blur', () => {
+            const typed = valueEl.textContent.trim();
+            const miles = normalizeLpbDistanceMiles(typed);
+            if (miles === null || miles === value) {
+                // Nothing usable (or nothing new) was typed: show the value as before.
+                valueEl.textContent = value !== null ? formatLpbMiles(value) : 'enter mi';
+                if (typed && miles === null) showToast('Enter the distance in miles, for example 1.5', 'Lost Person Behavior');
+                return;
+            }
+            setLpbCaseDistance(category, bracket, miles, value);
+        });
+        valueRow.appendChild(valueEl);
+
+        if (isEdited) {
+            const resetBtn = document.createElement('button');
+            resetBtn.type = 'button';
+            resetBtn.className = 'reset-pill-btn lpb-reset-btn';
+            resetBtn.textContent = '↺';
+            resetBtn.title = `Reset to the database default (${formatLpbMiles(defaultMiles)})`;
+            resetBtn.setAttribute('aria-label', `Reset the ${bracket.percent}% distance to ${formatLpbMiles(defaultMiles)}`);
+            resetBtn.onclick = (e) => {
+                e.stopPropagation();
+                setLpbCaseDistance(category, bracket, defaultMiles, value);
+            };
+            valueRow.appendChild(resetBtn);
+        }
+        column.appendChild(valueRow);
+        columns.appendChild(column);
+    });
+
+    return chart;
+}
+
+// One bracket's distance was typed or reset: the case gets the value (so
+// every device computes the same PSR), the login's table on the server gets
+// it as this user's value (or loses it again when it equals the default).
+function setLpbCaseDistance(category, bracket, miles, previousMiles) {
+    let terrain = '';
+    updateLostPersonBehavior((next) => {
+        const target = next.categories[category.key];
+        terrain = target.terrain;
+        const distances = Object.assign({}, target.distances || {});
+        distances[bracket.key] = miles;
+        target.distances = distances;
+        return `Lost Person Behavior: ${lpbCategoryLogName(category, target)} ${bracket.percent}% distance changed from ${previousMiles !== null && previousMiles !== undefined ? formatLpbMiles(previousMiles) : 'blank'} to ${formatLpbMiles(miles)}`;
+    });
+    const defaultMiles = getLpbDefaultDistance(category.label, terrain, bracket.key);
+    saveLpbOverrideDistance(category.label, terrain, bracket.key, miles === defaultMiles ? null : miles);
+    renderLostPersonBehaviorSection();
 }
 
 let currentFormsSubpage = 'task-assignment';
@@ -15516,6 +16439,8 @@ document.addEventListener('DOMContentLoaded', async () => {
         const superAdmin = (bundle.accounts || []).find(a => a.pin === '1976');
         if (superAdmin) {
             setCurrentUser(superAdmin);
+            // Geek Mode is kept per account: now that one is picked, show its own.
+            applyGeekMode();
             checkAccess();
         } else {
             showUserSelectionPopup();

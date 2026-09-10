@@ -37,6 +37,11 @@ const sampleBundle = {
         {id: 'ABCD', name: 'Primary Map'}
     ],
     profile: {incidentNumber: 'INC-1', lostPersonName: 'John Doe'},
+    lostPersonBehavior: {
+        psrAdjustmentEnabled: true,
+        ipp: {featureId: 'mk1', featureName: 'IPP', lat: 44.95, lng: -93.05, importedAt: '2026-09-09T10:00:00.000Z', importedBy: 'Jane'},
+        categories: {mentalIllness: {enabled: true, terrain: 'Mtn Temperate', distances: {p25: 0.5, p50: 1, p75: 1.5, p95: 2}}}
+    },
     accounts: [{username: 'Super Admin', pin: '1976'}],
     pages: {
         index: {
@@ -133,6 +138,41 @@ check('settings_page: single record captures settings', () => {
     const plan = buildStructuredPlan(sampleBundle, 'x');
     assert.strictEqual(plan.singles.settings_page.theme, 'dark');
     assert.strictEqual(plan.singles.settings_page.parCheckFrequency, 20);
+});
+
+check('lost_person_behavior: single record captured together with the IPP marker', () => {
+    const plan = buildStructuredPlan(sampleBundle, 'x');
+    assert.ok(SINGLE_TABLES.includes('lost_person_behavior'), 'lost_person_behavior must be a declared single table');
+    assert.deepStrictEqual(plan.singles.lost_person_behavior, sampleBundle.lostPersonBehavior);
+    assert.strictEqual(plan.hasLostPersonBehavior, true);
+    assert.strictEqual(plan.lostPersonIpp.lat, 44.95);
+    assert.strictEqual(plan.lostPersonIpp.lng, -93.05);
+    assert.strictEqual(plan.lostPersonIpp.featureId, 'mk1');
+    assert.strictEqual(plan.lostPersonIpp.featureName, 'IPP');
+    assert.strictEqual(plan.lostPersonIpp.importedBy, 'Jane');
+});
+
+check('a file without a Lost Person Behavior section reports none (so lpb_ipp is left alone)', () => {
+    const older = {...sampleBundle};
+    delete older.lostPersonBehavior;
+    const plan = buildStructuredPlan(older, 'x');
+    assert.strictEqual(plan.hasLostPersonBehavior, false);
+    assert.strictEqual(plan.lostPersonIpp, null);
+    assert.deepStrictEqual(plan.singles.lost_person_behavior, {}, 'the JSON mirror still gets an (empty) record');
+});
+
+check('a file whose IPP was cleared reports the section without an IPP (so the lpb_ipp row is removed)', () => {
+    const cleared = buildStructuredPlan({...sampleBundle, lostPersonBehavior: {ipp: null}}, 'x');
+    assert.strictEqual(cleared.hasLostPersonBehavior, true);
+    assert.strictEqual(cleared.lostPersonIpp, null);
+
+    // An IPP without a usable position counts as no IPP; a bogus section
+    // (array / string) counts as no section.
+    const unusable = buildStructuredPlan({...sampleBundle, lostPersonBehavior: {ipp: {featureId: 'mk1', lat: 'north', lng: null}}}, 'x');
+    assert.strictEqual(unusable.hasLostPersonBehavior, true);
+    assert.strictEqual(unusable.lostPersonIpp, null);
+    assert.strictEqual(buildStructuredPlan({...sampleBundle, lostPersonBehavior: []}, 'x').hasLostPersonBehavior, false);
+    assert.strictEqual(buildStructuredPlan({...sampleBundle, lostPersonBehavior: 'yes'}, 'x').hasLostPersonBehavior, false);
 });
 
 check('all declared tables are represented in the plan', () => {
