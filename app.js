@@ -14980,10 +14980,13 @@ function updateNotifications() {
   }
 
   // One entry per CalTopo Assignment that is not imported yet, with Import /
-  // Decline-for-now buttons. "Decline for now" only hides the entry on this
-  // device until the page is reloaded; the assignment stays in the table
-  // below the map.
-  if (unaccountedNames.length > 0) {
+  // Decline-for-now buttons. "Decline for now" records the assignment in the
+  // server's declined_assignment_features table for this case, so it stays
+  // quiet after a reload and on every device; the assignment itself stays in
+  // the table below the map. The entries wait until that list has been read
+  // (ensureDeclinedAssignmentFeaturesLoaded re-runs this when it arrives) so a
+  // declined assignment never flashes up - or toasts - in the meantime.
+  if (unaccountedNames.length > 0 && areDeclinedAssignmentFeaturesLoaded()) {
     const declined = getDeclinedAssignmentFeatureKeys();
     let assignmentToasts = 0;
     getUnaccountedAssignmentMapFeatures(bundle).forEach(feature => {
@@ -17967,13 +17970,133 @@ function getNewAssignmentNotificationText(feature) {
     return `Assignment ${getMapFeatureDisplayName(feature)} is on the map but not imported as a segment.`;
 }
 
-// Identity keys of the assignments whose notification was declined on this
-// device. Lives in memory only, so "for now" ends with the next page load.
+// Identity keys of the assignments whose notification was declined for now.
+// This is the page's copy of the server's declined_assignment_features table
+// for the open case (see ensureDeclinedAssignmentFeaturesLoaded): read once per
+// page load, updated at once when a button is pressed here, and refreshed by
+// every automatic map check so a decline made on another device is picked up
+// too. Switching to another case starts over with an empty, unread copy.
 function getDeclinedAssignmentFeatureKeys() {
-    if (!(window._declinedAssignmentFeatureKeys instanceof Set)) {
+    const bucket = getSyncBucket();
+    if (!(window._declinedAssignmentFeatureKeys instanceof Set) || window._declinedAssignmentFeaturesBucket !== bucket) {
         window._declinedAssignmentFeatureKeys = new Set();
+        window._declinedAssignmentFeaturesPending = new Set();
+        window._declinedAssignmentFeaturesBucket = bucket;
+        window._declinedAssignmentFeaturesLoaded = false;
+        window._declinedAssignmentFeaturesLoading = null;
     }
     return window._declinedAssignmentFeatureKeys;
+}
+
+// GET/POST /api/v1/<bucket>/declined-assignments (DELETE .../<featureKey>);
+// empty when there is no server, no case or no login to talk to.
+function getDeclinedAssignmentsApiUrl() {
+    const bucket = getSyncBucket();
+    const serverUrl = getSyncServerUrl();
+    if (!serverUrl || !bucket || !getUserCredentials()) return '';
+    return `${serverUrl.replace(/\/$/, '')}/api/v1/${bucket}/declined-assignments`;
+}
+
+// True once the server's list has been read for the open case (or the read
+// failed / there is no server and the page carries on with what it has).
+// updateNotifications holds the New Assignment entries back until then.
+function areDeclinedAssignmentFeaturesLoaded() {
+    getDeclinedAssignmentFeatureKeys();
+    return window._declinedAssignmentFeaturesLoaded === true;
+}
+
+// Read the declined assignments of the open case from the server. Runs once
+// per page load - later calls return the same promise - unless {force: true}
+// asks for a fresh read (the automatic map check does, to pick up declines
+// made on other devices). Never throws: when the server cannot be reached the
+// page keeps the keys it already has, and the notifications are rebuilt either
+// way once the answer (or the failure) is in.
+function ensureDeclinedAssignmentFeaturesLoaded(options = {}) {
+    const keys = getDeclinedAssignmentFeatureKeys();
+    if (window._declinedAssignmentFeaturesLoading) return window._declinedAssignmentFeaturesLoading;
+    if (window._declinedAssignmentFeaturesLoaded && !options.force) return Promise.resolve(keys);
+
+    const bucket = window._declinedAssignmentFeaturesBucket;
+    const stillSameCase = () => window._declinedAssignmentFeaturesBucket === bucket;
+    const url = getDeclinedAssignmentsApiUrl();
+    if (!url) {
+        window._declinedAssignmentFeaturesLoaded = true;
+        return Promise.resolve(keys);
+    }
+
+    const load = (async () => {
+        try {
+            const resp = await apiFetch(`${url}?_=${Date.now()}`, {headers: getAuthHeaders()});
+            if (resp.ok) {
+                const data = await resp.json();
+                const rows = data && Array.isArray(data.declined) ? data.declined : [];
+                if (stillSameCase()) {
+                    // The server is the source of truth; a decline this page is
+                    // still sending stays until the server has confirmed it.
+                    const set = getDeclinedAssignmentFeatureKeys();
+                    set.clear();
+                    rows.forEach(row => {
+                        const key = String(row && row.feature_key || '').trim();
+                        if (key) set.add(key);
+                    });
+                    (window._declinedAssignmentFeaturesPending || []).forEach(key => set.add(key));
+                }
+            } else {
+                console.warn(`Could not read the declined assignments from the server (HTTP ${resp.status}).`);
+            }
+        } catch (err) {
+            console.warn('Could not read the declined assignments from the server:', err);
+        } finally {
+            if (stillSameCase()) {
+                window._declinedAssignmentFeaturesLoaded = true;
+                window._declinedAssignmentFeaturesLoading = null;
+                updateNotifications();
+            }
+        }
+        return getDeclinedAssignmentFeatureKeys();
+    })();
+    window._declinedAssignmentFeaturesLoading = load;
+    return load;
+}
+
+// Write one decline to the server table (POST) or take it back again (DELETE
+// after an import). Resolves to true when the server confirmed it.
+async function sendDeclinedAssignmentFeatureChange(feature, declined) {
+    const url = getDeclinedAssignmentsApiUrl();
+    if (!url) return false;
+    const key = getMapFeatureIdentityKey(feature);
+    const bucket = window._declinedAssignmentFeaturesBucket;
+    const pending = window._declinedAssignmentFeaturesPending;
+    if (declined && pending) pending.add(key);
+    try {
+        let resp;
+        if (declined) {
+            const identity = getMapFeatureIdentity(feature);
+            resp = await apiFetch(url, {
+                method: 'POST',
+                headers: getAuthHeaders(),
+                body: JSON.stringify({
+                    fileName: getActiveCaseNumber() || undefined,
+                    featureKey: key,
+                    featureId: identity.id || '',
+                    featureName: getMapFeatureDisplayName(feature),
+                    declinedBy: getAccountName(getCurrentUser())
+                })
+            });
+        } else {
+            resp = await apiFetch(`${url}/${encodeURIComponent(key)}`, {method: 'DELETE', headers: getAuthHeaders()});
+        }
+        if (!resp.ok) {
+            console.warn(`Could not ${declined ? 'save' : 'remove'} the declined assignment on the server (HTTP ${resp.status}).`);
+            return false;
+        }
+        return true;
+    } catch (err) {
+        console.warn(`Could not ${declined ? 'save' : 'remove'} the declined assignment on the server:`, err);
+        return false;
+    } finally {
+        if (declined && pending && window._declinedAssignmentFeaturesBucket === bucket) pending.delete(key);
+    }
 }
 
 // The Import button on a New Assignment notification: the assignment becomes
@@ -17989,7 +18112,13 @@ function importUnaccountedAssignmentFeature(feature) {
     }
     // importSegmentsAction writes the "Imported segments" activity log entry.
     importSegmentsAction([buildCalTopoSegmentImportItem(feature)]);
-    getUnaccountedSelection().delete(getMapFeatureIdentityKey(feature));
+    const key = getMapFeatureIdentityKey(feature);
+    getUnaccountedSelection().delete(key);
+    // An earlier "Decline for now" is settled by the import: forget it here and
+    // on the server, so a shape with the same key is announced again later.
+    if (getDeclinedAssignmentFeatureKeys().delete(key)) {
+        sendDeclinedAssignmentFeatureChange(feature, false).catch(() => {});
+    }
     showToast(`Imported assignment ${name} as a segment.`, 'Import Complete');
     if (isMapsPage()) {
         renderUnaccountedFeaturesPanel();
@@ -17999,11 +18128,14 @@ function importUnaccountedAssignmentFeature(feature) {
     return true;
 }
 
-// The Decline-for-now button: hides this assignment's notification on this
-// device (its toast stays quiet like a dismissed one) without importing it or
-// marking it unwanted, so it is still listed in the table below the map.
-function declineAssignmentFeatureForNow(feature) {
-    if (!feature) return;
+// The Decline-for-now button: hides this assignment's notification without
+// importing it or marking it unwanted, so it is still listed in the table below
+// the map. The decline is recorded in the server's declined_assignment_features
+// table for this case (and applied here at once), so the same assignment is not
+// announced again after a page refresh or on another device; its toast stays
+// quiet like a dismissed one. Resolves once the server has answered.
+async function declineAssignmentFeatureForNow(feature) {
+    if (!feature) return false;
     getDeclinedAssignmentFeatureKeys().add(getMapFeatureIdentityKey(feature));
     const toastKey = NEW_ASSIGNMENT_NOTIFICATION_TITLE + getNewAssignmentNotificationText(feature);
     const bundle = loadBundle();
@@ -18013,6 +18145,13 @@ function declineAssignmentFeatureForNow(feature) {
         saveBundle(bundle);
     }
     updateNotifications();
+
+    if (!getDeclinedAssignmentsApiUrl()) return false;
+    const saved = await sendDeclinedAssignmentFeatureChange(feature, true);
+    if (!saved) {
+        showToast(`Could not save the decline of ${getMapFeatureDisplayName(feature)} on the server; it stays hidden on this page only.`, 'Decline Not Saved');
+    }
+    return saved;
 }
 
 function getUnaccountedFeatureNotificationText(names) {
@@ -18045,6 +18184,9 @@ function refreshUnaccountedMapFeatureNotifications(bundle = null) {
     if (names.length) {
         if (!window._shownToasts) window._shownToasts = new Set();
         window._shownToasts.add(UNACCOUNTED_FEATURES_NOTIFICATION_TITLE + getUnaccountedFeatureNotificationText(names));
+        // The New Assignment entries are listed once the server has said which
+        // assignments were declined for now (it rebuilds the list on arrival).
+        ensureDeclinedAssignmentFeaturesLoaded();
     }
     const navMaps = document.getElementById('nav-maps');
     if (navMaps) {
@@ -18095,6 +18237,9 @@ async function checkUnaccountedMapFeaturesAndNotify(options = {}) {
                 return [];
             }
 
+            // Re-read the declined assignments too, so a "Decline for now" pressed
+            // on another device since the last check is honoured here as well.
+            await ensureDeclinedAssignmentFeaturesLoaded({force: true});
             const names = refreshUnaccountedMapFeatureNotifications();
             const text = getUnaccountedFeatureNotificationText(names);
             const toastKey = UNACCOUNTED_FEATURES_NOTIFICATION_TITLE + text;

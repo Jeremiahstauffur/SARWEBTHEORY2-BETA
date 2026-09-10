@@ -413,6 +413,24 @@ const initDatabaseSchema = () => {
             PRIMARY KEY (username, search_case, entry_id),
             KEY idx_activity_entries_case_time (username, search_case, logged_at)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
+        // CalTopo Assignments whose "New Assignment" notification was declined
+        // with the "Decline for now" button, one row per (login, CASE #,
+        // feature). The website reads this list on every page load so a
+        // declined assignment is not announced again after a refresh or on
+        // another device; importing the assignment removes its row again.
+        // feature_key is the website's identity key for the shape ("id:<CalTopo
+        // id>" or "name:<lower-cased name>" when the shape has no real id).
+        db.run(`CREATE TABLE IF NOT EXISTS \`${DECLINED_ASSIGNMENTS_TABLE}\` (
+            username VARCHAR(191) NOT NULL,
+            search_case VARCHAR(191) NOT NULL,
+            feature_key VARCHAR(191) NOT NULL,
+            feature_id VARCHAR(255),
+            feature_name VARCHAR(255),
+            declined_by VARCHAR(255),
+            declined_at VARCHAR(64),
+            PRIMARY KEY (username, search_case, feature_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
     });
 };
 
@@ -439,6 +457,9 @@ const STRUCTURED_TABLES = [...COLLECTION_TABLES, ...SINGLE_TABLES];
 
 // Per-entry activity log store (one row per entry, keyed by entry id).
 const ACTIVITY_ENTRIES_TABLE = 'activity_log_entries';
+
+// "Declined for now" New Assignment notifications (one row per feature).
+const DECLINED_ASSIGNMENTS_TABLE = 'declined_assignment_features';
 
 // Promise wrapper around the sqlite-compatible db.run helper.
 const runAsync = (sql, params = []) => new Promise((resolve, reject) => {
@@ -819,6 +840,7 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports.SINGLE_TABLES = SINGLE_TABLES;
     module.exports.STRUCTURED_TABLES = STRUCTURED_TABLES;
     module.exports.ACTIVITY_ENTRIES_TABLE = ACTIVITY_ENTRIES_TABLE;
+    module.exports.DECLINED_ASSIGNMENTS_TABLE = DECLINED_ASSIGNMENTS_TABLE;
     module.exports.activityEntryId = activityEntryId;
     module.exports.collectActivityEntryChanges = collectActivityEntryChanges;
     module.exports.isInternalStoreKey = isInternalStoreKey;
@@ -1422,6 +1444,82 @@ app.get('/api/v1/:bucket/activity', authMiddleware, async (req, res) => {
     });
 });
 
+// ---------------------------------------------------------------------------
+// "Declined for now" New Assignment notifications
+// ---------------------------------------------------------------------------
+// The website shows one "New Assignment" notification per CalTopo Assignment
+// that is on the map but not imported as a segment. Its "Decline for now"
+// button used to hide the entry in memory only, so every page refresh raised
+// the same notification again. The declined features are kept here instead,
+// per login and CASE #, so the website can leave them out on every load and on
+// every device. `?case=` / body.fileName name the CASE # explicitly; otherwise
+// it is the CASE # behind the bucket.
+const declinedFeatureKey = (value) => String(value || '').trim().slice(0, 191);
+
+const searchCaseForRequest = (req, bucket, username) => {
+    const explicit = String((req.query && (req.query.case || req.query.searchCase))
+        || (req.body && (req.body.searchCase || req.body.fileName)) || '').trim();
+    const searchCase = explicit || caseNumberFromBucket(bucket, username);
+    return isInternalStoreKey(searchCase) ? '' : searchCase.replace(/\.json$/i, '');
+};
+
+// The declined assignments of this login and CASE #.
+app.get('/api/v1/:bucket/declined-assignments', authMiddleware, (req, res) => {
+    const {bucket} = req.params;
+    const username = req.user.username;
+    const searchCase = searchCaseForRequest(req, bucket, username);
+    if (!searchCase) {
+        return res.status(400).json({error: 'A CASE # is required'});
+    }
+    db.all(`SELECT feature_key, feature_id, feature_name, declined_by, declined_at FROM \`${DECLINED_ASSIGNMENTS_TABLE}\` WHERE username = ? AND search_case = ? ORDER BY declined_at ASC, feature_key ASC`,
+        [username, searchCase], (err, rows) => {
+            if (err) { return res.status(500).json({error: 'Failed to read declined assignments'}); }
+            res.json({username, searchCase, declined: rows || []});
+        });
+});
+
+// "Decline for now" pressed: remember the feature. Declining the same feature
+// twice (two devices, a retry) just refreshes the row.
+app.post('/api/v1/:bucket/declined-assignments', authMiddleware, (req, res) => {
+    const {bucket} = req.params;
+    const username = req.user.username;
+    const searchCase = searchCaseForRequest(req, bucket, username);
+    const body = req.body && typeof req.body === 'object' ? req.body : {};
+    const featureKey = declinedFeatureKey(body.featureKey);
+    if (!searchCase) {
+        return res.status(400).json({error: 'A CASE # is required'});
+    }
+    if (!featureKey) {
+        return res.status(400).json({error: 'featureKey is required'});
+    }
+    const now = new Date().toISOString();
+    db.run(`REPLACE INTO \`${DECLINED_ASSIGNMENTS_TABLE}\` (username, search_case, feature_key, feature_id, feature_name, declined_by, declined_at) VALUES (?, ?, ?, ?, ?, ?, ?)`,
+        [username, searchCase, featureKey, toLabel(body.featureId) || null, toLabel(body.featureName) || null, toLabel(body.declinedBy) || null, now], (err) => {
+            if (err) { return res.status(500).json({error: 'Failed to save declined assignment'}); }
+            res.json({success: true, username, searchCase, featureKey, declinedAt: now});
+        });
+});
+
+// The decline no longer applies (the assignment was imported): forget it, so a
+// later shape with the same key is announced again.
+app.delete('/api/v1/:bucket/declined-assignments/:featureKey', authMiddleware, (req, res) => {
+    const {bucket} = req.params;
+    const username = req.user.username;
+    const searchCase = searchCaseForRequest(req, bucket, username);
+    const featureKey = declinedFeatureKey(req.params.featureKey);
+    if (!searchCase) {
+        return res.status(400).json({error: 'A CASE # is required'});
+    }
+    if (!featureKey) {
+        return res.status(400).json({error: 'featureKey is required'});
+    }
+    db.run(`DELETE FROM \`${DECLINED_ASSIGNMENTS_TABLE}\` WHERE username = ? AND search_case = ? AND feature_key = ?`,
+        [username, searchCase, featureKey], (err) => {
+            if (err) { return res.status(500).json({error: 'Failed to remove declined assignment'}); }
+            res.json({success: true, username, searchCase, featureKey});
+        });
+});
+
 // Read back a single page of the stored search file.
 app.get('/api/v1/:bucket/page/:page', authMiddleware, async (req, res) => {
     const {bucket, page} = req.params;
@@ -1607,7 +1705,7 @@ app.delete('/api/v1/:bucket', authMiddleware, async (req, res) => {
             //    store key, which is common to every case), including the per-entry
             //    activity log rows.
             for (const searchCase of searchCases) {
-                for (const table of [...STRUCTURED_TABLES, ACTIVITY_ENTRIES_TABLE]) {
+                for (const table of [...STRUCTURED_TABLES, ACTIVITY_ENTRIES_TABLE, DECLINED_ASSIGNMENTS_TABLE]) {
                     await runAsync(`DELETE FROM \`${table}\` WHERE username = ? AND search_case = ?`, [userName, searchCase]);
                 }
             }

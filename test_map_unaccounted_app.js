@@ -9,6 +9,8 @@
 //     and the notification opens the Maps page,
 //   - every unimported CalTopo Assignment gets its own "New Assignment"
 //     notification with Import / Decline-for-now buttons,
+//   - "Decline for now" is stored on the server (declined_assignment_features)
+//     and honoured again on the next page load; an import takes it back,
 //   - the feature-type toggles below the map hide (mark unwanted) whole types
 //     and restore them when switched back on,
 //   - the Settings toggle stops the automatic check.
@@ -160,20 +162,44 @@ function createSandbox({store, fetch, page = 'page10', withUtils = true} = {}) {
 }
 
 // A CalTopo proxy answering with `features`, plus a sync server that accepts
-// everything. Records the proxy fetches.
+// everything. Records the proxy fetches and keeps the declined-assignment
+// table (`declined`, feature_key -> row) like the real server does, so a second
+// sandbox on the same server sees what the first one declined.
 function createServer(features) {
     const proxyCalls = [];
-    const state = {features};
+    const declinedCalls = [];
+    const declined = new Map();
+    const state = {features, declined, declinedCalls, failDeclined: false};
+    const json = (body, status = 200) => ({ok: status < 400, status, headers: {get: () => 'application/json'}, json: async () => body});
     const fetch = async (url, init = {}) => {
         const text = String(url);
         if (text.startsWith(PROXY_URL)) {
             proxyCalls.push(init.body ? JSON.parse(init.body) : null);
-            return {ok: true, status: 200, headers: {get: () => 'application/json'}, json: async () => ({features: state.features})};
+            return json({features: state.features});
         }
-        return {ok: true, status: 200, headers: {get: () => 'application/json'}, json: async () => ({success: true, applied: 1, modified: false})};
+        const match = text.match(/\/api\/v1\/([^/]+)\/declined-assignments(?:\/([^?]+))?(?:\?|$)/);
+        if (match) {
+            const method = String(init.method || 'GET').toUpperCase();
+            const body = init.body ? JSON.parse(init.body) : null;
+            declinedCalls.push({method, bucket: match[1], featureKey: match[2] ? decodeURIComponent(match[2]) : null, body, headers: init.headers || {}});
+            if (state.failDeclined) return json({error: 'down'}, 500);
+            if (method === 'GET') return json({declined: [...declined.values()]});
+            if (method === 'POST') {
+                declined.set(body.featureKey, {feature_key: body.featureKey, feature_id: body.featureId, feature_name: body.featureName, declined_by: body.declinedBy, declined_at: 't'});
+                return json({success: true, featureKey: body.featureKey});
+            }
+            if (method === 'DELETE') {
+                declined.delete(match[2] ? decodeURIComponent(match[2]) : '');
+                return json({success: true});
+            }
+        }
+        return json({success: true, applied: 1, modified: false});
     };
-    return {fetch, proxyCalls, state};
+    return {fetch, proxyCalls, state, declined, declinedCalls};
 }
+
+// Lets every promise that is already settled run its callbacks.
+const settle = () => new Promise(resolve => setImmediate(resolve));
 
 const calTopoFeature = (name, id) => ({
     type: 'Feature',
@@ -335,14 +361,22 @@ check('Import Selected with nothing checked marks every unaccounted shape unwant
     assert.ok(app.__alerts.some(a => /no unaccounted map features/.test(a)));
 });
 
-check('every unimported CalTopo Assignment gets its own New Assignment notification with Import / Decline buttons', () => {
+check('every unimported CalTopo Assignment gets its own New Assignment notification with Import / Decline buttons', async () => {
     const features = [storedFeature('Zulu', 'z'), storedMarker('PLS', 'p'), storedShape('Hazard', 'h'), storedFeature('Mike', 'm')];
     const store = seedStore({features});
-    const app = createSandbox({store, fetch: createServer([]).fetch, page: 'page2'});
+    const server = createServer([]);
+    const app = createSandbox({store, fetch: server.fetch, page: 'page2'});
 
     app.refreshUnaccountedMapFeatureNotifications();
 
     assert.deepStrictEqual(plain(app.window._unaccountedMapFeatureNames), ['Hazard', 'Mike', 'PLS', 'Zulu'], 'the general notification still covers every unaccounted shape');
+    // The assignment entries wait for the server's declined list, so nothing
+    // declined elsewhere can flash up (or toast) in the meantime.
+    assert.strictEqual(assignmentItems(app).length, 0, 'no assignment entry before the declined list is in');
+    assert.strictEqual(assignmentToasts(app).length, 0);
+    await app.ensureDeclinedAssignmentFeaturesLoaded();
+    assert.deepStrictEqual(server.declinedCalls.map(c => c.method), ['GET'], 'the declined list is read from the server once');
+    assert.strictEqual(server.declinedCalls[0].bucket, `${CASE}_tester`, 'for this CASE # and login');
     const items = assignmentItems(app);
     assert.strictEqual(items.length, 2, 'one entry per assignment (the marker and the plain shape get none)');
     assert.ok(/Assignment Mike is on the map but not imported as a segment/.test(items[0].innerHTML), items[0].innerHTML);
@@ -351,13 +385,21 @@ check('every unimported CalTopo Assignment gets its own New Assignment notificat
     assert.strictEqual(assignmentToasts(app).length, 2, 'each assignment toasts once');
     assert.deepStrictEqual(actionButtons(app.__body.children.find(el => /map-assignment-new/.test(el.className || ''))).map(b => b.textContent), ['Import', 'Decline for now'], 'the toast carries the same buttons');
 
-    // Decline for now: the entry disappears, nothing is imported or marked unwanted.
+    // Decline for now: the entry disappears at once, nothing is imported or
+    // marked unwanted, and the decline is written to the server table.
     actionButtons(items[1])[1].onclick({stopPropagation() {}});
     assert.deepStrictEqual(assignmentItems(app).map(el => /Zulu/.test(el.innerHTML)), [false], 'only Mike is left');
     assert.deepStrictEqual(segmentNames(app), []);
     assert.deepStrictEqual(unwantedNames(app), []);
     assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures().map(app.getMapFeatureDisplayName)), ['Hazard', 'Mike', 'PLS', 'Zulu'], 'Zulu still waits in the table below the map');
     assert.ok(plain(app.loadBundle().dismissedNotifications).some(k => /New AssignmentAssignment Zulu/.test(k)), 'its toast stays quiet like a dismissed one');
+    await settle();
+    const post = server.declinedCalls.find(c => c.method === 'POST');
+    assert.ok(post, 'the decline is sent to the server');
+    assert.strictEqual(post.bucket, `${CASE}_tester`);
+    assert.strictEqual(post.headers['X-User-Name'], 'tester', 'under this login');
+    assert.deepStrictEqual(plain({...post.body}), {fileName: CASE, featureKey: 'id:z', featureId: 'z', featureName: 'Zulu', declinedBy: ''});
+    assert.deepStrictEqual([...server.declined.keys()], ['id:z'], 'the server table now holds Zulu');
 
     // Import: only that assignment becomes a segment.
     actionButtons(assignmentItems(app)[0])[0].onclick({stopPropagation() {}});
@@ -371,6 +413,60 @@ check('every unimported CalTopo Assignment gets its own New Assignment notificat
     // Importing again is a no-op that just says so.
     assert.strictEqual(app.importUnaccountedAssignmentFeature(features[3]), false);
     assert.ok(toasts(app).some(html => /already imported/.test(html)));
+    await settle();
+    assert.ok(!server.declinedCalls.some(c => c.method === 'DELETE'), 'importing an assignment that was never declined touches no server row');
+});
+
+check('a declined assignment stays declined after a page reload (and on other devices) until it is imported', async () => {
+    const features = [storedFeature('Zulu', 'z'), storedFeature('Mike', 'm')];
+    // The CalTopo map keeps both assignments, so a re-fetch changes nothing.
+    const server = createServer([calTopoFeature('Zulu', 'z'), calTopoFeature('Mike', 'm')]);
+
+    // Page 1 declines Zulu.
+    const first = createSandbox({store: seedStore({features}), fetch: server.fetch, page: 'page2'});
+    first.refreshUnaccountedMapFeatureNotifications();
+    await first.ensureDeclinedAssignmentFeaturesLoaded();
+    assert.strictEqual(assignmentItems(first).length, 2);
+    assert.strictEqual(await first.declineAssignmentFeatureForNow(features[0]), true, 'the server confirmed the decline');
+    assert.deepStrictEqual([...server.declined.keys()], ['id:z']);
+
+    // Page 2 (a refresh, or another device on the same case) reads it back:
+    // Zulu is neither listed nor toasted, Mike still is.
+    const second = createSandbox({store: seedStore({features}), fetch: server.fetch, page: 'page3'});
+    second.refreshUnaccountedMapFeatureNotifications();
+    await second.ensureDeclinedAssignmentFeaturesLoaded();
+    assert.deepStrictEqual(plain([...second.getDeclinedAssignmentFeatureKeys()]), ['id:z'], 'the declined key comes from the server');
+    assert.deepStrictEqual(assignmentItems(second).map(el => /Mike/.test(el.innerHTML)), [true], 'only Mike is announced');
+    assert.deepStrictEqual(assignmentToasts(second).map(html => /Zulu/.test(html)), [false], 'Zulu does not toast either');
+    assert.deepStrictEqual(plain(second.getUnaccountedMapFeatures().map(second.getMapFeatureDisplayName)), ['Mike', 'Zulu'], 'Zulu still waits in the table below the map');
+
+    // Declining twice is harmless (the row is refreshed, not duplicated).
+    await second.declineAssignmentFeatureForNow(features[0]);
+    assert.strictEqual(server.declined.size, 1);
+
+    // A decline made on another device is picked up by the periodic check.
+    server.declined.set('id:m', {feature_key: 'id:m', feature_name: 'Mike'});
+    await second.checkUnaccountedMapFeaturesAndNotify();
+    assert.strictEqual(assignmentItems(second).length, 0, 'the check re-reads the declined list');
+
+    // Importing Zulu settles the decline: the server row goes away, so a
+    // later shape with the same key is announced again.
+    second.importUnaccountedAssignmentFeature(features[0]);
+    await settle();
+    assert.deepStrictEqual(segmentNames(second), ['Zulu']);
+    assert.deepStrictEqual(server.declinedCalls.filter(c => c.method === 'DELETE').map(c => c.featureKey), ['id:z']);
+    assert.deepStrictEqual([...server.declined.keys()], ['id:m']);
+
+    // When the server cannot be reached the decline still hides the entry on
+    // this page and the user is told it was not saved.
+    server.state.failDeclined = true;
+    const third = createSandbox({store: seedStore({features}), fetch: server.fetch, page: 'page2'});
+    third.refreshUnaccountedMapFeatureNotifications();
+    await third.ensureDeclinedAssignmentFeaturesLoaded();
+    assert.strictEqual(assignmentItems(third).length, 2, 'without an answer every assignment is listed');
+    assert.strictEqual(await third.declineAssignmentFeatureForNow(features[1]), false);
+    assert.deepStrictEqual(assignmentItems(third).map(el => /Zulu/.test(el.innerHTML)), [true], 'Mike is hidden on this page anyway');
+    assert.ok(toasts(third).some(html => /Decline Not Saved/.test(html)), 'the user is told the decline did not reach the server');
 });
 
 check('the feature-type toggles mark switched-off types unwanted, keep doing so on later fetches, and restore them when switched back on', async () => {
