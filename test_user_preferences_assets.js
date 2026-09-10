@@ -439,16 +439,25 @@ const run = async () => {
 
     console.log('theme-boot.js: no dark-then-light flash');
 
-    await check('every page loads theme-boot.js in <head>, right after the stylesheet', () => {
+    await check('every page loads theme-boot.js as the first thing in <head>, before the stylesheet', () => {
         fs.readdirSync(__dirname).filter(f => /\.html$/.test(f)).forEach((file) => {
             const html = fs.readFileSync(path.join(__dirname, file), 'utf8');
             const head = html.slice(0, html.indexOf('<body'));
             assert.ok(/<script src="theme-boot\.js\?v=\d+"><\/script>/.test(head), `${file} must load theme-boot.js in <head>`);
-            assert.ok(head.indexOf('href="styles.css') < head.indexOf('src="theme-boot.js'), `${file}: the stylesheet comes first`);
+            const bootAt = head.indexOf('src="theme-boot.js');
+            assert.ok(bootAt < head.indexOf('href="styles.css'), `${file}: theme-boot.js comes before the stylesheet`);
+            assert.strictEqual(head.indexOf('<script'), head.lastIndexOf('<script', bootAt), `${file}: no other script runs before theme-boot.js`);
+            assert.strictEqual(head.indexOf('<link rel="stylesheet"'), head.indexOf('<link rel="stylesheet" href="styles.css'), `${file}: no stylesheet is requested before theme-boot.js ran`);
         });
-        assert.ok(/html\.sar-booting::before[\s\S]*rgba\(7, 16, 34, 0\.8\)/.test(stylesSource), 'dark overlay at 80%');
-        assert.ok(/html\.sar-booting\.light-mode::before[\s\S]*rgba\(244, 247, 251, 0\.8\)/.test(stylesSource), 'light overlay at 80%');
-        assert.ok(/html\.sar-booting::after[\s\S]*animation: sar-boot-spin/.test(stylesSource), 'a rotating loader');
+        // The overlay CSS lives in theme-boot.js (injected inline), not in styles.css,
+        // so it is in force before the stylesheet has even arrived.
+        assert.ok(!/sar-booting::/.test(stylesSource), 'styles.css no longer carries the overlay (single source: theme-boot.js)');
+        assert.ok(/html \{ background: #071022; color-scheme: dark; \}/.test(bootSource), 'dark canvas before styles.css arrives');
+        assert.ok(/html\.light-mode \{ background: #f4f7fb; color-scheme: light; \}/.test(bootSource), 'light canvas before styles.css arrives');
+        assert.ok(/html\.sar-booting::before[^']*rgba\(7, 16, 34, 0\.8\)/.test(bootSource), 'dark overlay at 80%');
+        assert.ok(/html\.sar-booting\.light-mode::before[^']*rgba\(244, 247, 251, 0\.8\)/.test(bootSource), 'light overlay at 80%');
+        assert.ok(/html\.sar-booting::after[^']*animation: sar-boot-spin/.test(bootSource), 'a rotating loader');
+        assert.ok(/border-top-color: var\(--accent, #7dc6ff\)/.test(bootSource), 'the spinner has a colour even before styles.css defines --accent');
     });
 
     await check('the hint cookie puts the page in light mode (and Geek Mode) before the first paint, under the boot overlay', () => {
@@ -456,6 +465,9 @@ const run = async () => {
         assert.ok(light.__html.classList.contains('light-mode'), 'light-mode is on before app.js ran');
         assert.ok(light.__html.classList.contains('geek-mode'));
         assert.ok(light.__html.classList.contains('sar-booting'), 'the overlay is up');
+        const injected = light.document.head.children.find(c => c.id === 'sar-boot-style');
+        assert.ok(injected, 'the overlay/canvas CSS is injected into <head> by theme-boot.js');
+        assert.ok(/html\.sar-booting::before/.test(injected.textContent) && /@keyframes sar-boot-spin/.test(injected.textContent));
         const dark = createSandbox({baseUrl});
         assert.ok(!dark.__html.classList.contains('light-mode'), 'without a hint the page stays dark');
         assert.ok(dark.__html.classList.contains('sar-booting'));
