@@ -20,12 +20,20 @@ const FILE_LIST_STORAGE_KEY = 'sar-saved-files-v1';
 // under this name: its name always follows the CASE # it was created for.
 const DEFAULT_FILE_NAME = '';
 const NO_CASE_LABEL = 'No case selected';
-const SYNC_URL_STORAGE_KEY = 'sar-sync-url-v1';
+// Which sync server this device talks to. Two cookies, in order of precedence:
+//   * SYNC_URL_LOCAL_STORAGE_KEY - the address typed into the login popup's
+//     "Set Server" (the ONLY place a person can change the data server; it is
+//     reached by logging out first);
+//   * SYNC_URL_CONFIG_STORAGE_KEY - the address the server itself publishes
+//     from the Railway variable CALTOPO_SYNC (GET /api/config), refreshed on
+//     every page load and used whenever nothing was set by hand.
+// The CalTopo proxy is not configurable any more: it is always the sync
+// server's own /api/proxy (see getCalTopoProxy).
 const SYNC_URL_LOCAL_STORAGE_KEY = 'sar-sync-url-local-v1';
+const SYNC_URL_CONFIG_STORAGE_KEY = 'sar-sync-url-config-v1';
 const SYNC_BUCKET_STORAGE_KEY = 'sar-sync-bucket-v1';
 const USER_NAME_STORAGE_KEY = 'sar-user-name-v1';
 const USER_PASSWORD_STORAGE_KEY = 'sar-user-password-v1';
-const CALTOPO_PROXY_STORAGE_KEY = 'sar-caltopo-proxy-v1';
 const CALTOPO_CREDS_STORAGE_KEY = 'sar-caltopo-creds-v1';
 const DEVICE_ID_STORAGE_KEY = 'sar-device-id-v1';
 // The background photo every page shows unless the login uploaded its own.
@@ -1908,7 +1916,16 @@ async function withSaveButtonFeedback(button, saveAction, options = {}) {
 // Public backend (Railway) that runs the SAR sync API (register/login + per-user
 // data buckets). The GitHub-hosted static site cannot execute data.php locally,
 // so all API requests must be sent to this absolute URL instead of a relative path.
+// It is only the bootstrap address: the server it names publishes the address
+// the website is actually to use (Railway variable CALTOPO_SYNC, GET /api/config),
+// which then takes over as the default - see loadSyncServerConfig().
 const DEFAULT_SYNC_SERVER_URL = 'https://sarwebtheory2-production.up.railway.app';
+
+// Absolute http(s) address with no trailing slash, or '' when the value is not one.
+function normalizeSyncServerUrl(url) {
+    const trimmed = typeof url === 'string' ? url.trim().replace(/\/+$/, '') : '';
+    return /^https?:\/\/[^\s/]+/i.test(trimmed) ? trimmed : '';
+}
 
 // A locally-stored (cookie) sync server URL, set from the login popup BEFORE
 // authentication. This is the source against which all data flows in and out.
@@ -1928,6 +1945,28 @@ function setLocalSyncServerUrl(url) {
     }
 }
 
+// The sync server address the server publishes from its CALTOPO_SYNC variable,
+// as last read by this device (cookie, so it is known before the first request
+// of the next page load). '' until a server has answered /api/config.
+function getPublishedSyncServerUrl() {
+    return normalizeSyncServerUrl(getCookie(SYNC_URL_CONFIG_STORAGE_KEY));
+}
+
+function setPublishedSyncServerUrl(url) {
+    const normalized = normalizeSyncServerUrl(url);
+    if (normalized) {
+        setCookie(SYNC_URL_CONFIG_STORAGE_KEY, normalized);
+    } else {
+        eraseCookie(SYNC_URL_CONFIG_STORAGE_KEY);
+    }
+}
+
+// The address the website uses when nobody typed one into "Set Server": the
+// one CALTOPO_SYNC publishes, else the built-in bootstrap address.
+function getDefaultSyncServerUrl() {
+    return getPublishedSyncServerUrl() || DEFAULT_SYNC_SERVER_URL;
+}
+
 function getSyncServerUrl() {
     // A URL explicitly set from the login popup wins over everything else so the
     // user can point the app at their own server before (and after) logging in.
@@ -1935,11 +1974,10 @@ function getSyncServerUrl() {
     if (localUrl) {
         return localUrl;
     }
-    const configuredUrl = _serverSettings && _serverSettings[SYNC_URL_STORAGE_KEY];
-    // Only honor an explicitly configured absolute URL. A stale relative value
-    // like "data.php" would resolve against the static host and fail with a 405.
-    if (configuredUrl && /^https?:\/\//i.test(configuredUrl)) {
-        return configuredUrl;
+    // Next, the address the server publishes from CALTOPO_SYNC (once read).
+    const publishedUrl = getPublishedSyncServerUrl();
+    if (publishedUrl) {
+        return publishedUrl;
     }
     // When running the backend locally, talk to the local sync server.
     if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
@@ -1949,6 +1987,50 @@ function getSyncServerUrl() {
     // backend over an absolute URL; a relative "data.php" would hit the static
     // host and return a 405 HTML page instead of JSON.
     return DEFAULT_SYNC_SERVER_URL;
+}
+
+// Which servers loadSyncServerConfig() asks for the published address, in
+// order: the one this device uses now, then the bootstrap address (not from a
+// localhost page, which must never silently talk to production).
+function getSyncConfigServerCandidates() {
+    const isLocalPage = typeof window !== 'undefined' && !!window.location
+        && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
+    const candidates = [normalizeSyncServerUrl(getSyncServerUrl())];
+    if (!isLocalPage) candidates.push(DEFAULT_SYNC_SERVER_URL);
+    return candidates.filter((url, index) => !!url && candidates.indexOf(url) === index);
+}
+
+// Ask the server which sync server the website is to use (its CALTOPO_SYNC
+// variable, GET /api/config) and remember the answer for getSyncServerUrl().
+// Runs once per page load, before anything else talks to the server, and is
+// bounded by a timeout so a sleeping or unreachable server cannot hold the
+// page. Nothing is changed when no server answers: the last published address
+// stays in force. A server that answers with no address (variable unset)
+// clears the remembered one, so the built-in bootstrap address is used again.
+// Resolves with the address in force afterwards.
+async function loadSyncServerConfig(timeoutMs = 4000) {
+    for (const base of getSyncConfigServerCandidates()) {
+        if (isBlockedMixedContentUrl(base)) continue;
+        try {
+            const resp = await fetchWithTimeout(`${base}/api/config?_=${Date.now()}`, {
+                method: 'GET',
+                cache: 'no-store'
+            }, timeoutMs);
+            if (!resp || !resp.ok) continue;
+            const data = await resp.json().catch(() => null);
+            if (!data || typeof data !== 'object' || !('syncServerUrl' in data)) continue;
+            const published = normalizeSyncServerUrl(data.syncServerUrl);
+            if (published && isBlockedMixedContentUrl(published)) {
+                console.warn(`[SYNC] CALTOPO_SYNC names an http:// server (${published}) that this https:// page cannot call; ignoring it.`);
+                continue;
+            }
+            setPublishedSyncServerUrl(published);
+            return getSyncServerUrl();
+        } catch (e) {
+            // Unreachable / timed out: try the next candidate.
+        }
+    }
+    return getSyncServerUrl();
 }
 
 // The working copy of the open case, the rows still queued for the server and
@@ -2275,7 +2357,7 @@ function saveUserPreferences(patch) {
     if (!getUserCredentials() || !patch || typeof patch !== 'object') return null;
     // Never write before the server's record was read: the PUT replaces the
     // whole record, so saving onto an empty stand-in would wipe the login's
-    // case number, proxy URL and every other setting.
+    // case number, preferences and every other setting.
     if (!_serverSettingsLoaded) {
         console.warn('Preferences not saved: the server settings have not been read yet.');
         return null;
@@ -2602,17 +2684,19 @@ function isBlockedMixedContentUrl(url) {
 }
 
 // Base URLs to try for the pre-login auth calls, in priority order. The address
-// this device is configured to use comes first, then the public backend as a
-// fallback, so a device holding a stale or unreachable "Set Server" address (or
-// an http:// one that gets blocked as mixed content) can still log in instead
-// of dead-ending on "Failed to fetch". Local development is left alone: a page
-// opened from localhost must never silently talk to production.
+// this device is configured to use comes first, then the address CALTOPO_SYNC
+// publishes, then the built-in public backend as a last fallback, so a device
+// holding a stale or unreachable "Set Server" address (or an http:// one that
+// gets blocked as mixed content) can still log in instead of dead-ending on
+// "Failed to fetch". Local development is left alone: a page opened from
+// localhost must never silently talk to production.
 function getAuthServerUrlCandidates() {
     const stripTrailingSlash = url => String(url || '').trim().replace(/\/$/, '');
     const isLocalPage = typeof window !== 'undefined' && !!window.location
         && (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1');
     const candidates = [stripTrailingSlash(getSyncServerUrl())];
     if (!isLocalPage) {
+        candidates.push(stripTrailingSlash(getPublishedSyncServerUrl()));
         candidates.push(stripTrailingSlash(DEFAULT_SYNC_SERVER_URL));
     }
     return candidates.filter((url, index) => !!url && candidates.indexOf(url) === index);
@@ -2984,7 +3068,7 @@ async function postAuthRequest(endpointPath, payload, options = {}) {
                 'a browser extension (ad/script blocker, privacy shield),',
                 'a VPN or corporate proxy, or Windows/browser certificate trust being out of date.',
                 'Try: an incognito/private window with extensions off, then temporarily disable the antivirus web/HTTPS scanning, then a different network (mobile hotspot).',
-                `To confirm the server is up, open ${DEFAULT_SYNC_SERVER_URL}/api/health directly in this browser \u2014 if that shows "status":"ok" while the app still cannot connect, the block is on this device.`,
+                `To confirm the server is up, open ${getDefaultSyncServerUrl()}/api/health directly in this browser \u2014 if that shows "status":"ok" while the app still cannot connect, the block is on this device.`,
                 'The "Set Server" popup also has a "Test" button that reports exactly what is failing.'
             ].join(' ')
     ].filter(Boolean).join(' '));
@@ -3063,16 +3147,24 @@ function showLoginPopup() {
             if (resp.ok && data.success) {
                 setCookie(USER_NAME_STORAGE_KEY, data.user.username);
                 setCookie(USER_PASSWORD_STORAGE_KEY, data.user.pin);
-                setCurrentUser(data.user);
-                // Read this login's stored preferences now and leave the theme
-                // hint for the reload, so the first page after logging in
+                // The login is the team's, not a person's: nobody is the current
+                // user until they pick themselves in the profile popup below.
+                sessionStorage.removeItem('sar-current-user');
+                // Read this login's stored preferences now (they also name the
+                // open case, whose team members the picker lists) and leave the
+                // theme hint for the reload, so the first page after logging in
                 // already paints in the login's theme (see theme-boot.js).
                 loginBtn.textContent = 'Loading your settings\u2026';
                 _serverSettings = null;
                 await withTimeout(loadServerSettings(), 6000);
                 rememberUiHintFromPreferences();
+                loginBtn.textContent = 'Loading team members\u2026';
+                const choices = await withTimeout(fetchLoginProfileChoices(), 8000);
                 closePopup(popup);
-                window.location.reload();
+                showLoginProfilePopup(choices, (user) => {
+                    setCurrentUser(user);
+                    window.location.reload();
+                });
                 return;
             }
             alert(data.error || 'no matching login found');
@@ -3177,13 +3269,20 @@ function showAdminVerifyPopup(username, pin, loginPopup) {
             const {resp} = await postAuthRequest('/api/auth/register', { username, pin, adminPassword });
             const data = await readJsonResponse(resp);
             if (resp.ok && data.success) {
-                // Auto-login the new account: identical to the login-success path.
+                // Auto-login the new account: identical to the login-success path,
+                // including the "who is using this device?" pick (a brand-new
+                // login has no team members yet, so that offers Anonymous and
+                // the Super Admin).
                 setCookie(USER_NAME_STORAGE_KEY, data.user.username);
                 setCookie(USER_PASSWORD_STORAGE_KEY, data.user.pin);
-                setCurrentUser(data.user);
+                sessionStorage.removeItem('sar-current-user');
+                _serverSettings = null;
                 closePopup(popup);
                 if (loginPopup) closePopup(loginPopup);
-                window.location.reload();
+                showLoginProfilePopup(buildLoginProfileChoices([]), (user) => {
+                    setCurrentUser(user);
+                    window.location.reload();
+                });
             } else {
                 alert(data.error || 'Registration failed');
                 registerBtn.disabled = false;
@@ -3210,10 +3309,226 @@ function showAdminVerifyPopup(username, pin, loginPopup) {
     setTimeout(() => adminInput.focus(), 100);
 }
 
+// ---------------------------------------------------------------------------
+// Who is at the device: the profile picked right after logging in.
+//
+// A login (username + PIN) belongs to a whole team; the person at the device
+// says WHO they are the moment the login is verified, and that choice (kept in
+// sessionStorage as 'sar-current-user') is what tags activity-log entries,
+// completed forms and the per-account look-and-feel. Nobody is presumed: the
+// pick starts on a stand-in called "Anonymous" - never on the Super-Admin -
+// and lists every team member stored under the login (the personnel table on
+// the server, for the login's open case when it has one), plus the Super
+// Admin for whoever really is one. Anonymous is not an account of the case: it
+// is virtual, has no profile to edit and belongs to no personnel row, so the
+// Users page simply offers "Switch User" for it.
+// ---------------------------------------------------------------------------
+const ANONYMOUS_USER_NAME = 'Anonymous';
+const ANONYMOUS_USER_PIN = 'anonymous';
+// Set (sessionStorage, this tab only) by "Switch User" so the next page load
+// opens the team-member picker instead of quietly continuing as Anonymous.
+const OPEN_USER_POPUP_SESSION_KEY = 'sar-open-user-popup';
+
+function createAnonymousUser() {
+    return {
+        username: ANONYMOUS_USER_NAME,
+        pin: ANONYMOUS_USER_PIN,
+        handle: ANONYMOUS_USER_NAME,
+        color: 'none',
+        theme: 'dark',
+        isFileManager: false,
+        isAnonymous: true
+    };
+}
+
+function isAnonymousUser(user) {
+    return !!user && (user.isAnonymous === true || user.pin === ANONYMOUS_USER_PIN);
+}
+
+// "Switch User": forget who is at this device and open the team-member picker
+// on the Home page (the flag survives the navigation; the login itself stays).
+function requestUserSwitch() {
+    try { sessionStorage.setItem(OPEN_USER_POPUP_SESSION_KEY, '1'); } catch (e) { /* ignore */ }
+    sessionStorage.removeItem('sar-current-user');
+    window.location.href = 'home.html';
+}
+
+// The one Super Admin account every case carries (see defaultBundle).
+function createSuperAdminAccount() {
+    const fromDefault = (defaultBundle().accounts || []).find(a => a.pin === '1976');
+    return fromDefault ? {...fromDefault, visiblePages: [...(fromDefault.visiblePages || [])]} : {
+        username: 'Super Admin', pin: '1976', color: 'none', handle: 'Super-Admin', isFileManager: true, theme: 'dark'
+    };
+}
+
+// The choices the picker shows, from personnel rows - either the server's
+// structured `personnel` table rows ({label, data: [name, team, lead, ...,
+// pin at 8]}) or bare Personnel page rows. Anonymous first and marked as the
+// default, then every distinct person A-Z, then the Super Admin (offered, but
+// never the default). Rows that would duplicate those two are dropped.
+function buildLoginProfileChoices(personnelRows) {
+    const reserved = new Set([ANONYMOUS_USER_NAME.toLowerCase(), 'super admin', 'super-admin']);
+    const seen = new Set();
+    const people = [];
+    (Array.isArray(personnelRows) ? personnelRows : []).forEach((row) => {
+        const data = row && Array.isArray(row.data) ? row.data : (Array.isArray(row) ? row : null);
+        const name = String((data && data[0]) || (row && !Array.isArray(row) && row.label) || '').trim();
+        if (!name) return;
+        const key = name.toLowerCase();
+        if (reserved.has(key) || seen.has(key)) return;
+        seen.add(key);
+        people.push({
+            user: {
+                username: name,
+                pin: String((data && data[8]) || '').trim(),
+                color: 'none',
+                handle: name,
+                isFileManager: false,
+                theme: 'dark'
+            },
+            isDefault: false,
+            isSuperAdmin: false
+        });
+    });
+    people.sort((a, b) => a.user.username.localeCompare(b.user.username, undefined, {sensitivity: 'base'}));
+    return [
+        {user: createAnonymousUser(), isDefault: true, isSuperAdmin: false},
+        ...people,
+        {user: createSuperAdminAccount(), isDefault: false, isSuperAdmin: true}
+    ];
+}
+
+// The personnel stored under the login, read from the server right after the
+// login is verified (the case itself is not in memory yet). The login's open
+// case is asked for first so the pins match that case's accounts; a login
+// without one - or a case whose rows are not mirrored yet - falls back to
+// every personnel row the login has in any case. [] when nothing is reachable.
+async function fetchLoginProfilePersonnel() {
+    const serverUrl = normalizeSyncServerUrl(getSyncServerUrl());
+    if (!serverUrl || !getUserCredentials()) return [];
+    const read = async (caseNumber) => {
+        const query = caseNumber ? `?case=${encodeURIComponent(caseNumber)}&_=${Date.now()}` : `?_=${Date.now()}`;
+        const resp = await apiFetch(`${serverUrl}/api/v1/tables/personnel${query}`, {headers: getAuthHeaders()});
+        if (!resp || !resp.ok) return [];
+        const rows = await resp.json().catch(() => []);
+        return Array.isArray(rows) ? rows : [];
+    };
+    try {
+        const caseNumber = getActiveCaseNumber();
+        if (caseNumber) {
+            const scoped = await read(caseNumber);
+            if (scoped.length) return scoped;
+        }
+        return await read('');
+    } catch (e) {
+        console.warn('[LOGIN] Could not read the team members for the profile picker:', e);
+        return [];
+    }
+}
+
+async function fetchLoginProfileChoices() {
+    return buildLoginProfileChoices(await fetchLoginProfilePersonnel());
+}
+
+// The picker itself (opened by the login popup once the login is verified).
+// Clicking a name picks it at once; "Continue as Anonymous", the ✕ and a click
+// outside all pick the default. `onPick(user)` is called exactly once.
+function showLoginProfilePopup(choices, onPick) {
+    if (document.querySelector('.popup-overlay.login-profile-popup')) return null;
+    const list = Array.isArray(choices) && choices.length ? choices : buildLoginProfileChoices([]);
+    const defaultChoice = list.find(c => c.isDefault) || list[0];
+    let picked = false;
+    let popup = null;
+    const pick = (user) => {
+        if (picked) return;
+        picked = true;
+        if (popup) closePopup(popup);
+        if (typeof onPick === 'function') onPick(user);
+    };
+    popup = createPopup('Who is using this device?', null, () => pick(defaultChoice.user));
+    popup.classList.add('login-profile-popup');
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+
+    const inputs = document.createElement('div');
+    inputs.className = 'popup-input-container';
+    inputs.style.display = 'flex';
+    inputs.style.flexDirection = 'column';
+    inputs.style.gap = '12px';
+
+    const creds = getUserCredentials();
+    const label = document.createElement('div');
+    label.textContent = `Logged in as "${creds ? creds.name : ''}". Pick the team member working on this device - everything done here is recorded under that name. "${ANONYMOUS_USER_NAME}" is used unless you pick someone.`;
+    label.style.textAlign = 'center';
+    label.style.fontSize = '0.9em';
+    label.style.opacity = '0.85';
+    inputs.appendChild(label);
+
+    const searchInput = document.createElement('input');
+    searchInput.type = 'text';
+    searchInput.placeholder = 'Type to search...';
+    searchInput.className = 'pill-input';
+    searchInput.style.textAlign = 'center';
+    searchInput.style.width = '100%';
+    inputs.appendChild(searchInput);
+
+    const pillsContainer = document.createElement('div');
+    pillsContainer.className = 'login-profile-pills';
+    pillsContainer.style.display = 'flex';
+    pillsContainer.style.flexWrap = 'wrap';
+    pillsContainer.style.justifyContent = 'center';
+    pillsContainer.style.gap = '5px';
+    pillsContainer.style.maxHeight = '40vh';
+    pillsContainer.style.overflowY = 'auto';
+    inputs.appendChild(pillsContainer);
+
+    const renderPills = () => {
+        pillsContainer.innerHTML = '';
+        const query = searchInput.value.trim().toLowerCase();
+        list.filter(choice => !query || choice.user.username.toLowerCase().includes(query)).forEach((choice) => {
+            const pill = document.createElement('button');
+            pill.type = 'button';
+            pill.className = 'mini-pill login-profile-pill';
+            pill.textContent = choice.user.username;
+            pill.dataset.pin = choice.user.pin || '';
+            if (choice.isDefault) {
+                pill.classList.add('active');
+                pill.style.background = 'var(--pill-bg-hover)';
+                pill.style.borderColor = 'var(--accent)';
+                pill.title = 'Default';
+            }
+            if (choice.isSuperAdmin) {
+                pill.style.opacity = '0.8';
+                pill.title = 'Only for the Super-Admin';
+            }
+            pill.onclick = () => pick(choice.user);
+            pillsContainer.appendChild(pill);
+        });
+    };
+    searchInput.oninput = renderPills;
+    renderPills();
+
+    content.insertBefore(inputs, btnContainer);
+
+    const continueBtn = document.createElement('button');
+    continueBtn.className = 'popup-btn primary';
+    continueBtn.id = 'login-profile-continue-btn';
+    continueBtn.textContent = `Continue as ${defaultChoice.user.username}`;
+    continueBtn.onclick = () => pick(defaultChoice.user);
+    btnContainer.appendChild(continueBtn);
+
+    setTimeout(() => searchInput.focus(), 100);
+    return popup;
+}
+
 // Second popup (opened from the login popup's "Set Server" button) that lets the
 // user type or paste the address of the server against which all data flows in
 // and out. On "Set" the URL is validated and persisted locally so it takes
 // effect immediately for every request, including the login that follows.
+// This is the ONLY place the data server can be changed: the Settings page no
+// longer has a sync-server (or CalTopo proxy) section, so switching servers
+// means logging out and using this popup from the login popup. "Use Default"
+// returns to the address the server publishes from CALTOPO_SYNC.
 function showSetServerPopup() {
     if (document.querySelector('.popup-overlay.set-server-popup')) return;
     const popup = createPopup('Set Server', null, null);
@@ -3305,7 +3620,7 @@ function showSetServerPopup() {
                 return;
             }
 
-            const fallback = DEFAULT_SYNC_SERVER_URL.replace(/\/$/, '');
+            const fallback = getDefaultSyncServerUrl().replace(/\/$/, '');
             if (url !== fallback) {
                 statusLine.textContent = `${message}\nTesting the built-in server ${fallback}\u2026`;
                 const fallbackResult = await diagnoseSyncServerConnection(fallback);
@@ -3332,15 +3647,16 @@ function showSetServerPopup() {
     };
     btnContainer.appendChild(testBtn);
 
-    // Restores the built-in public backend, undoing a wrong/stale address that
-    // was saved on this device.
+    // Restores the default backend (the address CALTOPO_SYNC publishes, else
+    // the built-in one), undoing a wrong/stale address saved on this device.
     const resetBtn = document.createElement('button');
     resetBtn.className = 'popup-btn';
     resetBtn.textContent = 'Use Default';
     resetBtn.onclick = () => {
-        serverInput.value = DEFAULT_SYNC_SERVER_URL;
+        const fallback = getDefaultSyncServerUrl();
+        serverInput.value = fallback;
         setLocalSyncServerUrl('');
-        statusLine.textContent = `Reset to the built-in server ${DEFAULT_SYNC_SERVER_URL}. Press "Test" to check it.`;
+        statusLine.textContent = `Reset to the default server ${fallback}. Press "Test" to check it.`;
     };
     btnContainer.appendChild(resetBtn);
 
@@ -3356,13 +3672,10 @@ function showSetServerPopup() {
         if (isBlockedMixedContentUrl(url)) {
             return alert(`This page is served over HTTPS, so it cannot talk to an http:// server.\n\nUse https:// for:\n${url}`);
         }
+        // The choice is this device's alone (a cookie); it is deliberately not
+        // written into the login's server-side settings, so no other device -
+        // and no page other than this popup - can switch the data server.
         setLocalSyncServerUrl(url);
-        // Keep any loaded server-side settings in sync so it also persists for
-        // the logged-in session, not just this device's cookie.
-        if (_serverSettings) {
-            _serverSettings[SYNC_URL_STORAGE_KEY] = url;
-            saveServerSettings(_serverSettings);
-        }
         alert(`Server set to:\n${url}`);
         closePopup(popup);
     };
@@ -3464,116 +3777,16 @@ function getCalTopoProxyHealthUrl(url) {
     return baseUrl.replace(/\/fetch-map\/?$/, '/api/health').replace(/\/api\/proxy\/?$/, '/api/health');
 }
 
+// The CalTopo proxy is the sync server itself: every Team API call is signed by
+// the same Railway service the case data lives on, at its /api/proxy (and
+// /api/call) endpoints. It is derived from getSyncServerUrl() on every call -
+// so it follows the address CALTOPO_SYNC publishes, or the one set through the
+// login popup - and is no longer a setting of its own (the old per-login
+// 'sar-caltopo-proxy-v1' value is simply ignored). '' only when there is no
+// sync server at all, which callers report as "no proxy".
 function getCalTopoProxy() {
-    let proxy = _serverSettings && _serverSettings[CALTOPO_PROXY_STORAGE_KEY] ? _serverSettings[CALTOPO_PROXY_STORAGE_KEY] : null;
-    // Migration: Migrate from old SARTopo key if needed
-    if (!proxy) {
-        const oldProxy = _serverSettings && _serverSettings['sar-sartopo-proxy-v1'] ? _serverSettings['sar-sartopo-proxy-v1'] : null;
-        if (oldProxy) {
-            proxy = oldProxy;
-            if (_serverSettings) {
-                _serverSettings[CALTOPO_PROXY_STORAGE_KEY] = proxy;
-                delete _serverSettings['sar-sartopo-proxy-v1'];
-                saveServerSettings(_serverSettings);
-            }
-        }
-    }
-    const normalizedProxy = normalizeCalTopoProxyUrl(proxy);
-    if (proxy && normalizedProxy && proxy !== normalizedProxy) {
-        proxy = normalizedProxy;
-        if (_serverSettings) {
-            _serverSettings[CALTOPO_PROXY_STORAGE_KEY] = proxy;
-            saveServerSettings(_serverSettings);
-        }
-    }
-    return proxy || 'https://sarwebtheory2-production.up.railway.app/api/proxy';
-}
-
-const checkProxyHealth = async (timeoutMs = 5000) => {
-    const dot = document.getElementById('proxy-status-dot');
-    const text = document.getElementById('proxy-status-text');
-    if (!dot || !text) return;
-
-
-    const proxyUrl = getCalTopoProxy();
-
-    // Immediate feedback
-    dot.style.background = '#ffd43b'; // Yellow for checking
-    text.textContent = 'Checking...';
-
-    if (!proxyUrl) {
-        dot.style.background = '#ff6b6b';
-        text.textContent = 'Not Configured';
-        return;
-    }
-
-    // Derived health endpoint from proxyUrl
-    const healthUrl = getCalTopoProxyHealthUrl(proxyUrl);
-
-    try {
-    // console.log('[PROXY] Checking health:', healthUrl);
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), timeoutMs);
-
-        const healthUrlWithBuster = healthUrl.includes('?') ? `${healthUrl}&_=${Date.now()}` : `${healthUrl}?_=${Date.now()}`;
-        const resp = await fetch(healthUrlWithBuster, {signal: controller.signal});
-        clearTimeout(timeoutId);
-
-        if (resp.ok) {
-            const data = await resp.json().catch(() => ({}));
-            if (data.caltopoSigningConfigured) {
-                dot.style.background = '#40c057';
-                text.textContent = 'Ready' + (data.version ? ` (${data.version})` : '');
-                text.title = `Connected to proxy ${data.version || ''} at ${healthUrl}. Proxy has CalTopo signing credentials ready on the backend.`;
-            } else if (data.supportsClientSuppliedCredentials === false) {
-                dot.style.background = '#ffd43b';
-                text.textContent = 'Needs CalTopo Credentials';
-                text.title = data.credentialConfigPaths && data.credentialConfigPaths.length
-                    ? `Connected to proxy ${data.version || ''} at ${healthUrl}, but you still need to configure CALTOPO_CREDENTIAL_ID and CALTOPO_CREDENTIAL_SECRET on the proxy server in ${data.credentialConfigPaths.join(' or ')} or as deployed environment variables.`
-                    : `Connected to proxy ${data.version || ''} at ${healthUrl}, but you still need to configure CALTOPO_CREDENTIAL_ID and CALTOPO_CREDENTIAL_SECRET on the proxy server.`;
-            } else {
-                dot.style.background = '#40c057';
-                text.textContent = 'Online' + (data.version ? ` (${data.version})` : '');
-                text.title = `Connected to proxy ${data.version || ''} at ${healthUrl}`;
-            }
-        } else {
-            console.warn('[PROXY] Health check returned error:', resp.status);
-            dot.style.background = '#ff6b6b';
-            text.textContent = 'Error ' + resp.status;
-        }
-    } catch (err) {
-        if (err.name === 'AbortError') {
-            console.warn('[PROXY] Health check timed out');
-            dot.style.background = '#ff6b6b';
-            text.textContent = 'Timeout';
-            return;
-        }
-        console.error('[PROXY] Health check failed:', err);
-        dot.style.background = '#ff6b6b';
-        text.textContent = 'Offline';
-
-        // Helpful tip for mixed content or unreachable
-        if (window.location.protocol === 'https:' && healthUrl.startsWith('http:')) {
-            console.error('[PROXY] Mixed content detected! Site is HTTPS but proxy is HTTP.');
-            text.textContent = 'Offline (Security)';
-        } else if (healthUrl.includes(':5050')) {
-            console.info('[PROXY] Using port 5050. Ensure the proxy is listening on this port and it is publicly accessible.');
-        }
-    }
-};
-
-function setCalTopoProxy(url) {
-    if (url) {
-        if (_serverSettings) {
-            _serverSettings[CALTOPO_PROXY_STORAGE_KEY] = url;
-            saveServerSettings(_serverSettings);
-        }
-    } else {
-        if (_serverSettings) {
-            delete _serverSettings[CALTOPO_PROXY_STORAGE_KEY];
-            saveServerSettings(_serverSettings);
-        }
-    }
+    const serverUrl = normalizeSyncServerUrl(getSyncServerUrl());
+    return serverUrl ? normalizeCalTopoProxyUrl(serverUrl) : '';
 }
 
 function getCalTopoCredentials() {
@@ -4056,8 +4269,14 @@ function checkAccess() {
     return;
   }
 
-  // Refresh user data from bundle if exists locally (for permissions)
-  const actualUser = (bundle.accounts || []).find(a => a.pin === user.pin);
+  // Refresh user data from bundle if exists locally (for permissions). A
+  // person picked at login is matched by PIN, else by name (their row may
+  // not have carried a PIN yet); the Anonymous stand-in matches nobody.
+  const accounts = bundle.accounts || [];
+  const actualUser = isAnonymousUser(user)
+    ? null
+    : (accounts.find(a => a.pin === user.pin)
+        || accounts.find(a => (a.username || '').trim().toLowerCase() === (user.username || '').trim().toLowerCase()));
   if (actualUser) {
       // Keep name from credentials but merge other props
       const merged = { ...actualUser, ...user };
@@ -9684,8 +9903,10 @@ function showUserSelectionPopup() {
   const btnContainer = popup.querySelector('.popup-buttons');
   
   const bundle = loadBundle();
-  const accounts = bundle.accounts || [];
-  let selectedUser = getCurrentUser();
+  // Anonymous (the stand-in nobody has to "be") is always offered first; the
+  // case's accounts follow. When nobody is picked yet it is the highlighted default.
+  const accounts = [createAnonymousUser(), ...(bundle.accounts || []).filter(acc => !isAnonymousUser(acc))];
+  let selectedUser = getCurrentUser() || createAnonymousUser();
 
   const inputs = document.createElement('div');
   inputs.className = 'popup-input-container';
@@ -13133,162 +13354,6 @@ function buildSettingsPage() {
       applyLogo(nextBundle);
       status.textContent = 'Logo removed.';
     };
-  }
-
-  const syncUrlInput = document.getElementById('sync-url-input');
-  const saveSyncBtn = document.getElementById('save-sync-url-btn');
-  const syncStatusMsg = document.getElementById('sync-status-msg');
-    const proxyInput = document.getElementById('caltopo-proxy-input');
-  const saveProxyBtn = document.getElementById('save-proxy-btn');
-    const testProxyBtn = document.getElementById('test-proxy-btn');
-
-  if (proxyInput && saveProxyBtn) {
-      proxyInput.value = getCalTopoProxy();
-      saveProxyBtn.onclick = async () => {
-          await withSaveButtonFeedback(saveProxyBtn, async () => {
-              const normalizedProxyUrl = normalizeCalTopoProxyUrl(proxyInput.value);
-              setCalTopoProxy(normalizedProxyUrl);
-              proxyInput.value = normalizedProxyUrl;
-              status.textContent = 'CalTopo Proxy URL saved.';
-              await checkProxyHealth();
-          });
-    };
-  }
-
-    if (testProxyBtn) {
-        testProxyBtn.onclick = async () => {
-            const proxyUrl = normalizeCalTopoProxyUrl(proxyInput.value);
-            if (!proxyUrl) {
-                alert('Please enter a Proxy URL first.');
-                return;
-            }
-
-            proxyInput.value = proxyUrl;
-
-            testProxyBtn.textContent = 'Testing...';
-            testProxyBtn.disabled = true;
-
-            const healthUrl = getCalTopoProxyHealthUrl(proxyUrl);
-
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 10000); // 10s timeout for manual test
-
-                const healthUrlWithBuster = healthUrl.includes('?') ? `${healthUrl}&_=${Date.now()}` : `${healthUrl}?_=${Date.now()}`;
-                const resp = await fetch(healthUrlWithBuster, {signal: controller.signal});
-                const data = await resp.json().catch(() => ({}));
-                clearTimeout(timeoutId);
-
-                if (resp.ok) {
-                    if (data.caltopoSigningConfigured) {
-                        alert(`Success!\n\nProxy Version: ${data.version || 'unknown'}\nStatus: ${data.status}\nMessage: ${data.message}\n\nYour proxy is reachable and ready for signed CalTopo requests using backend credentials.`);
-                    } else if (data.supportsClientSuppliedCredentials === false) {
-                        const configLocationHint = data.credentialConfigPaths && data.credentialConfigPaths.length
-                            ? `\n\nSuggested config file(s):\n${data.credentialConfigPaths.join('\n')}`
-                            : '';
-                        alert(`Proxy Reachable, Needs CalTopo Credentials\n\nProxy Version: ${data.version || 'unknown'}\nStatus: ${data.status}\nMessage: ${data.message}${configLocationHint}\n\nConfigure CALTOPO_CREDENTIAL_ID and CALTOPO_CREDENTIAL_SECRET on the proxy server, then redeploy or restart it.`);
-                    } else {
-                        alert(`Success!\n\nProxy Version: ${data.version || 'unknown'}\nStatus: ${data.status}\nMessage: ${data.message}`);
-                    }
-                    checkProxyHealth();
-                } else {
-                    alert(`Proxy Error ${resp.status}\n\nThe server is there, but it returned an error. Make sure you deployed the latest code.`);
-                }
-            } catch (err) {
-                if (err.name === 'AbortError') {
-                    alert(`Connection Timed Out\n\nCould not reach ${healthUrl} within 10 seconds.\n\nThis usually means the URL is wrong, the service is sleeping, or your internet is slow.`);
-                } else {
-                    alert(`Connection Failed\n\nCould not reach ${healthUrl}.\n\nError: ${err.message}\n\nThis usually means the URL is wrong or the Railway service is down.`);
-                }
-            } finally {
-                testProxyBtn.textContent = 'Test Connection';
-                testProxyBtn.disabled = false;
-            }
-        };
-    }
-
-    checkProxyHealth();
-
-    const startWalkthroughBtn = document.getElementById('start-walkthrough-btn');
-    if (startWalkthroughBtn) {
-        startWalkthroughBtn.onclick = () => startCalTopoSetupWalkthrough(1);
-    }
-
-  if (syncUrlInput && saveSyncBtn) {
-      syncUrlInput.value = getSyncServerUrl();
-
-    saveSyncBtn.onclick = async () => {
-        await withSaveButtonFeedback(saveSyncBtn, async () => {
-            const serverUrl = syncUrlInput.value.trim();
-
-            if (serverUrl) {
-                // Persist locally too so it takes effect immediately and is not
-                // masked by a stale login-popup cookie (getSyncServerUrl prefers
-                // the local value).
-                setLocalSyncServerUrl(serverUrl);
-                if (_serverSettings) {
-                    _serverSettings[SYNC_URL_STORAGE_KEY] = serverUrl;
-                    saveServerSettings(_serverSettings);
-                }
-                syncStatusMsg.textContent = 'Sync settings saved! Testing connection...';
-
-                try {
-                    const healthUrl = `${serverUrl.replace(/\/$/, '')}/api/health?_=${Date.now()}`;
-                    const resp = await fetch(healthUrl);
-
-                    if (resp.ok) {
-                        syncStatusMsg.textContent = 'Sync connection successful! Server is reachable.';
-                    } else {
-                        syncStatusMsg.textContent = `Server returned status ${resp.status}.`;
-                    }
-                } catch (err) {
-                    console.error("Sync connection error:", err);
-                    syncStatusMsg.textContent = `Could not reach sync server: ${err.message}. Check the URL and your connection.`;
-                }
-            } else {
-                syncStatusMsg.textContent = 'Please enter a Server URL.';
-            }
-        });
-    };
-
-    const testSyncBtn = document.getElementById('test-sync-btn');
-    if (testSyncBtn) {
-        testSyncBtn.onclick = async () => {
-            const serverUrl = syncUrlInput.value.trim();
-            if (!serverUrl) return alert('Please enter a Sync Server URL first.');
-
-            testSyncBtn.textContent = 'Testing...';
-            testSyncBtn.disabled = true;
-
-            const healthUrl = `${serverUrl.replace(/\/$/, '')}/api/health`;
-
-            try {
-                const controller = new AbortController();
-                const timeoutId = setTimeout(() => controller.abort(), 10000);
-
-                const healthUrlWithBuster = `${healthUrl}?_=${Date.now()}`;
-                const resp = await fetch(healthUrlWithBuster, {signal: controller.signal});
-                const data = await resp.json().catch(() => ({}));
-                clearTimeout(timeoutId);
-
-                if (resp.ok) {
-                    alert(`Success!\n\nSync Server Version: ${data.version || 'unknown'}\nStatus: ${data.status}\nService: ${data.service}\n\nSync server is reachable and active.`);
-                } else {
-                    alert(`Sync Server Error ${resp.status}\n\nThe server is reachable but returned an error. Check server logs.`);
-                }
-            } catch (err) {
-                console.error("Sync server test error:", err);
-                if (err.name === 'AbortError') {
-                    alert(`Connection Timed Out\n\nCould not reach ${healthUrl} within 10 seconds.`);
-                } else {
-                    alert(`Connection Failed\n\nCould not reach ${healthUrl}.\n\nError: ${err.message}\n\nMake sure the URL is correct and the server is running.`);
-                }
-            } finally {
-                testSyncBtn.textContent = 'Test Connection';
-                testSyncBtn.disabled = false;
-            }
-        };
-    }
   }
 }
 
@@ -16891,7 +16956,14 @@ function whenDataReady(callback) {
 
 document.addEventListener('DOMContentLoaded', async () => {
     initPageTransitions();
-    
+
+    // First of all, ask the server which sync server the website is to use
+    // (the Railway variable CALTOPO_SYNC). Awaited so every request below -
+    // and the login popup's "Set Server" default - already targets it; bounded
+    // so a sleeping or unreachable server cannot hold the page. A device that
+    // set its own server in "Set Server" is left alone (see getSyncServerUrl).
+    await withTimeout(loadSyncServerConfig(), 6000);
+
     if (!getUserCredentials()) {
         // Nothing to read for a visitor who is not logged in: lift the boot
         // overlay so the login popup can be used.
@@ -16966,14 +17038,22 @@ document.addEventListener('DOMContentLoaded', async () => {
 
     const currentUser = getCurrentUser();
     if (!currentUser) {
-        const superAdmin = (bundle.accounts || []).find(a => a.pin === '1976');
-        if (superAdmin) {
-            setCurrentUser(superAdmin);
+        // Nobody has been picked in this tab yet (a new tab, or the login was
+        // done elsewhere). The Super-Admin is never presumed: after a "Switch
+        // User" the team-member picker opens, otherwise the tab works as the
+        // Anonymous stand-in until someone picks themselves.
+        let switchRequested = false;
+        try {
+            switchRequested = sessionStorage.getItem(OPEN_USER_POPUP_SESSION_KEY) === '1';
+            sessionStorage.removeItem(OPEN_USER_POPUP_SESSION_KEY);
+        } catch (e) { /* ignore */ }
+        if (switchRequested) {
+            showUserSelectionPopup();
+        } else {
+            setCurrentUser(createAnonymousUser());
             // Geek Mode is kept per account: now that one is picked, show its own.
             applyGeekMode();
             checkAccess();
-        } else {
-            showUserSelectionPopup();
         }
     } else {
         checkAccess();
@@ -17995,81 +18075,6 @@ function showImportSegmentsPopup() {
   renderFileSelection();
 }
 
-function startCalTopoSetupWalkthrough(step = 1) {
-    let title = "CalTopo Setup Guide (1/4)";
-    let body = "";
-    let btnText = "Next";
-    let nextStep = step + 1;
-
-    if (step === 1) {
-        title = "Welcome to CalTopo Integration (1/4)";
-        body = `
-      <p>This guide will help you set up <strong>CalTopo</strong> integration correctly.</p>
-      <p style="margin-top:10px;">To fetch shapes (polygons and assignments) directly from CalTopo, we use a <strong>Web Proxy</strong> to avoid browser security (CORS) issues.</p>
-      <p style="margin-top:10px;"><strong>Goal:</strong> Get your map data flowing into the Segments table without needing to run any scripts locally!</p>
-    `;
-    } else if (step === 2) {
-        title = "Step 1: Web-Hosted Middleman (2/4)";
-        body = `
-      <p>We have moved the "middleman" to the web. You no longer need to run <code>middleman.py</code> on your computer.</p>
-      <p style="margin-top:10px;">The proxy is hosted at:</p>
-      <code style="display:block; padding: 10px; background: rgba(0,0,0,0.05); border-radius: 4px; margin: 10px 0;">https://sarwebtheory2-production.up.railway.app</code>
-      <p style="margin-top:10px; font-size: 0.9rem; color: var(--muted);">This service handles all CalTopo traffic securely and enables this site to fetch your private or public map data.</p>
-    `;
-    } else if (step === 3) {
-        title = "Step 2: Configure Proxy URL (3/4)";
-        body = `
-      <p>Now, ensure this software knows where to find the web proxy.</p>
-      <ul style="margin-left: 20px; margin-top: 10px; line-height: 1.6;">
-        <li>Go to the <strong>Settings</strong> page.</li>
-        <li>Look for <strong>CalTopo Proxy Settings</strong>.</li>
-        <li>Ensure it is set to <code>https://sarwebtheory2-production.up.railway.app/api/proxy</code></li>
-        <li>Click <strong>Save Proxy Settings</strong>.</li>
-      </ul>
-      <div style="margin-top:15px; padding: 10px; background: rgba(255,165,0,0.1); border-radius: 4px; font-size: 0.9rem;">
-        <strong>Note:</strong> If you are already on the Settings page, you can do this now!
-      </div>
-    `;
-    } else if (step === 4) {
-        title = "Step 3: Add Map & Fetch Shapes (4/4)";
-        body = `
-      <p>Final Step: Connect your map!</p>
-      <ol style="margin-left: 20px; margin-top: 10px; line-height: 1.6;">
-        <li>Go to the <strong>Maps</strong> page.</li>
-        <li>Check the <strong>Proxy Status</strong> indicator (it should be green/Online).</li>
-        <li>Enter your <strong>Map ID</strong> and click <strong>Add Map</strong>.</li>
-        <li>Click <strong>Fetch Shapes</strong>. All data now flows securely through the web middleman!</li>
-      </ol>
-      <p style="margin-top:10px;">If the status is "Offline", check your internet connection or the Proxy URL in Settings.</p>
-    `;
-        btnText = "Finish";
-        nextStep = null;
-    }
-
-    const popup = createPopup(title, null);
-    const content = popup.querySelector('.popup-content');
-    const btnContainer = popup.querySelector('.popup-buttons');
-
-    const bodyEl = document.createElement('div');
-    bodyEl.style.padding = '10px 0';
-    bodyEl.style.lineHeight = '1.5';
-    bodyEl.innerHTML = body;
-    content.insertBefore(bodyEl, btnContainer);
-
-    btnContainer.innerHTML = '';
-    const nextBtn = document.createElement('button');
-    nextBtn.className = 'popup-btn';
-    nextBtn.style.flex = '1';
-    nextBtn.textContent = btnText;
-    nextBtn.onclick = () => {
-        closePopup(popup);
-        if (nextStep) {
-            setTimeout(() => startCalTopoSetupWalkthrough(nextStep), 300);
-        }
-    };
-    btnContainer.appendChild(nextBtn);
-}
-
 function showCalTopoShapesPopup(features) {
     const popup = createPopup('Import Shapes from CalTopo', null);
   const content = popup.querySelector('.popup-content');
@@ -18344,7 +18349,7 @@ async function caltopo_api_call(method, endpoint, payload = null, domain = null,
     console.error('CalTopo API Call Error:', error);
     if (!silent) {
       if (error.message.includes('Unexpected token')) {
-         alert('CalTopo API Call Error: The server returned an invalid response (not JSON). This usually happens when the proxy URL is incorrect or the server is down.');
+         alert('CalTopo API Call Error: The server returned an invalid response (not JSON). This usually happens when the sync server is down or its address (login popup > Set Server) is wrong.');
       } else {
          alert('CalTopo API Call Error: ' + error.message);
       }
@@ -18356,7 +18361,7 @@ async function caltopo_api_call(method, endpoint, payload = null, domain = null,
 async function _execute_caltopo_api_call(method, endpoint, payload, domain) {
   const proxyUrl = getCalTopoProxy();
   if (!proxyUrl) {
-    alert('No CalTopo Proxy configured. Please go to Settings and set the Proxy URL.');
+    alert('No sync server is configured, so CalTopo cannot be reached. Log out and use "Set Server" on the login popup.');
     return null;
   }
 
@@ -18573,7 +18578,7 @@ async function caltopo_request(btn = null, options = {}) {
   try {
     const proxyUrl = getCalTopoProxy();
     if (!proxyUrl) {
-      report('No CalTopo Proxy configured. Please go to Settings and set the Proxy URL.');
+      report('No sync server is configured, so CalTopo cannot be reached. Log out and use "Set Server" on the login popup.');
       return null;
     }
 
@@ -18970,17 +18975,26 @@ function buildUserAccountPage() {
     }
 
     if (!userToEdit) {
+        // The Anonymous stand-in has no account of its own to edit.
+        const message = (!userPin && isAnonymousUser(currentUser))
+            ? `This device is working as "${ANONYMOUS_USER_NAME}", which has no profile. Pick yourself from the team to edit your account.`
+            : 'User not found.';
         container.innerHTML = `
             <div style="text-align: center; padding: 40px; color: white;">
-                <p style="font-size: 1.2rem; margin-bottom: 20px;">User not found.</p>
+                <p style="font-size: 1.2rem; margin-bottom: 20px;">${message}</p>
                 <button id="switch-user-btn" class="mini-pill" style="padding: 12px 20px; font-size: 1rem; background: rgba(235, 87, 87, 0.1); border-color: rgba(235, 87, 87, 0.4);">Switch User</button>
+                <button id="logout-btn" class="mini-pill" style="padding: 12px 20px; font-size: 1rem; margin-left: 10px; background: rgba(235, 87, 87, 0.1); border-color: rgba(235, 87, 87, 0.4);">Log Out</button>
             </div>
         `;
         const switchBtn = document.getElementById('switch-user-btn');
         if (switchBtn) {
-            switchBtn.onclick = () => {
-                sessionStorage.removeItem('sar-current-user');
-                window.location.href = 'home.html';
+            switchBtn.onclick = () => requestUserSwitch();
+        }
+        const logoutBtnAnon = document.getElementById('logout-btn');
+        if (logoutBtnAnon) {
+            logoutBtnAnon.onclick = () => {
+                setCurrentUser(null);
+                window.location.href = 'index.html';
             };
         }
         return;
@@ -19085,10 +19099,7 @@ function buildUserAccountPage() {
 
     const switchBtn = document.getElementById('switch-user-btn');
     if (switchBtn) {
-        switchBtn.onclick = () => {
-            sessionStorage.removeItem('sar-current-user');
-            window.location.href = 'home.html';
-        };
+        switchBtn.onclick = () => requestUserSwitch();
     }
 
     const logoutBtn = document.getElementById('logout-btn');
@@ -19190,10 +19201,7 @@ function renderUserManagement(container, bundle) {
 
     const switchBtnMgmt = document.getElementById('switch-user-btn-mgmt');
     if (switchBtnMgmt) {
-        switchBtnMgmt.onclick = () => {
-            sessionStorage.removeItem('sar-current-user');
-            window.location.href = 'home.html';
-        };
+        switchBtnMgmt.onclick = () => requestUserSwitch();
     }
 
     const tbody = document.getElementById('user-management-body');
@@ -19496,8 +19504,6 @@ function buildMapsPage() {
         };
         caltopoAssignmentOverlayToggle.dataset.bound = 'true';
     }
-
-  checkProxyHealth();
 
   let activeMapId = null;
   let activeMapTeamId = null;
@@ -20080,7 +20086,7 @@ async function checkUnaccountedMapFeaturesAndNotify(options = {}) {
             return [];
         }
         if (!getCalTopoProxy()) {
-            if (manual) alert('No CalTopo Proxy configured. Please go to Settings and set the Proxy URL.');
+            if (manual) alert('No sync server is configured, so CalTopo cannot be reached. Log out and use "Set Server" on the login popup.');
             return [];
         }
 

@@ -6,8 +6,8 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Settings | Search & Rescue Theory Software</title>
   <!-- theme-boot.js must be the first thing in <head>, before the stylesheet: it reads the theme hint cookie, puts <html> in the right theme and paints the 80% boot overlay + spinner before anything else is rendered (preferences themselves come from the server after login). -->
-  <script src="theme-boot.js?v=20260915"></script>
-  <link rel="stylesheet" href="styles.css?v=20260915" />
+  <script src="theme-boot.js?v=20260916"></script>
+  <link rel="stylesheet" href="styles.css?v=20260916" />
 </head>
 <body data-page="settings">
   <div class="site-shell">
@@ -269,54 +269,7 @@
             </div>
             <div id="segment-search-opacity-label" style="margin-top: 10px; font-size: 0.85rem; color: var(--muted);"></div>
           </div>
-
-          <div class="home-panel full-width" data-setting-scope="login">
-            <div style="display: flex; justify-content: space-between; align-items: center; margin-bottom: calc(15px * var(--space-scale, 1));">
-              <h2 style="margin: 0;">CalTopo Proxy Settings</h2>
-              <div id="proxy-status-container"
-                   style="font-size: 0.9rem; display: flex; align-items: center; gap: 8px; background: rgba(0,0,0,0.05); padding: calc(5px * var(--space-scale, 1)) calc(12px * var(--space-scale, 1)); border-radius: 20px;">
-                <span id="proxy-status-dot"
-                      style="width: 10px; height: 10px; border-radius: 50%; background: #ccc;"></span>
-                <span id="proxy-status-text">Checking...</span>
-              </div>
-              <button class="clear-btn" id="start-walkthrough-btn"
-                      style="background: var(--accent); color: white; border: none;">Help Me Setup
-              </button>
-            </div>
-            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
-                CalTopo Team API requests should be signed by your proxy, not sent browser-direct to CalTopo.
-                Enter the Web Proxy URL below (e.g.,
-              <code>https://sarwebtheory2-production.up.railway.app/api/proxy</code>).
-            </p>
-            <div class="home-row">
-              <input class="pill-input" id="caltopo-proxy-input"
-                     placeholder="e.g., https://sarwebtheory2-production.up.railway.app/api/proxy" style="flex-grow: 1;"
-                       type="text">
-              <button id="save-proxy-btn" class="clear-btn" type="button">Save Proxy Settings</button>
-              <button class="clear-btn" id="test-proxy-btn" style="margin-left: calc(10px * var(--space-scale, 1)); border-color: var(--accent); color: var(--accent);"
-                      type="button">Test Connection
-              </button>
-            </div>
-          </div>
-
-          <div class="home-panel full-width" data-setting-scope="login">
-            <h2>Data Synchronization</h2>
-            <p style="margin-bottom: calc(15px * var(--space-scale, 1)); color: var(--muted); font-size: 0.95rem;">
-              Enter your Sync Server URL (from Railway) to synchronize data across devices.
-              All devices logged in with the same username will share data automatically.
-            </p>
-            <div class="home-row" style="flex-wrap: wrap; gap: 10px;">
-              <input class="pill-input" id="sync-url-input" placeholder="Sync Server URL (e.g., https://my-sync-server.railway.app)" style="flex: 1; min-width: 250px;"
-                     type="text">
-              <button class="clear-btn" id="save-sync-url-btn" style="white-space: nowrap;" type="button">Save Sync
-                Settings
-              </button>
-              <button class="clear-btn" id="test-sync-btn" style="margin-left: calc(10px * var(--space-scale, 1)); border-color: var(--accent); color: var(--accent);"
-                      type="button">Test Connection
-              </button>
-            </div>
-            <div id="sync-status-msg" style="margin-top: calc(10px * var(--space-scale, 1)); font-size: 0.85rem; color: var(--accent);"></div>
-          </div>
+          <!-- The data server (and with it the CalTopo proxy, its /api/proxy) is not a setting: the website reads it from the server's CALTOPO_SYNC variable, and a device changes it only by logging out and using "Set Server" on the login popup. -->
         </div>
 
         <div class="status" id="settings-status">Ready.</div>
@@ -347,9 +300,9 @@
         </a>
     </nav>
   </div>
-  <script src="map-segment-utils.js?v=20260915"></script>
-  <script src="sync-delta.js?v=20260915"></script>
-  <script src="app.js?v=20260915"></script>
+  <script src="map-segment-utils.js?v=20260916"></script>
+  <script src="sync-delta.js?v=20260916"></script>
+  <script src="app.js?v=20260916"></script>
 
     <div class="notification-sidebar" id="notif-sidebar">
       <div class="notification-header">

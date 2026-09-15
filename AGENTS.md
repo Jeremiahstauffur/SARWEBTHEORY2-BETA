@@ -168,13 +168,27 @@ bundle = {
   holds this tab's last push attempt (deliberately per tab, survives page navigation), and
   `maps[0].caltopoAssignmentOverlayState.updatedAt` is the case's record of the last push that *changed*
   a shape (a hint other devices read as a lower bound). Plan: `.junie/plans/caltopo-color-sync-rate-limit.md`.
+- **Which sync server / CalTopo proxy** is *not* a setting and *not* in the bundle. `getSyncServerUrl()`
+  resolves, in order: the login popup's **"Set Server"** cookie (`SYNC_URL_LOCAL_STORAGE_KEY`) → the
+  address the server publishes from its Railway variable **`CALTOPO_SYNC`** (`GET /api/config`, cached in
+  the `SYNC_URL_CONFIG_STORAGE_KEY` cookie by `loadSyncServerConfig()`, which runs first in
+  `DOMContentLoaded`) → `localhost:3000` for a localhost page → the bootstrap `DEFAULT_SYNC_SERVER_URL`.
+  The CalTopo proxy is always `<sync server>/api/proxy` (`getCalTopoProxy()`, derived on every call).
+  The Settings page has no server/proxy section: switching servers = log out → login popup → "Set Server".
+  Plan: `.junie/plans/caltopo-sync-variable-and-login-profile-pick.md`.
+- **Who is at the device** (`sessionStorage['sar-current-user']`) is picked right after login
+  (`showLoginProfilePopup`): the login's personnel from `GET /api/v1/tables/personnel[?case=]`, with the
+  virtual **"Anonymous"** (`createAnonymousUser()`, pin `anonymous`, not in `bundle.accounts`) as the
+  default and the Super Admin offered but never presumed. A tab with no pick works as Anonymous;
+  "Switch User" (`requestUserSwitch()`, flag `sar-open-user-popup`) opens the in-page picker.
 
 **Nothing is persisted on the device.** The case lives in memory for the page lifetime; the device
-keeps only login cookies/sessionStorage and the sync-server URL. The `*_STORAGE_KEY` constants are
+keeps only login cookies/sessionStorage and the sync-server URL cookies (the "Set Server" choice and
+the `CALTOPO_SYNC`-published address). The `*_STORAGE_KEY` constants are
 mostly keys into the **per-user server settings** (`GET/PUT /api/auth/settings`) or the in-memory
 store, and `LEGACY_LOCAL_STORAGE_KEYS` is wiped at startup. Do not reintroduce localStorage caching
 of case data. (`sessionStorage` is allowed for per-tab *clocks and flags* only — `sar-open-case-popup`,
-the color-sync last-push time — never for case content.)
+`sar-open-user-popup`, the color-sync last-push time — never for case content.)
 
 ---
 
@@ -212,7 +226,9 @@ overwritten/deleted by the Super-Admin (403 otherwise). `DELETE /api/v1/:bucket`
 Key endpoints: `/api/auth/{register,login,history,settings,assets[/:kind]}`,
 `/api/v1/:bucket/{rows,state,activity,declined-assignments,page/:page,all-files,latest,:key}`,
 `/api/v1/tables[/:table]?case=`, `GET/PUT /api/lpb/distances` (login-scoped LPB distance defaults +
-overrides), `/api/health`, `/api/proxy` + `/api/call` (CalTopo, signed server-side).
+overrides), `GET /api/config` (public, `no-store`: the `CALTOPO_SYNC` sync-server address the website is
+to use, read from `process.env` per request), `/api/health` (also carries it), `/api/proxy` + `/api/call`
+(CalTopo, signed server-side).
 
 ---
 
@@ -220,7 +236,7 @@ overrides), `/api/health`, `/api/proxy` + `/api/call` (CalTopo, signed server-si
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260915`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260916`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
 - **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
@@ -256,6 +272,10 @@ overrides), `/api/health`, `/api/proxy` + `/api/call` (CalTopo, signed server-si
   UTF-8 tool unless you intend to convert it; several sessions deliberately left it alone.
 - **CalTopo credentials stay on the server** (`.env` → `CALTOPO_CREDENTIAL_ID/SECRET`). Never add a
   client path that forwards them.
+- **Never add a second way to change the data server.** The only override is the login popup's "Set
+  Server" (a device cookie); the default comes from the server's `CALTOPO_SYNC` variable. Do not write
+  a server URL into the login's `user_settings`, and do not make the CalTopo proxy configurable — it is
+  `getCalTopoProxy()` = sync server + `/api/proxy`. `test_sync_server_config.js` pins both.
 - **Do not run `git` history-rewriting or reset commands**; do not commit unless asked.
 
 ---
@@ -366,6 +386,26 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   `INSERT … SELECT … WHERE NOT EXISTS` and upsert with `INSERT … ON DUPLICATE KEY UPDATE` to keep the ids
   stable. `test_lpb_server.js` simulates the pre-id table shape and MySQL's numbering-from-1 behaviour.
   (plan: `lost-person-behavior-psr-adjustment.md`, Step 5)
+- **2026-09-14 — Data server from `CALTOPO_SYNC`; Settings server/proxy sections removed.** Two things
+  worth knowing. (1) A static frontend cannot read a server env var, so the server *publishes* it
+  (`GET /api/config`) and the page asks for it **before anything else** in `DOMContentLoaded` (awaited,
+  capped) and caches it in a cookie — otherwise the first requests of a load would go to the bootstrap
+  address and the next load to the published one. Read the variable per request on the server, never
+  once at start, or a test (and a Railway variable-only redeploy) sees a stale value. (2) The old
+  `getCalTopoProxy()` fell back to the **production** proxy even for a localhost page, so
+  `test_map_unaccounted_app.js` was silently pinned to the production URL; deriving the proxy from
+  `getSyncServerUrl()` changed that to `http://localhost:3000/api/proxy` and the test's constant had to
+  follow. Rule: any URL the frontend talks to must derive from `getSyncServerUrl()`, never be hard-coded.
+  (plan: `caltopo-sync-variable-and-login-profile-pick.md`)
+- **2026-09-14 — Post-login profile pick / "Anonymous".** The login (username + PIN) is a team; the
+  person is chosen after verification. Traps: `setCurrentUser(null)` is the *logout* path (it erases the
+  login cookies) — to "un-pick" someone use `sessionStorage.removeItem('sar-current-user')`. Personnel
+  live per case, so before the case is in memory the picker reads the server's structured
+  `personnel` table (`/api/v1/tables/personnel?case=` first, then every case) rather than the bundle;
+  Anonymous is virtual (never in `bundle.accounts`, so `checkAccess`/Users page must tolerate a current
+  user with no account, and `checkAccess` now also matches by name for a row that had no PIN yet).
+  Testing a popup needs a fake DOM whose `querySelector` understands `.a.b` — see `makeElement` in
+  `test_sync_server_config.js`. (plan: `caltopo-sync-variable-and-login-profile-pick.md`)
 
 ---
 
@@ -404,6 +444,18 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   only stops them re-pushing right after another device's *changing* push, so identical no-change
   pushes can double up. Accepted (CalTopo tolerates it); a shared per-login clock in `user_settings`
   would close it. The countdown pill therefore shows *this tab's* schedule, not a fleet-wide one.
+- `CALTOPO_SYNC` follow-ups: the variable must be set on the Railway service (unset ⇒ the website keeps
+  its built-in `DEFAULT_SYNC_SERVER_URL`; the server logs a `[CONFIG]` warning). `data.php`/`proxy.php`
+  know nothing of `/api/config`. Old per-login settings still carry dead `sar-sync-url-v1` /
+  `sar-caltopo-proxy-v1` values (ignored, never read; harmless). The old `getCalTopoProxyHealthUrl` /
+  `normalizeCalTopoProxyUrl` helpers stay because `test_caltopo_php_proxy_query_params.js` and the
+  `.php` proxy path use them. A localhost page whose local server publishes a remote `CALTOPO_SYNC`
+  will follow it (by design — the variable is authoritative).
+- Profile-pick follow-ups: Anonymous has no `bundle.accounts` record, so its theme/color/visible pages
+  are the defaults and the Users page only offers "Switch User" / "Log Out" for it. A personnel row that
+  exists in the structured table but not in the open case (picked from the "every case" fallback) is
+  matched by name/PIN on reload and otherwise behaves like Anonymous with that name in the log tag.
+  The picker shows *personnel names*; `bundle.accounts` handles are not consulted before the reload.
 
 ---
 

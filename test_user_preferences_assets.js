@@ -587,7 +587,7 @@ const run = async () => {
             return {title, scope, kind: pill.querySelector('.setting-scope-pill-kind').textContent, name: name.textContent,
                 user: pill.classList.contains('setting-scope-pill--user'), login: pill.classList.contains('setting-scope-pill--login')};
         });
-        assert.ok(pills.length >= 12, `all panels are tagged (${pills.length})`);
+        assert.ok(pills.length >= 10, `all panels are tagged (${pills.length})`);
         ['Theme', 'Geek Mode'].forEach((title) => {
             const pill = pills.find(p => p.title === title);
             assert.strictEqual(pill.scope, 'user', `${title} is a per-user setting`);
@@ -595,7 +595,7 @@ const run = async () => {
             assert.strictEqual(pill.user, true);
         });
         ['Delete Mode', 'Background Image', 'Application Logo', 'Tips Display', 'Par Check Frequency', 'Map Feature Check',
-            'CalTopo Color Sync', 'Segment Color Scale', 'CalTopo Proxy Settings', 'Data Synchronization'].forEach((title) => {
+            'CalTopo Color Sync', 'Segment Color Scale'].forEach((title) => {
             const pill = pills.find(p => p.title === title);
             assert.ok(pill, `${title} is tagged`);
             assert.strictEqual(pill.scope, 'login', `${title} is a per-login setting`);

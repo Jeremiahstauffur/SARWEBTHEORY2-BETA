@@ -195,6 +195,36 @@ loadServerEnvironment({
 const getTrimmedString = (value) => typeof value === 'string' ? value.trim() : '';
 const getCredentialConfigPaths = () => getServerEnvironmentInfo().checkedFiles.filter((filePath) => /\.env(\.local)?$/i.test(filePath));
 
+// The address of the sync server the website is to use, published by this
+// server from the Railway variable CALTOPO_SYNC (also honoured from .env). The
+// website asks for it on every page load (GET /api/config) and uses it as its
+// default data server and, with /api/proxy appended, as its CalTopo proxy; a
+// device only deviates from it through the login popup's "Set Server". Read at
+// request time (not once at start) so a test - or a redeploy that only changes
+// the variable - is seen without restarting the process. An unset or malformed
+// value publishes '' and the website falls back to its built-in address.
+const CALTOPO_SYNC_ENV_KEY = 'CALTOPO_SYNC';
+const getConfiguredSyncServerUrl = (env = process.env) => {
+    const raw = getTrimmedString(env[CALTOPO_SYNC_ENV_KEY]).replace(/\/+$/, '');
+    if (!raw) return '';
+    if (!/^https?:\/\/[^\s/]+/i.test(raw)) return '';
+    try {
+        // eslint-disable-next-line no-new
+        new URL(raw);
+    } catch (error) {
+        return '';
+    }
+    return raw;
+};
+const getPublishedSyncConfig = (env = process.env) => {
+    const syncServerUrl = getConfiguredSyncServerUrl(env);
+    return {
+        syncServerUrl,
+        caltopoProxyUrl: syncServerUrl ? `${syncServerUrl}/api/proxy` : '',
+        source: syncServerUrl ? CALTOPO_SYNC_ENV_KEY : 'unset'
+    };
+};
+
 const getCredentialConfigurationHelp = () => {
     const configPaths = getCredentialConfigPaths();
     return configPaths.length
@@ -206,10 +236,18 @@ const logCredentialConfigurationStatus = () => {
     const creds = resolveCalTopoCredentials();
     if (creds.configured) {
         console.log(`[CONFIG] CalTopo credentials loaded from ${creds.source}.`);
-        return;
+    } else {
+        console.warn(`[CONFIG] ${getCredentialConfigurationHelp()}`);
     }
 
-    console.warn(`[CONFIG] ${getCredentialConfigurationHelp()}`);
+    const published = getPublishedSyncConfig();
+    if (published.syncServerUrl) {
+        console.log(`[CONFIG] ${CALTOPO_SYNC_ENV_KEY} publishes the sync server ${published.syncServerUrl} to the website.`);
+    } else if (getTrimmedString(process.env[CALTOPO_SYNC_ENV_KEY])) {
+        console.warn(`[CONFIG] ${CALTOPO_SYNC_ENV_KEY} is set but is not an absolute http(s) URL; the website will use its built-in server address.`);
+    } else {
+        console.warn(`[CONFIG] ${CALTOPO_SYNC_ENV_KEY} is not set; the website will use its built-in server address. Set it to this service's public URL (e.g. https://sarwebtheory2-production.up.railway.app).`);
+    }
 };
 
 // Ensure data directory exists
@@ -1063,6 +1101,10 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports.collectActivityEntryChanges = collectActivityEntryChanges;
     module.exports.isInternalStoreKey = isInternalStoreKey;
     module.exports.searchCaseForBundle = searchCaseForBundle;
+    // The CALTOPO_SYNC → website address rule, testable without a process env.
+    module.exports.CALTOPO_SYNC_ENV_KEY = CALTOPO_SYNC_ENV_KEY;
+    module.exports.getConfiguredSyncServerUrl = getConfiguredSyncServerUrl;
+    module.exports.getPublishedSyncConfig = getPublishedSyncConfig;
     // Exposed so an integration test can drive the endpoints over HTTP without
     // the server having to bind a fixed port on its own.
     module.exports.app = app;
@@ -2421,14 +2463,30 @@ app.get('/', (req, res) => {
     res.send('SAR Sync + Proxy Server is running');
 });
 
+// What the website needs to know before anyone is logged in: the sync server
+// it is to use (the Railway variable CALTOPO_SYNC) and the CalTopo proxy that
+// comes with it. Public and cache-free on purpose - the login popup runs
+// before any credentials exist, and a changed variable must reach every
+// device on its next page load.
+app.get('/api/config', (req, res) => {
+    res.set('Cache-Control', 'no-store');
+    res.json({
+        ...getPublishedSyncConfig(),
+        timestamp: new Date().toISOString()
+    });
+});
+
 // Health check endpoint for the proxy
 app.get('/api/health', (req, res) => {
     const creds = resolveCalTopoCredentials();
     const envInfo = getServerEnvironmentInfo();
+    const published = getPublishedSyncConfig();
     res.json({
         status: 'ok',
         version: '1.3.0',
         service: 'SAR Proxy + Sync',
+        syncServerUrl: published.syncServerUrl,
+        syncServerUrlSource: published.source,
         message: creds.configured
             ? 'Unified server is live and ready to sign CalTopo Team API requests using backend credentials.'
             : getCredentialConfigurationHelp(),

@@ -30,7 +30,9 @@ const BUNDLE_KEY = 'pill-table-bundle-v1';
 const SETTINGS_CACHE_KEY = 'sar-server-settings-cache-v1';
 const LAST_CHECK_KEY = 'sar-map-unaccounted-last-check-v1';
 const CASE = 'Case-1';
-const PROXY_URL = 'https://sarwebtheory2-production.up.railway.app/api/proxy';
+// The CalTopo proxy is the sync server's own /api/proxy; the sandbox page is
+// served from localhost, so that is the local sync server (see getCalTopoProxy).
+const PROXY_URL = 'http://localhost:3000/api/proxy';
 
 function makeElement(depth = 0) {
     const classes = new Set();
