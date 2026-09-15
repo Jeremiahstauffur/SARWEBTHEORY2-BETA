@@ -1022,6 +1022,429 @@
         return {matched: true, distanceMiles, contributions, addedPercent, factor: 1 + addedPercent / 100};
     }
 
+    // ------------------------------------------------------------------
+    // Searchers Tracks (Search Log page, "Map Tracking").
+    //
+    // The tracks the searchers recorded on the CalTopo map are imported into
+    // the search file and measured against the segment shapes: how many miles
+    // of each track lie inside each segment. With the Search Log's "Map
+    // Tracking" switch on, those miles stand in for Num of Sweeps x segment
+    // length in the coverage term of the PSR maths. A track belongs to the
+    // segment that holds the majority of its miles (its home segment) and so
+    // to that segment's task; the miles it spent in another segment go to the
+    // most recent task of that segment (or to the next one, once it exists).
+    // Two tasks on the home segment make the track ambiguous until the
+    // planner picks one. The track's name on CalTopo carries a code with the
+    // task and the segment ("#2-4D Team 1"); the code is recognised when a
+    // name is read back so it is replaced, never stacked. Everything here is
+    // pure so the website, the server and the tests share one implementation.
+    // ------------------------------------------------------------------
+
+    // "#<task>-<segment> " at the front of a track name (the generic form,
+    // used when the segment is not one of the known names).
+    const SEARCHER_TRACK_NAME_CODE = /^#(\d+)-(\S+)(?:\s+|$)/;
+    // 'Track' / 'Route' come off the map; 'Custom' is typed in by the planner
+    // (a name, a length and the task it counts toward - no shape behind it).
+    const SEARCHER_TRACK_TYPES = ['Track', 'Route', 'Custom'];
+
+    function isFiniteLngLat(point) {
+        return Array.isArray(point) && Number.isFinite(point[0]) && Number.isFinite(point[1])
+            && Math.abs(point[0]) <= 180 && Math.abs(point[1]) <= 90;
+    }
+
+    // "#2" for '2', '#2' or ' #2 '; '' for anything without a number.
+    function normalizeTaskTag(value) {
+        const num = String(value === undefined || value === null ? '' : value).trim().replace(/^#/, '');
+        return /^\d+$/.test(num) ? `#${num}` : '';
+    }
+
+    function segmentKey(region, segment) {
+        return `${normalizeSegmentName(region)}|${normalizeSegmentName(segment)}`;
+    }
+
+    // Every line of a geometry as a list of [lng, lat(, alt, time)] points: a
+    // LineString gives one path, a MultiLineString one per part, a
+    // GeometryCollection the lines of its members. Points and polygons give
+    // none; unusable points are skipped.
+    function getLineStringPaths(geometry) {
+        const paths = [];
+        const collect = (geom) => {
+            if (!geom || typeof geom !== 'object') return;
+            const type = String(geom.type || '');
+            if (type === 'LineString') {
+                const pts = (Array.isArray(geom.coordinates) ? geom.coordinates : []).filter(isFiniteLngLat);
+                if (pts.length >= 2) paths.push(pts);
+            } else if (type === 'MultiLineString') {
+                (Array.isArray(geom.coordinates) ? geom.coordinates : []).forEach(line => {
+                    const pts = (Array.isArray(line) ? line : []).filter(isFiniteLngLat);
+                    if (pts.length >= 2) paths.push(pts);
+                });
+            } else if (type === 'GeometryCollection') {
+                (Array.isArray(geom.geometries) ? geom.geometries : []).forEach(collect);
+            }
+        };
+        collect(geometry);
+        return paths;
+    }
+
+    // A fetched CalTopo feature that is a line (a recorded track, a live
+    // track, a drawn route) rather than an assignment, an area or a marker.
+    function isTrackLikeFeature(feature) {
+        if (!feature || typeof feature !== 'object') return false;
+        const attrs = feature.attributes || feature.properties || {};
+        if (String(attrs.class || '').toLowerCase() === 'assignment' || attrs.assignment) return false;
+        return getLineStringPaths(feature.geometry).length > 0;
+    }
+
+    // 'Track' for a line recorded or live-tracked in the field (CalTopo's
+    // AppTrack / LiveTrack classes, or points that carry timestamps), 'Route'
+    // for a line somebody drew.
+    function getTrackTypeLabel(feature) {
+        const attrs = (feature && (feature.attributes || feature.properties)) || {};
+        const cls = String(attrs.class || attrs.type || '').toLowerCase();
+        if (/track/.test(cls)) return 'Track';
+        if (Array.isArray(attrs.timestamps) && attrs.timestamps.length) return 'Track';
+        const paths = getLineStringPaths(feature && feature.geometry);
+        if (paths.some(path => path.some(pt => pt.length >= 4 && Number.isFinite(pt[3])))) return 'Track';
+        return 'Route';
+    }
+
+    // Great-circle length of a path in miles.
+    function pathLengthMiles(path) {
+        const pts = (Array.isArray(path) ? path : []).filter(isFiniteLngLat);
+        let total = 0;
+        for (let i = 1; i < pts.length; i++) {
+            total += haversineMiles({lat: pts[i - 1][1], lng: pts[i - 1][0]}, {lat: pts[i][1], lng: pts[i][0]}) || 0;
+        }
+        return total;
+    }
+
+    // Even-odd ray casting against one lon/lat ring (closed or open).
+    function pointInRing(point, ring) {
+        const pts = (Array.isArray(ring) ? ring : []).filter(isFiniteLngLat);
+        const n = pts.length;
+        if (n < 3) return false;
+        const x = point[0];
+        const y = point[1];
+        let inside = false;
+        for (let i = 0, j = n - 1; i < n; j = i++) {
+            const xi = pts[i][0];
+            const yi = pts[i][1];
+            const xj = pts[j][0];
+            const yj = pts[j][1];
+            if ((yi > y) !== (yj > y) && x < (xj - xi) * (y - yi) / (yj - yi) + xi) inside = !inside;
+        }
+        return inside;
+    }
+
+    // Inside the polygon made of `rings` (the first is the outer boundary, the
+    // rest are holes): even-odd over every ring.
+    function pointInPolygonRings(point, rings) {
+        if (!isFiniteLngLat(point) || !Array.isArray(rings)) return false;
+        let inside = false;
+        rings.forEach(ring => { if (pointInRing(point, ring)) inside = !inside; });
+        return inside;
+    }
+
+    // The polygons (each a list of rings) of an area geometry: a Polygon, the
+    // members of a MultiPolygon, the area members of a GeometryCollection.
+    // A line or a point has none.
+    function collectAreaPolygons(geometry, out = []) {
+        if (!geometry || typeof geometry !== 'object') return out;
+        const type = String(geometry.type || '');
+        if (type === 'Polygon') {
+            if (Array.isArray(geometry.coordinates) && geometry.coordinates.length) out.push(geometry.coordinates);
+        } else if (type === 'MultiPolygon') {
+            (Array.isArray(geometry.coordinates) ? geometry.coordinates : []).forEach(polygon => {
+                if (Array.isArray(polygon) && polygon.length) out.push(polygon);
+            });
+        } else if (type === 'GeometryCollection') {
+            (Array.isArray(geometry.geometries) ? geometry.geometries : []).forEach(member => collectAreaPolygons(member, out));
+        }
+        return out;
+    }
+
+    function pointInAreaGeometry(point, geometry) {
+        return collectAreaPolygons(geometry).some(rings => pointInPolygonRings(point, rings));
+    }
+
+    // Where the leg a -> b crosses the edge p -> q, as the fraction of the leg
+    // (0 at a, 1 at b); null when they do not cross (or run parallel - the
+    // midpoint tests take care of a leg lying along an edge).
+    function legCrossingParameter(a, b, p, q) {
+        const rx = b[0] - a[0];
+        const ry = b[1] - a[1];
+        const sx = q[0] - p[0];
+        const sy = q[1] - p[1];
+        const denominator = rx * sy - ry * sx;
+        if (Math.abs(denominator) < 1e-18) return null;
+        const t = ((p[0] - a[0]) * sy - (p[1] - a[1]) * sx) / denominator;
+        const u = ((p[0] - a[0]) * ry - (p[1] - a[1]) * rx) / denominator;
+        if (t < 0 || t > 1 || u < 0 || u > 1) return null;
+        return t;
+    }
+
+    // The miles of a path that lie inside an area geometry. Every leg of the
+    // path is cut where it crosses an edge of the shape and each piece is
+    // counted when its midpoint is inside, so a track that leaves a segment
+    // and comes back is measured exactly for the part it spent inside.
+    function measurePathInsideGeometryMiles(path, geometry) {
+        const polygons = collectAreaPolygons(geometry);
+        const pts = (Array.isArray(path) ? path : []).filter(isFiniteLngLat);
+        if (!polygons.length || pts.length < 2) return 0;
+
+        const edges = [];
+        let minX = Infinity;
+        let minY = Infinity;
+        let maxX = -Infinity;
+        let maxY = -Infinity;
+        polygons.forEach(rings => rings.forEach(ring => {
+            const vertices = (Array.isArray(ring) ? ring : []).filter(isFiniteLngLat);
+            for (let i = 0; i < vertices.length; i++) {
+                const p = vertices[i];
+                const q = vertices[(i + 1) % vertices.length];
+                if (p[0] === q[0] && p[1] === q[1]) continue;
+                edges.push({p, q, minX: Math.min(p[0], q[0]), maxX: Math.max(p[0], q[0]), minY: Math.min(p[1], q[1]), maxY: Math.max(p[1], q[1])});
+                minX = Math.min(minX, p[0]);
+                maxX = Math.max(maxX, p[0]);
+                minY = Math.min(minY, p[1]);
+                maxY = Math.max(maxY, p[1]);
+            }
+        }));
+        if (!edges.length) return 0;
+
+        const at = (a, b, t) => [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        let inside = 0;
+        for (let i = 1; i < pts.length; i++) {
+            const a = pts[i - 1];
+            const b = pts[i];
+            const legMinX = Math.min(a[0], b[0]);
+            const legMaxX = Math.max(a[0], b[0]);
+            const legMinY = Math.min(a[1], b[1]);
+            const legMaxY = Math.max(a[1], b[1]);
+            // A leg outside the shape's bounding box cannot be inside it.
+            if (legMaxX < minX || legMinX > maxX || legMaxY < minY || legMinY > maxY) continue;
+            const cuts = [0, 1];
+            edges.forEach(edge => {
+                if (edge.maxX < legMinX || edge.minX > legMaxX || edge.maxY < legMinY || edge.minY > legMaxY) return;
+                const t = legCrossingParameter(a, b, edge.p, edge.q);
+                if (t !== null) cuts.push(t);
+            });
+            cuts.sort((x, y) => x - y);
+            for (let k = 1; k < cuts.length; k++) {
+                const t0 = cuts[k - 1];
+                const t1 = cuts[k];
+                if (t1 - t0 <= 1e-12) continue;
+                const mid = at(a, b, (t0 + t1) / 2);
+                if (!polygons.some(rings => pointInPolygonRings(mid, rings))) continue;
+                const from = at(a, b, t0);
+                const to = at(a, b, t1);
+                inside += haversineMiles({lat: from[1], lng: from[0]}, {lat: to[1], lng: to[0]}) || 0;
+            }
+        }
+        return inside;
+    }
+
+    const roundMiles = (miles) => Math.round(miles * 10000) / 10000;
+
+    // How the miles of a track fall across the Segments rows whose CalTopo
+    // shape is known (findFeatureForSegmentRow): {totalMiles, pointCount,
+    // segments: [{region, segment, miles}]} listing only the segments the
+    // track actually entered. A segment without an area shape (a line
+    // assignment, no shape at all) is never entered.
+    function measureTrackMilesBySegment(trackFeature, segmentRows, features) {
+        const paths = getLineStringPaths(trackFeature && trackFeature.geometry);
+        const totalMiles = roundMiles(paths.reduce((sum, path) => sum + pathLengthMiles(path), 0));
+        const pointCount = paths.reduce((sum, path) => sum + path.length, 0);
+        const segments = [];
+        (Array.isArray(segmentRows) ? segmentRows : []).forEach(row => {
+            if (!Array.isArray(row) || !String(row[1] || '').trim()) return;
+            const shape = findFeatureForSegmentRow(features, row);
+            if (!shape || !collectAreaPolygons(shape.geometry).length) return;
+            const miles = roundMiles(paths.reduce((sum, path) => sum + measurePathInsideGeometryMiles(path, shape.geometry), 0));
+            if (miles > 0) segments.push({region: String(row[0] || '').trim(), segment: String(row[1] || '').trim(), miles});
+        });
+        return {totalMiles, pointCount, segments};
+    }
+
+    // The task/segment code at the front of a track name: "#2-4D Team 1" ->
+    // {taskNumber: '2', segment: '4D', baseName: 'Team 1'}. The known segment
+    // names are tried first (longest first) so a segment name with spaces is
+    // recognised; otherwise the code runs to the first space. A name without
+    // the code comes back unchanged with an empty task and segment.
+    function parseSearcherTrackName(name, segmentNames) {
+        const text = String(name || '').trim();
+        const result = {taskNumber: '', segment: '', baseName: text};
+        const dash = text.indexOf('-');
+        if (!text.startsWith('#') || dash < 2 || !/^\d+$/.test(text.slice(1, dash))) return result;
+        const rest = text.slice(dash + 1);
+        const known = (Array.isArray(segmentNames) ? segmentNames : [])
+            .map(value => String(value || '').trim())
+            .filter(Boolean)
+            .sort((a, b) => b.length - a.length);
+        for (const segment of known) {
+            if (rest === segment || (rest.startsWith(segment) && /^\s/.test(rest.slice(segment.length)))) {
+                return {taskNumber: text.slice(1, dash), segment, baseName: rest.slice(segment.length).trim()};
+            }
+        }
+        const match = text.match(SEARCHER_TRACK_NAME_CODE);
+        if (!match) return result;
+        return {taskNumber: match[1], segment: match[2], baseName: text.slice(match[0].length).trim()};
+    }
+
+    // "#2-4D Team 1"; the base name alone when there is no task or segment.
+    function formatSearcherTrackName(taskTag, segment, baseName) {
+        const num = normalizeTaskTag(taskTag).replace(/^#/, '');
+        const seg = String(segment || '').trim();
+        const base = String(baseName || '').trim();
+        if (!num || !seg) return base;
+        return `#${num}-${seg}${base ? ` ${base}` : ''}`;
+    }
+
+    // One imported track in canonical form (null when it cannot be one):
+    //   id           the CalTopo feature id, or the id the website made up
+    //   featureId    the CalTopo id ('' when the shape has none)
+    //   baseName     the name without the task/segment code
+    //   caltopoName  the title CalTopo last had (fetched, or pushed by us)
+    //   type         'Track' | 'Route'
+    //   lengthMiles, pointCount
+    //   segmentMiles [{region, segment, miles}] - the miles inside each segment
+    //   assignedTask '#2' when the planner picked the task; '' = automatic
+    //   custom       true for a track typed in by hand (type 'Custom'): it has
+    //                no shape on the map, so it is never re-measured, renamed
+    //                or recolored there
+    //   importedAt, importedBy, evaluatedAt
+    function normalizeSearcherTrack(value) {
+        if (!value || typeof value !== 'object' || Array.isArray(value)) return null;
+        const id = String(value.id || value.featureId || '').trim();
+        if (!id) return null;
+        const custom = value.custom === true || value.type === 'Custom';
+        const lengthMiles = toFiniteNumber(value.lengthMiles);
+        const pointCount = toFiniteNumber(value.pointCount);
+        const segmentMiles = (Array.isArray(value.segmentMiles) ? value.segmentMiles : []).map(entry => {
+            if (!entry || typeof entry !== 'object') return null;
+            const miles = toFiniteNumber(entry.miles);
+            const segment = String(entry.segment || '').trim();
+            if (!segment || miles === null || miles <= 0) return null;
+            return {region: String(entry.region || '').trim(), segment, miles};
+        }).filter(Boolean);
+        return {
+            id,
+            featureId: custom ? '' : String(value.featureId || '').trim(),
+            baseName: String(value.baseName || '').trim(),
+            caltopoName: custom ? '' : String(value.caltopoName || '').trim(),
+            type: custom ? 'Custom' : (SEARCHER_TRACK_TYPES.includes(value.type) ? value.type : 'Route'),
+            lengthMiles: lengthMiles !== null && lengthMiles > 0 ? lengthMiles : 0,
+            pointCount: pointCount !== null && pointCount > 0 ? Math.floor(pointCount) : 0,
+            segmentMiles,
+            assignedTask: normalizeTaskTag(value.assignedTask),
+            custom,
+            importedAt: typeof value.importedAt === 'string' ? value.importedAt : '',
+            importedBy: typeof value.importedBy === 'string' ? value.importedBy : '',
+            evaluatedAt: typeof value.evaluatedAt === 'string' ? value.evaluatedAt : ''
+        };
+    }
+
+    // The canonical list: usable records only, one per id (the first wins).
+    function normalizeSearcherTracks(list) {
+        const seen = new Set();
+        const out = [];
+        (Array.isArray(list) ? list : []).forEach(value => {
+            const track = normalizeSearcherTrack(value);
+            if (!track || seen.has(track.id)) return;
+            seen.add(track.id);
+            out.push(track);
+        });
+        return out;
+    }
+
+    // When a Search Log row was logged (column 1 = MM-DD-YYYY, column 2 =
+    // HH:mm); 0 for a row without a date.
+    function searchLogRowTimestamp(row) {
+        if (!Array.isArray(row) || !row[1]) return 0;
+        const [m, d, y] = String(row[1]).split('-').map(Number);
+        const [hh, mm] = String(row[2] || '00:00').split(':').map(Number);
+        const ts = new Date(y || 0, (m || 1) - 1, d || 1, hh || 0, mm || 0).getTime();
+        return Number.isFinite(ts) ? ts : 0;
+    }
+
+    // Which task every imported track counts toward, from the tracks' stored
+    // per-segment miles and the Search Log rows:
+    //   byTask         {'#2': {miles, portions: [{trackId, region, segment,
+    //                  miles, home}]}} - the track miles each task gets
+    //   tracks         one per track: {id, track, home, homeTasks, task,
+    //                  ambiguous, portions: [{region, segment, miles, task,
+    //                  home}], displayName}
+    //   ambiguousTasks the tasks that share a home segment with an ambiguous
+    //                  track (they get the red question mark)
+    // The home segment is the one with the most miles. Its tasks are the
+    // Search Log rows for that segment, oldest first; the planner's pick
+    // (assignedTask) wins when it is one of them, a single task is taken as
+    // is, several make the track ambiguous and the latest gets the miles for
+    // now, none leaves the miles unallocated until a task exists. The miles
+    // in every other segment go to that segment's latest task (or wait for
+    // the next one). displayName carries the "#task-segment " code.
+    function allocateSearcherTracks(tracks, searchLogRows) {
+        const list = normalizeSearcherTracks(tracks);
+        const taskNumber = tag => parseInt(String(tag).replace('#', ''), 10) || 0;
+        const rows = (Array.isArray(searchLogRows) ? searchLogRows : [])
+            .filter(row => Array.isArray(row) && normalizeTaskTag(row[0]) && String(row[4] || '').trim())
+            .sort((a, b) => (searchLogRowTimestamp(a) - searchLogRowTimestamp(b)) || (taskNumber(a[0]) - taskNumber(b[0])));
+        const tasksBySegment = new Map();
+        rows.forEach(row => {
+            const key = segmentKey(row[3], row[4]);
+            const tag = normalizeTaskTag(row[0]);
+            if (!tasksBySegment.has(key)) tasksBySegment.set(key, []);
+            if (!tasksBySegment.get(key).includes(tag)) tasksBySegment.get(key).push(tag);
+        });
+        const tasksFor = (region, segment) => (tasksBySegment.get(segmentKey(region, segment)) || []).slice();
+        const latestTaskFor = (region, segment) => {
+            const tasks = tasksFor(region, segment);
+            return tasks.length ? tasks[tasks.length - 1] : '';
+        };
+
+        const byTask = {};
+        const ambiguousTasks = [];
+        const allocated = list.map(track => {
+            const ordered = track.segmentMiles.slice().sort((a, b) => b.miles - a.miles);
+            const home = ordered.length ? {region: ordered[0].region, segment: ordered[0].segment, miles: ordered[0].miles} : null;
+            const homeTasks = home ? tasksFor(home.region, home.segment) : [];
+            let task = '';
+            let ambiguous = false;
+            if (home) {
+                if (track.assignedTask && homeTasks.includes(track.assignedTask)) {
+                    task = track.assignedTask;
+                } else if (homeTasks.length === 1) {
+                    task = homeTasks[0];
+                } else if (homeTasks.length > 1) {
+                    task = homeTasks[homeTasks.length - 1];
+                    ambiguous = true;
+                }
+            }
+            if (ambiguous) homeTasks.forEach(tag => { if (!ambiguousTasks.includes(tag)) ambiguousTasks.push(tag); });
+            const portions = ordered.map((portion, index) => {
+                const isHome = index === 0;
+                const portionTask = isHome ? task : latestTaskFor(portion.region, portion.segment);
+                if (portionTask) {
+                    if (!byTask[portionTask]) byTask[portionTask] = {miles: 0, portions: []};
+                    byTask[portionTask].miles += portion.miles;
+                    byTask[portionTask].portions.push({trackId: track.id, region: portion.region, segment: portion.segment, miles: portion.miles, home: isHome});
+                }
+                return {region: portion.region, segment: portion.segment, miles: portion.miles, task: portionTask, home: isHome};
+            });
+            const displayName = task && home ? formatSearcherTrackName(task, home.segment, track.baseName) : track.baseName;
+            return {id: track.id, track, home, homeTasks, task, ambiguous, portions, displayName};
+        });
+        return {byTask, tracks: allocated, ambiguousTasks};
+    }
+
+    // The track miles a task gets from an allocation (0 without any).
+    function getTaskTrackMiles(allocation, taskTag) {
+        const tag = normalizeTaskTag(taskTag);
+        const entry = allocation && allocation.byTask && tag ? allocation.byTask[tag] : null;
+        return entry && Number.isFinite(entry.miles) ? entry.miles : 0;
+    }
+
     return {
         LPB_CATEGORY_GROUPS,
         LPB_CATEGORIES,
@@ -1047,6 +1470,25 @@
         resolveLpbBracket,
         buildLpbContext,
         getLpbSegmentAdjustment,
+        SEARCHER_TRACK_NAME_CODE,
+        SEARCHER_TRACK_TYPES,
+        normalizeTaskTag,
+        getLineStringPaths,
+        isTrackLikeFeature,
+        getTrackTypeLabel,
+        pathLengthMiles,
+        pointInPolygonRings,
+        collectAreaPolygons,
+        pointInAreaGeometry,
+        measurePathInsideGeometryMiles,
+        measureTrackMilesBySegment,
+        parseSearcherTrackName,
+        formatSearcherTrackName,
+        normalizeSearcherTrack,
+        normalizeSearcherTracks,
+        searchLogRowTimestamp,
+        allocateSearcherTracks,
+        getTaskTrackMiles,
         getFeatureTypeKey,
         getCalTopoApiObjectType,
         captureCalTopoFeatureStyle,

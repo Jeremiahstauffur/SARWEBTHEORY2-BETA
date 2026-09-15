@@ -44,7 +44,7 @@
           <div class="hero-columns">
             <div class="hero-col-left">
               <h1>Search Log</h1>
-              <p>Log search activities including regions, segments, and search parameters. Date and Time columns format automatically as you type. Changes save automatically.</p>
+              <p>Log search activities including regions, segments, and search parameters. Date and Time columns format automatically as you type. Changes save automatically. With <strong>Map Tracking</strong> on, the miles of searcher track inside each task's segment stand in for Num of Sweeps &times; segment length &times; team count in the PSR maths, and the sweep-count reminders are off.</p>
             </div>
           </div>
         </section>
@@ -93,6 +93,14 @@
             <span class="geek-abbr" title="Sort: most recent at top">Newest First</span>
           </div>
           <div class="tool-actions">
+            <!-- Map Tracking: the miles of imported searcher tracks (Searchers Tracks table below) replace Num of Sweeps x segment length in the PSR maths. Bound by buildSearchLogTable (app.js). -->
+            <div class="map-tracking-toggle" id="map-tracking-control">
+              <label class="toggle-switch">
+                <input type="checkbox" id="map-tracking-toggle">
+                <span class="slider"></span>
+              </label>
+              <span id="map-tracking-label">Map Tracking</span>
+            </div>
           </div>
         </div>
 
@@ -102,6 +110,36 @@
         </table>
 
         <div class="status" id="save-status">Ready.</div>
+      </section>
+
+      <!-- Searchers Tracks: the GPS tracks imported from the CalTopo map, each measured for the miles it spent inside every segment (rendered by renderSearcherTracksTable in app.js). -->
+      <section class="table-card searcher-tracks-card" id="searcher-tracks-card">
+        <div class="searcher-tracks-header">
+          <div>
+            <h2>Searchers Tracks</h2>
+            <p>Tracks recorded on the CalTopo map, named <code>#task-segment</code> after the segment they mostly searched, plus any custom track typed in by hand. The miles inside each segment count toward that segment's task; a red <strong>?</strong> marks a track whose segment carries more than one task - click it to choose.</p>
+          </div>
+          <div class="tool-actions">
+            <button type="button" class="clear-btn" id="custom-track-btn" title="Type in a track that never reached the map: a name, the miles walked and the task # it counts toward">Custom Track</button>
+            <button type="button" class="clear-btn" id="refresh-tracks-btn" title="Fetch the map again and re-measure every imported track">Refresh Tracks</button>
+            <button type="button" class="clear-btn" id="import-tracks-btn" title="Fetch the tracks recorded on the CalTopo map and pick the ones to import">Import Tracks</button>
+          </div>
+        </div>
+
+        <table class="grid-table searcher-tracks-table" aria-label="Searchers Tracks table">
+          <thead>
+            <tr>
+              <th class="fixed-header">Track Name</th>
+              <th class="fixed-header">Type</th>
+              <th class="fixed-header">Length</th>
+              <th class="fixed-header">Length per Segment</th>
+              <th class="fixed-header">Delete</th>
+            </tr>
+          </thead>
+          <tbody id="searcher-tracks-body"></tbody>
+        </table>
+
+        <div class="status searcher-tracks-status" id="searcher-tracks-status">No searcher tracks imported yet.</div>
       </section>
     </main>
 

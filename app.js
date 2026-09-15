@@ -1321,6 +1321,26 @@ function buildCalTopoOverlayStyle(overlayColor, isActiveSearch, segmentDisplaySe
     return style;
 }
 
+// The line color of a searcher track that has been imported into the search
+// file (Search Log page, Searchers Tracks) while the PSRc Assignment Colors
+// are on: a darker red, so the map tells the tracks the file counts from the
+// ones it does not know yet. Pushed by updateCalTopoAssignmentOverlay along
+// with the segment colors; the track's own style is kept in the overlay
+// state's `originals` and put back when the colors go off or the track is
+// dropped from the table.
+const CALTOPO_IMPORTED_TRACK_COLOR = '#8b0000';
+
+// The style pushed for an imported track: the dark red line at full opacity,
+// its thickness left as it is (a line has no fill).
+function buildCalTopoImportedTrackStyle() {
+    return {
+        color: CALTOPO_IMPORTED_TRACK_COLOR,
+        stroke: CALTOPO_IMPORTED_TRACK_COLOR,
+        opacity: 1,
+        'stroke-opacity': 1
+    };
+}
+
 // ---------------------------------------------------------------------------
 // Finished-task summaries in CalTopo assignment descriptions.
 //
@@ -1574,7 +1594,34 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
         return !!getFeaturePsrcAssignmentStyle(feature, psrcLookup, segmentDisplaySettings);
     });
 
-    if (!matchingAssignments.length) {
+    // The searcher tracks imported on the Search Log page: drawn in dark red
+    // while the colors are on (their own style captured first, like the
+    // assignments'); a track-like shape whose original style is on record but
+    // that is no longer imported - or every one of them when the colors go off
+    // - gets its original style back.
+    const importedTracks = [];
+    const trackKeys = new Set();
+    if (enabled) {
+        getSearcherTracks(bundle).forEach(track => {
+            const feature = findFeatureForSearcherTrack(track, features);
+            const styleKey = feature ? getCalTopoOverlayOriginalStyleKey(feature) : '';
+            if (!feature || !styleKey || trackKeys.has(styleKey) || !getCalTopoWritableFeatureId(feature)) {
+                return;
+            }
+            trackKeys.add(styleKey);
+            importedTracks.push({feature, styleKey, style: buildCalTopoImportedTrackStyle(), restore: false});
+        });
+    }
+    features.forEach(feature => {
+        const styleKey = getCalTopoOverlayOriginalStyleKey(feature);
+        if (!styleKey || trackKeys.has(styleKey) || !originals[styleKey] || !isTrackLikeMapFeature(feature) || !getCalTopoWritableFeatureId(feature)) {
+            return;
+        }
+        trackKeys.add(styleKey);
+        importedTracks.push({feature, styleKey, style: originals[styleKey], restore: true});
+    });
+
+    if (!matchingAssignments.length && !importedTracks.length) {
         if (!enabled) {
             delete map.caltopoAssignmentOverlayState;
             saveBundle(bundle);
@@ -1672,6 +1719,49 @@ async function updateCalTopoAssignmentOverlay(enabled, options = {}) {
         }
         if (nextDescription !== null) {
             feature.attributes.description = nextDescription;
+            changedLocally = true;
+        }
+        updatedCount++;
+    }
+
+    for (const {feature, styleKey, style, restore} of importedTracks) {
+        const featureId = getCalTopoWritableFeatureId(feature);
+        const featureName = getMapFeatureDisplayName(feature) || styleKey;
+        if (!restore && !Object.prototype.hasOwnProperty.call(originals, styleKey)) {
+            originals[styleKey] = captureCalTopoFeatureStyle(feature.attributes);
+            changedLocally = true;
+        }
+
+        // The whole shape travels with the style (geometry and all) so nothing
+        // else about the track changes on CalTopo.
+        const payload = buildCalTopoFeatureUpdatePayload(feature, style);
+        payload.id = featureId;
+        let successfulType = null;
+        for (const objectType of getSearcherTrackApiObjectTypeCandidates(feature)) {
+            const endpoint = `/api/v1/map/${encodeURIComponent(map.id)}/${encodeURIComponent(objectType)}/${encodeURIComponent(featureId)}`;
+            const result = await caltopo_api_call('POST', endpoint, payload, map.domain || 'caltopo.com', {silent: true});
+            if (result) {
+                successfulType = objectType;
+                break;
+            }
+        }
+        if (!successfulType) {
+            errors.push(`CalTopo could not update track "${featureName}".`);
+            continue;
+        }
+        if (feature.attributes.class !== successfulType) {
+            feature.attributes.class = successfulType;
+            changedLocally = true;
+        }
+
+        const styleBefore = JSON.stringify(captureCalTopoFeatureStyle(feature.attributes));
+        applyCapturedCalTopoFeatureStyle(feature.attributes, style);
+        if (JSON.stringify(captureCalTopoFeatureStyle(feature.attributes)) !== styleBefore) {
+            changedLocally = true;
+        }
+        if (restore) {
+            // Back to its own style: nothing left to put back later.
+            delete originals[styleKey];
             changedLocally = true;
         }
         updatedCount++;
@@ -5601,6 +5691,10 @@ function defaultBundle() {
     // the team wants to hear about; a type switched off is marked unwanted
     // automatically. Missing = on.
     mapFeatureTypeFilters: {marker: true, shape: true, assignment: true, route: true, other: true},
+    // Search Log page "Map Tracking": off until switched on, no searcher tracks
+    // imported from the map yet (see the Searchers Tracks section).
+    mapTrackingEnabled: false,
+    searcherTracks: [],
     permanentPersonnel: {},
     // The one IC Report of this CASE # (Forms page, "IC Report" button).
     icReport: defaultIcReport(),
@@ -5812,6 +5906,11 @@ function sanitizeBundle(bundle) {
   // Segments page's apply switch). Kept in canonical form so two devices never
   // disagree about the shape they diff.
   const lostPersonBehavior = normalizeLostPersonBehavior(bundle.lostPersonBehavior);
+  // The Search Log page's Map Tracking switch and the searcher tracks imported
+  // from the CalTopo map with their measured miles per segment (canonical, so
+  // every device allocates the same miles to the same tasks).
+  const mapTrackingEnabled = bundle.mapTrackingEnabled === true;
+  const searcherTracks = normalizeSearcherTracks(bundle.searcherTracks);
 
   let accounts = Array.isArray(bundle.accounts) ? bundle.accounts : fallback.accounts;
 
@@ -5941,6 +6040,8 @@ function sanitizeBundle(bundle) {
     icReport,
     incidentDays,
     lostPersonBehavior,
+    mapTrackingEnabled,
+    searcherTracks,
     accounts: syncedAccounts 
   };
 }
@@ -7147,6 +7248,13 @@ function recalculateEverything(options = {}) {
   // PSRc and the search log's PSR before/after all move together.
   const lpbContext = buildLpbContext(bundle);
 
+  // Search Log "Map Tracking": with the switch on, the miles of imported
+  // searcher tracks inside a task's segment stand in for Num of Sweeps x
+  // segment length in the coverage term (see calculateSearchCoverage and the
+  // Searchers Tracks section).
+  const mapTracking = isMapTrackingEnabled(bundle);
+  const trackAllocation = mapTracking ? allocateSearcherTracksForBundle(bundle) : null;
+
   // Helper for share calculation
   const getInitialShare = (region, area) => {
     const regionRowIndex = (regionsData.rows || []).findIndex(r => r[0] === region);
@@ -7212,8 +7320,11 @@ function recalculateEverything(options = {}) {
       const psrBefore = (length / timePerSweep * sweepWidth * info.share) / (area / 640);
       logRow[5] = isFinite(psrBefore) ? psrBefore.toFixed(4) : '';
 
-      if (sweepWidth > 0 && numSweeps > 0 && numMembers > 0 && area > 0 && length > 0) {
-        const z = sweepWidth / ((area / 640 / length / numSweeps / numMembers) * 5280);
+      const z = calculateSearchCoverage({
+        area, length, sweepWidth, numSweeps, numMembers,
+        trackMiles: mapTracking ? getTaskTrackMiles(trackAllocation, logRow[0]) : null
+      });
+      if (z > 0) {
         info.share *= Math.exp(-z);
       }
 
@@ -8771,19 +8882,52 @@ function getLatestPSR(region, segment) {
   return '';
 }
 
+// The coverage term of the PSR maths - the exponent a segment's share decays
+// by after a search: the sweep width over the searchers' spacing. The spacing
+// is the segment's average width (area / 640 / length, in miles) split between
+// the sweeps and the team members, in feet:
+//   z = sweepWidth / ((area / 640 / length / numSweeps / numMembers) x 5280)
+// With the Search Log's Map Tracking switch on, `trackMiles` - the miles of
+// imported searcher tracks inside the task's segment - takes the place of the
+// whole length x numSweeps x numMembers product (those three only ever
+// estimated the miles the team walked; the tracks are those miles), so the
+// term reads "tracks" instead of "num of sweeps" and the team count is not
+// used:
+//   z = sweepWidth / ((area / 640 / trackMiles) x 5280)
+// 0 when a value the term needs is missing (the share does not decay). The
+// operations of the classic form are kept in their original order so stored
+// PSR values do not move by a rounding bit.
+function calculateSearchCoverage({area, length, sweepWidth, numSweeps, numMembers, trackMiles = null}) {
+  if (!(area > 0) || !(sweepWidth > 0)) return 0;
+  let spacingFt;
+  if (trackMiles === null || trackMiles === undefined) {
+    if (!(length > 0) || !(numSweeps > 0) || !(numMembers > 0)) return 0;
+    spacingFt = (area / 640 / length / numSweeps / numMembers) * 5280;
+  } else {
+    if (!(trackMiles > 0)) return 0;
+    spacingFt = (area / 640 / trackMiles) * 5280;
+  }
+  const z = sweepWidth / spacingFt;
+  return Number.isFinite(z) && z > 0 ? z : 0;
+}
+
 function calculatePSRAfter(row, bundle, segDataOverride = null) {
   const region = row[3];
   const segment = row[4];
   const teamInfo = row[7] || '';
   const sweepWidth = parseNumeric(row[8]);
   const numSweeps = parseNumeric(row[9]);
+  // Map Tracking: the task's track miles stand in for Num of Sweeps x length.
+  const mapTracking = isMapTrackingEnabled(bundle);
+  const trackMiles = mapTracking ? getTaskTrackMiles(allocateSearcherTracksForBundle(bundle), row[0]) : null;
 
-  if (!region || !segment || sweepWidth <= 0 || numSweeps <= 0) return '';
+  if (!region || !segment || sweepWidth <= 0 || (mapTracking ? trackMiles <= 0 : numSweeps <= 0)) return '';
 
-  // Extract team members count from e.g. "Team Alpha (3)"
+  // Extract team members count from e.g. "Team Alpha (3)" (not used with Map
+  // Tracking on - the track miles already are the miles the team walked).
   const match = teamInfo.match(/\((\d+)\)/);
   const numMembers = match ? parseInt(match[1]) : 0;
-  if (numMembers <= 0) return '';
+  if (!mapTracking && numMembers <= 0) return '';
 
   // Get segment info from Segments page data
   const segData = segDataOverride || bundle.pages.page2 || [];
@@ -8814,9 +8958,10 @@ function calculatePSRAfter(row, bundle, segDataOverride = null) {
 
   // Formula as requested:
   // PSR = Length / TimePerSweep * SweepWidth * ((Consensus * Area / SumOfAreas) - ((Consensus * Area / SumOfAreas) * (1 - EXP(-(SweepWidth / (Area / 640 / Length / NumOfSweeps / NumTeamMembers) * 5280)))))) / (Area / 640)
+  // (with Map Tracking on, Length x NumOfSweeps x NumTeamMembers is the task's track miles - see calculateSearchCoverage)
 
   const baseValue = (consensus * area / sumOfAreas);
-  const z = sweepWidth / ((area / 640 / length / numSweeps / numMembers) * 5280);
+  const z = calculateSearchCoverage({area, length, sweepWidth, numSweeps, numMembers, trackMiles});
   const psrAfter = (length / timePerSweep * sweepWidth * (baseValue - (baseValue * (1 - Math.exp(-z))))) / (area / 640);
 
   return isFinite(psrAfter) ? psrAfter.toFixed(4) : '';
@@ -11563,6 +11708,12 @@ function buildSearchLogTable() {
   const data = loadData();
   const bundle = loadBundle();
 
+  // Map Tracking (see the Searchers Tracks section): the switch in the tools
+  // row, and which task every imported track's miles count toward.
+  const mapTracking = isMapTrackingEnabled(bundle);
+  const trackAllocation = allocateSearcherTracksForBundle(bundle);
+  bindMapTrackingToggle(mapTracking);
+
   // Identify unfinished tasks from team assignments and statuses
   const unfinishedTasks = new Set();
   if (bundle.currentAssignments && bundle.teamStatuses) {
@@ -11635,6 +11786,12 @@ function buildSearchLogTable() {
     const th = document.createElement('th');
     th.textContent = h;
     th.className = 'fixed-header';
+    if (h === 'Num of Sweeps' && mapTracking) {
+      // With Map Tracking on the term reads "Tracks": the miles of searcher
+      // track inside the task's segment replace Num of Sweeps x segment length.
+      th.textContent = 'Tracks (mi)';
+      th.title = MAP_TRACKING_COLUMN_HINT;
+    }
     if (h === 'Team') {
       const recountBtn = document.createElement('button');
       recountBtn.className = 'mini-pill';
@@ -11717,15 +11874,21 @@ function buildSearchLogTable() {
       
       cell.spellcheck = false;
 
+      // Map Tracking: the typed sweeps count is not used, so the cell fades
+      // out and is read-only; the tag riding it (added below the cell) carries
+      // the miles of searcher track inside this task's segment (see the
+      // Searchers Tracks section).
+      const fadedSweeps = c === 9 && mapTracking && !!taskNum;
+
       // Highlight Team (7) and Num of Sweeps (9) when blank.
       // Skip the highlight entirely for rows that have no Task # yet
       // (e.g. a freshly opened case with no search log record).
-      if ([7, 9].includes(c) && cellValue === '' && taskNum) {
+      if ([7, 9].includes(c) && cellValue === '' && taskNum && !fadedSweeps) {
         cell.classList.add('blank-highlight');
       }
 
       // Read-only columns: Task # (0), Region (3), Segment (4), PSR Before (5), PSR After (6), and Team if it's a pill (7)
-      const isReadonly = [0, 3, 4, 5, 6].includes(c) || (c === 7 && cellValue.includes('('));
+      const isReadonly = [0, 3, 4, 5, 6].includes(c) || (c === 7 && cellValue.includes('(')) || fadedSweeps;
       if (isReadonly) {
         cell.classList.add('readonly-pill');
       } else {
@@ -11808,6 +11971,15 @@ function buildSearchLogTable() {
       });
 
       cellContainer.appendChild(cell);
+
+      if (fadedSweeps) {
+        appendTrackMilesTag(cellContainer, cell, taskNum, trackAllocation);
+      }
+      // A task whose segment carries two assignments cannot tell which one an
+      // imported track belongs to: the red question mark opens the picker.
+      if (c === 0 && mapTracking && taskNum && trackAllocation.ambiguousTasks.includes(normalizeSearchTaskTag(taskNum))) {
+        appendTrackQuestionBadge(cellContainer, taskNum, trackAllocation);
+      }
 
       td.appendChild(cellContainer);
       tr.appendChild(td);
@@ -11930,8 +12102,986 @@ function buildSearchLogTable() {
   if (clearBtn) {
     clearBtn.remove();
   }
+
+  // The Searchers Tracks table under the log, and the CalTopo names of the
+  // tracks (a no-op when every name already carries its code).
+  renderSearcherTracksTable(bundle, trackAllocation, mapTracking);
+  syncSearcherTrackNamesToCalTopo();
   
   initCharts();
+}
+
+// ---------------------------------------------------------------------------
+// Searchers Tracks (Search Log page, "Map Tracking").
+//
+// The GPS tracks the searchers recorded on the CalTopo map are imported into
+// the case (bundle.searcherTracks) and measured against the segment shapes -
+// how many miles of each track lie inside each segment - by the pure maths in
+// map-segment-utils.js (measureTrackMilesBySegment, allocateSearcherTracks).
+// With the page's "Map Tracking" switch (bundle.mapTrackingEnabled, a case
+// setting so every device computes the same PSR) on, the miles allocated to a
+// task stand in for Num of Sweeps x segment length in the coverage term of
+// the PSR maths (calculateSearchCoverage); off, the typed sweeps are used and
+// the tracks are merely listed. A track's home segment (the majority of its
+// miles) decides its task; the rest of its miles go to the latest task of the
+// segment they were in. Two tasks on the home segment make the track
+// ambiguous (red "?") until the planner picks one. The track's name on
+// CalTopo gets the "#task-segment " code in front - parsed off a fetched
+// name so it is replaced, never stacked - and the rename is pushed to CalTopo
+// silently.
+// ---------------------------------------------------------------------------
+
+const MAP_TRACKING_COLUMN_HINT = 'Map Tracking is on: the miles of searcher track inside each task\'s segment take the place of Num of Sweeps x segment length x team count in the PSR maths ("tracks" instead of "num of sweeps"; the team count is not used). Sweep-count reminders are off. Switch Map Tracking off to use the typed Num of Sweeps again.';
+const MAP_TRACKING_OFF_HINT = 'Map Tracking is off: the typed Num of Sweeps (with the segment length and the team count) drives the PSR maths. Switch it on to use the miles of searcher track inside each task\'s segment instead.';
+// A track whose CalTopo rename failed is not retried for this long, so the
+// 4 s sync polls (which redraw the page) cannot hammer the proxy.
+const SEARCHER_TRACK_RENAME_RETRY_MS = 5 * 60 * 1000;
+
+// Wrappers over the shared module (the fallbacks keep the page working,
+// without tracking, should the module fail to load).
+function normalizeSearcherTracks(list) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.normalizeSearcherTracks === 'function' ? utils.normalizeSearcherTracks(list) : [];
+}
+
+function isMapTrackingEnabled(bundle = null) {
+    const b = bundle || loadBundle();
+    return !!b && b.mapTrackingEnabled === true;
+}
+
+function getSearcherTracks(bundle = null) {
+    const b = bundle || loadBundle();
+    return normalizeSearcherTracks(b ? b.searcherTracks : []);
+}
+
+// Which task every imported track's miles count toward (allocateSearcherTracks).
+function allocateSearcherTracksForBundle(bundle = null) {
+    const b = bundle || loadBundle();
+    const utils = getMapSegmentUtils();
+    if (typeof utils.allocateSearcherTracks === 'function') {
+        return utils.allocateSearcherTracks(b ? b.searcherTracks : [], b && b.pages ? b.pages.page4 : []);
+    }
+    return {byTask: {}, tracks: [], ambiguousTasks: []};
+}
+
+function getTaskTrackMiles(allocation, taskTag) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getTaskTrackMiles === 'function') return utils.getTaskTrackMiles(allocation, taskTag);
+    const tag = normalizeSearchTaskTag(taskTag);
+    const entry = allocation && allocation.byTask && tag ? allocation.byTask[tag] : null;
+    return entry && Number.isFinite(entry.miles) ? entry.miles : 0;
+}
+
+function isTrackLikeMapFeature(feature) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.isTrackLikeFeature === 'function' ? utils.isTrackLikeFeature(feature) : false;
+}
+
+function getSearcherTrackTypeLabel(feature) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.getTrackTypeLabel === 'function' ? utils.getTrackTypeLabel(feature) : 'Route';
+}
+
+function measureTrackMilesBySegment(feature, segmentRows, features) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.measureTrackMilesBySegment === 'function') return utils.measureTrackMilesBySegment(feature, segmentRows, features);
+    return {totalMiles: 0, pointCount: 0, segments: []};
+}
+
+function parseSearcherTrackName(name, segmentNames) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.parseSearcherTrackName === 'function') return utils.parseSearcherTrackName(name, segmentNames);
+    return {taskNumber: '', segment: '', baseName: String(name || '').trim()};
+}
+
+function formatSearcherTrackName(taskTag, segment, baseName) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.formatSearcherTrackName === 'function') return utils.formatSearcherTrackName(taskTag, segment, baseName);
+    return String(baseName || '').trim();
+}
+
+function getMapFeatures(bundle) {
+    const map = bundle && Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    return map && Array.isArray(map.features) ? map.features : [];
+}
+
+function formatTrackMiles(miles) {
+    const value = Number(miles);
+    return `${(Number.isFinite(value) ? value : 0).toFixed(2)} mi`;
+}
+
+// The name a track is listed under: the computed "#task-segment " name, else
+// what it was called on the map.
+function getSearcherTrackLabel(entry) {
+    return entry.displayName || entry.track.baseName || entry.track.caltopoName || entry.id;
+}
+
+// The case's record for a fetched CalTopo line: its miles measured against
+// the segment shapes (segments with a known CalTopo shape only), the name
+// CalTopo has for it and the base name without the code. `existing` - the
+// record already in the case, if any - keeps its id, the planner's pick and
+// the import stamp.
+function buildSearcherTrackRecord(feature, bundle, existing = null) {
+    const segmentRows = ensureSegmentsPageRows(bundle);
+    const measured = measureTrackMilesBySegment(feature, segmentRows, getMapFeatures(bundle));
+    const featureId = getCalTopoWritableFeatureId(feature);
+    const caltopoName = getMapFeatureDisplayName(feature);
+    const parsed = parseSearcherTrackName(caltopoName, segmentRows.map(row => (Array.isArray(row) ? row[1] : '')));
+    const now = new Date().toISOString();
+    const user = getCurrentUser();
+    const record = {
+        id: (existing && existing.id) || featureId || `trk-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
+        featureId,
+        baseName: parsed.baseName,
+        caltopoName,
+        type: getSearcherTrackTypeLabel(feature),
+        lengthMiles: measured.totalMiles,
+        pointCount: measured.pointCount,
+        segmentMiles: measured.segments,
+        assignedTask: existing ? existing.assignedTask : '',
+        importedAt: existing && existing.importedAt ? existing.importedAt : now,
+        importedBy: existing && existing.importedBy ? existing.importedBy : (user ? String(user.handle || user.username || '').trim() : ''),
+        evaluatedAt: now
+    };
+    const utils = getMapSegmentUtils();
+    return typeof utils.normalizeSearcherTrack === 'function' ? utils.normalizeSearcherTrack(record) : record;
+}
+
+// The fetched feature an imported track came from: by CalTopo id, else (a
+// shape without a real id) by the name CalTopo last had for it. A custom
+// track has no shape on the map, whatever a shape may be called.
+function findFeatureForSearcherTrack(track, features) {
+    if (!track || track.custom) return null;
+    const list = Array.isArray(features) ? features : [];
+    if (track.featureId) {
+        const byId = list.find(feature => getCalTopoWritableFeatureId(feature) === track.featureId);
+        if (byId) return byId;
+    }
+    const names = [track.caltopoName, track.baseName].map(normalizeSegmentNameForMatch).filter(Boolean);
+    return list.find(feature => isTrackLikeMapFeature(feature) && names.includes(normalizeSegmentNameForMatch(getMapFeatureDisplayName(feature)))) || null;
+}
+
+// The imported track a fetched feature already is, if any (id first, name
+// for shapes without one).
+function findSearcherTrackForFeature(feature, tracks) {
+    const featureId = getCalTopoWritableFeatureId(feature);
+    const name = normalizeSegmentNameForMatch(getMapFeatureDisplayName(feature));
+    return (Array.isArray(tracks) ? tracks : []).find(track => !track.custom && (featureId
+        ? track.featureId === featureId
+        : (!track.featureId && !!name && normalizeSegmentNameForMatch(track.caltopoName) === name))) || null;
+}
+
+// Store a change to the tracks or the switch: saved without sending, then
+// recalculateEverything saves - so the tracks, the log entry and the
+// recomputed PSR rows travel in one batch - and asks for the CalTopo color
+// push at once; the deferred rows still go out when no value moved (the
+// pattern saveLostPersonBehaviorChange uses). Returns the flush promise.
+function saveSearcherTracksChange(bundle) {
+    saveBundle(bundle, true);
+    return recalculateEverything({colorSyncDelay: 0})
+        .then((flushed) => (flushed ? true : pushBundleDelta(loadBundle())));
+}
+
+// The page's "Map Tracking" switch. Resolves false when nothing changed.
+function setMapTrackingEnabled(enabled) {
+    const bundle = loadBundle();
+    if (bundle.mapTrackingEnabled === !!enabled) return Promise.resolve(false);
+    bundle.mapTrackingEnabled = !!enabled;
+    addActivityLogEntry('System', `Map Tracking switched ${enabled ? 'on' : 'off'} on the Search Log page${enabled ? ' (searcher track miles replace Num of Sweeps in the PSR maths)' : ''}`, bundle);
+    return saveSearcherTracksChange(bundle);
+}
+
+function bindMapTrackingToggle(enabled) {
+    const toggle = document.getElementById('map-tracking-toggle');
+    if (!toggle) return;
+    toggle.checked = !!enabled;
+    if (!toggle.dataset.bound) {
+        toggle.dataset.bound = 'true';
+        toggle.onchange = () => {
+            // saveBundle stores the switch at once; the network flush it
+            // returns is not waited for, so the table redraws immediately.
+            setMapTrackingEnabled(toggle.checked);
+            buildSearchLogTable();
+        };
+    }
+    const control = document.getElementById('map-tracking-control');
+    if (control) {
+        control.title = enabled ? MAP_TRACKING_COLUMN_HINT : MAP_TRACKING_OFF_HINT;
+        control.classList.toggle('is-on', !!enabled);
+    }
+}
+
+// The tag riding the faded Num of Sweeps pill: the miles of searcher track
+// allocated to this task, with the tracks behind them as the tooltip.
+function appendTrackMilesTag(container, cell, taskNum, allocation) {
+    const tag = normalizeSearchTaskTag(taskNum);
+    const entry = allocation && allocation.byTask ? allocation.byTask[tag] : null;
+    const miles = entry ? entry.miles : 0;
+    const lines = entry ? entry.portions.map(portion => {
+        const owner = (allocation.tracks || []).find(t => t.id === portion.trackId);
+        const name = owner ? getSearcherTrackLabel(owner) : portion.trackId;
+        return `${name}: ${formatTrackMiles(portion.miles)} in ${portion.segment}${portion.home ? '' : ' (spill-over from its home segment)'}`;
+    }) : [];
+    const summary = miles > 0
+        ? `Map Tracking: ${formatTrackMiles(miles)} of searcher track inside this task's segment stand in for Num of Sweeps x segment length x team count.\n${lines.join('\n')}`
+        : 'Map Tracking: no searcher track has miles in this task\'s segment yet, so this task searches nothing off in the PSR maths. Import tracks (or add a custom track) below.';
+    cell.classList.add('map-tracking-faded');
+    cell.title = summary;
+    const tagEl = document.createElement('span');
+    tagEl.className = 'track-miles-tag';
+    if (!(miles > 0)) tagEl.classList.add('is-empty');
+    tagEl.textContent = formatTrackMiles(miles);
+    tagEl.title = summary;
+    container.classList.add('has-track-tag');
+    container.appendChild(tagEl);
+}
+
+// The red question mark on a Task # whose segment carries another assignment
+// too: the imported tracks in that segment could belong to either. Clicking
+// it opens the picker for the (first) undecided track.
+function appendTrackQuestionBadge(container, taskNum, allocation) {
+    const tag = normalizeSearchTaskTag(taskNum);
+    const undecided = (allocation.tracks || []).filter(t => t.ambiguous && t.homeTasks.includes(tag));
+    if (!undecided.length) return;
+    const badge = document.createElement('button');
+    badge.type = 'button';
+    badge.className = 'track-question-badge';
+    badge.textContent = '?';
+    const names = undecided.map(getSearcherTrackLabel).join(', ');
+    badge.title = `${undecided.length === 1 ? 'A searcher track' : `${undecided.length} searcher tracks`} in ${undecided[0].home.segment} could belong to ${undecided[0].homeTasks.join(' or ')}: ${names}. Click to choose the task #.`;
+    badge.onclick = (event) => {
+        event.stopPropagation();
+        showSearcherTrackTaskPicker(undecided[0].id);
+    };
+    container.classList.add('has-track-question');
+    container.appendChild(badge);
+}
+
+// One "length per segment" pill: the task the miles went to, the segment and
+// the miles ("#2-4D 1.20 mi"); a portion without a task yet says so.
+function buildTrackPortionPill(portion) {
+    const pill = document.createElement('span');
+    pill.className = `mini-pill track-portion-pill ${portion.home ? 'home' : 'other'}${portion.task ? '' : ' unassigned'}`;
+    pill.textContent = `${portion.task ? `${portion.task}-` : ''}${portion.segment} ${formatTrackMiles(portion.miles)}`;
+    pill.title = portion.task
+        ? `${formatTrackMiles(portion.miles)} inside segment ${portion.segment} count toward task ${portion.task}${portion.home ? ' (the track\'s home segment)' : ' (the latest task of that segment)'}.`
+        : `${formatTrackMiles(portion.miles)} inside segment ${portion.segment}: no task has been assigned to that segment yet, so they wait for the next one.`;
+    return pill;
+}
+
+// The "Searchers Tracks" card under the Search Log: one row per imported
+// track with its name (carrying the task/segment code), type, length and the
+// miles per segment as pills - the home segment's pill first with its task,
+// the others with the task their miles went to - plus the red question mark
+// of an undecided track and a Delete button.
+function renderSearcherTracksTable(bundle, allocation, mapTracking) {
+    const tbody = document.getElementById('searcher-tracks-body');
+    if (!tbody) return;
+    const status = document.getElementById('searcher-tracks-status');
+    const importBtn = document.getElementById('import-tracks-btn');
+    const refreshBtn = document.getElementById('refresh-tracks-btn');
+    if (importBtn && !importBtn.dataset.bound) {
+        importBtn.dataset.bound = 'true';
+        importBtn.onclick = () => importSearcherTracksAction(importBtn);
+    }
+    if (refreshBtn && !refreshBtn.dataset.bound) {
+        refreshBtn.dataset.bound = 'true';
+        refreshBtn.onclick = () => refreshSearcherTracks(refreshBtn);
+    }
+    const customBtn = document.getElementById('custom-track-btn');
+    if (customBtn && !customBtn.dataset.bound) {
+        customBtn.dataset.bound = 'true';
+        customBtn.onclick = () => showCustomTrackPopup();
+    }
+    const tracks = allocation && Array.isArray(allocation.tracks) ? allocation.tracks : [];
+    // Only a track off the map can be re-measured there.
+    if (refreshBtn) refreshBtn.disabled = !tracks.some(entry => !entry.track.custom);
+
+    tbody.innerHTML = '';
+    if (!tracks.length) {
+        tbody.innerHTML = '<tr><td colspan="5" class="searcher-tracks-empty">No searcher tracks yet. <strong>Import Tracks</strong> fetches the tracks recorded on the CalTopo map, <strong>Custom Track</strong> types one in (name, miles, task #); the miles a track spent inside a segment count toward that segment\'s task when Map Tracking is on.</td></tr>';
+    }
+
+    let insideMiles = 0;
+    tracks.forEach(entry => {
+        const track = entry.track;
+        const tr = document.createElement('tr');
+        tr.dataset.trackId = entry.id;
+        if (entry.ambiguous) tr.classList.add('track-row-ambiguous');
+
+        const nameTd = document.createElement('td');
+        nameTd.dataset.label = 'Track Name';
+        const nameWrap = document.createElement('div');
+        nameWrap.className = 'pill-cell-container';
+        const namePill = document.createElement('div');
+        namePill.className = 'pill-cell readonly-pill searcher-track-name';
+        namePill.textContent = getSearcherTrackLabel(entry);
+        const stamp = track.evaluatedAt ? new Date(track.evaluatedAt) : null;
+        namePill.title = track.custom
+            ? [
+                'Custom track (typed in, no shape on the map)',
+                track.importedBy ? `Added by ${track.importedBy}` : '',
+                stamp && !isNaN(stamp.getTime()) ? `Added ${stamp.toLocaleString()}` : ''
+            ].filter(Boolean).join('\n')
+            : [
+                `On the map: ${track.caltopoName || '(unnamed)'}`,
+                track.importedBy ? `Imported by ${track.importedBy}` : '',
+                stamp && !isNaN(stamp.getTime()) ? `Measured ${stamp.toLocaleString()}` : '',
+                track.pointCount ? `${track.pointCount} points` : ''
+            ].filter(Boolean).join('\n');
+        nameWrap.appendChild(namePill);
+        nameTd.appendChild(nameWrap);
+        tr.appendChild(nameTd);
+
+        const typeTd = document.createElement('td');
+        typeTd.dataset.label = 'Type';
+        const typeWrap = document.createElement('div');
+        typeWrap.className = 'pill-cell-container';
+        const typePill = document.createElement('div');
+        typePill.className = 'pill-cell readonly-pill';
+        typePill.textContent = track.type;
+        typeWrap.appendChild(typePill);
+        typeTd.appendChild(typeWrap);
+        tr.appendChild(typeTd);
+
+        const lengthTd = document.createElement('td');
+        lengthTd.dataset.label = 'Length';
+        const lengthWrap = document.createElement('div');
+        lengthWrap.className = 'pill-cell-container';
+        const lengthPill = document.createElement('div');
+        lengthPill.className = 'pill-cell readonly-pill';
+        lengthPill.textContent = formatTrackMiles(track.lengthMiles);
+        lengthWrap.appendChild(lengthPill);
+        lengthTd.appendChild(lengthWrap);
+        tr.appendChild(lengthTd);
+
+        const perSegmentTd = document.createElement('td');
+        perSegmentTd.dataset.label = 'Length per Segment';
+        const perSegmentWrap = document.createElement('div');
+        perSegmentWrap.className = 'pill-cell-container track-portions';
+        if (entry.ambiguous) {
+            const badge = document.createElement('button');
+            badge.type = 'button';
+            badge.className = 'track-question-badge inline';
+            badge.textContent = '?';
+            badge.title = `Segment ${entry.home.segment} has ${entry.homeTasks.length} task assignments (${entry.homeTasks.join(', ')}); the miles count toward ${entry.task} until you choose. Click to choose the task #.`;
+            badge.onclick = () => showSearcherTrackTaskPicker(entry.id);
+            perSegmentWrap.appendChild(badge);
+        }
+        entry.portions.forEach(portion => {
+            insideMiles += portion.miles;
+            perSegmentWrap.appendChild(buildTrackPortionPill(portion));
+        });
+        const portionMiles = entry.portions.reduce((sum, portion) => sum + portion.miles, 0);
+        const outsideMiles = track.lengthMiles - portionMiles;
+        if (track.custom && entry.portions.length) {
+            // A custom track is all inside the task's segment by definition.
+        } else if (!entry.portions.length) {
+            const none = document.createElement('span');
+            none.className = 'mini-pill track-portion-pill outside';
+            none.textContent = 'outside every segment';
+            none.title = 'No part of this track lies inside a segment with a CalTopo shape, so it counts toward no task.';
+            perSegmentWrap.appendChild(none);
+        } else if (outsideMiles > 0.005) {
+            const outside = document.createElement('span');
+            outside.className = 'mini-pill track-portion-pill outside';
+            outside.textContent = `outside ${formatTrackMiles(outsideMiles)}`;
+            outside.title = `${formatTrackMiles(outsideMiles)} of this track lie outside every segment and count toward no task.`;
+            perSegmentWrap.appendChild(outside);
+        }
+        perSegmentTd.appendChild(perSegmentWrap);
+        tr.appendChild(perSegmentTd);
+
+        const deleteTd = document.createElement('td');
+        deleteTd.dataset.label = 'Delete';
+        const deleteWrap = document.createElement('div');
+        deleteWrap.className = 'pill-cell-container';
+        const delBtn = document.createElement('button');
+        delBtn.className = 'row-delete-btn';
+        delBtn.textContent = 'Delete';
+        delBtn.type = 'button';
+        delBtn.onclick = () => confirmDeleteRow(tr, () => removeSearcherTrack(entry.id));
+        deleteWrap.appendChild(delBtn);
+        deleteTd.appendChild(deleteWrap);
+        tr.appendChild(deleteTd);
+
+        tbody.appendChild(tr);
+    });
+
+    if (status) {
+        const undecided = tracks.filter(t => t.ambiguous).length;
+        const parts = [];
+        if (tracks.length) {
+            parts.push(`${tracks.length} track${tracks.length === 1 ? '' : 's'}, ${formatTrackMiles(insideMiles)} inside segments.`);
+            if (undecided) parts.push(`${undecided} track${undecided === 1 ? ' needs' : 's need'} a task # (red question mark).`);
+        }
+        parts.push(mapTracking
+            ? 'Map Tracking is on: these miles stand in for Num of Sweeps x segment length x team count in the PSR maths.'
+            : 'Map Tracking is off: the typed Num of Sweeps drives the PSR maths; switch it on to use these miles.');
+        status.textContent = parts.join(' ');
+        status.classList.toggle('is-on', !!mapTracking);
+    }
+}
+
+// The picker behind the red question mark: which of the home segment's tasks
+// the track's progress counts toward (or back to automatic - the latest).
+function showSearcherTrackTaskPicker(trackId) {
+    const bundle = loadBundle();
+    const allocation = allocateSearcherTracksForBundle(bundle);
+    const entry = allocation.tracks.find(t => t.id === trackId);
+    if (!entry || !entry.home) return null;
+    const popup = createPopup(`Which task # does "${getSearcherTrackLabel(entry)}" belong to?`, null);
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+
+    const body = document.createElement('div');
+    body.className = 'track-task-picker';
+    const intro = document.createElement('p');
+    intro.textContent = `${formatTrackMiles(entry.home.miles)} of this track lie in segment ${entry.home.segment}, which carries ${entry.homeTasks.length} task assignments. Choose the task # this progress counts toward; the miles in other segments keep going to those segments' latest tasks.`;
+    body.appendChild(intro);
+
+    const rows = Array.isArray(bundle.pages.page4) ? bundle.pages.page4 : [];
+    const options = document.createElement('div');
+    options.className = 'track-task-options';
+    entry.homeTasks.forEach(tag => {
+        const row = rows.find(r => Array.isArray(r) && normalizeSearchTaskTag(r[0]) === tag);
+        const option = document.createElement('button');
+        option.type = 'button';
+        option.className = `mini-pill track-task-option${entry.track.assignedTask === tag ? ' active' : ''}`;
+        option.dataset.task = tag;
+        const details = row ? [row[1], row[2], row[7]].filter(Boolean).join(' ') : '';
+        option.textContent = details ? `${tag} - ${details}` : tag;
+        option.onclick = () => {
+            closePopup(popup);
+            assignSearcherTrackTask(trackId, tag);
+        };
+        options.appendChild(option);
+    });
+    const auto = document.createElement('button');
+    auto.type = 'button';
+    auto.className = `mini-pill track-task-option${entry.track.assignedTask ? '' : ' active'}`;
+    auto.dataset.task = '';
+    auto.textContent = `Automatic (latest task, ${entry.homeTasks[entry.homeTasks.length - 1]})`;
+    auto.onclick = () => {
+        closePopup(popup);
+        assignSearcherTrackTask(trackId, '');
+    };
+    options.appendChild(auto);
+    body.appendChild(options);
+    content.insertBefore(body, btnContainer);
+
+    btnContainer.innerHTML = '';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => closePopup(popup);
+    btnContainer.appendChild(cancelBtn);
+    return popup;
+}
+
+// The planner's pick for an undecided track ('' = back to automatic).
+function assignSearcherTrackTask(trackId, taskTag) {
+    const bundle = loadBundle();
+    const tracks = getSearcherTracks(bundle);
+    const track = tracks.find(t => t.id === trackId);
+    if (!track) return Promise.resolve(false);
+    const tag = normalizeSearchTaskTag(taskTag);
+    if (track.assignedTask === tag) return Promise.resolve(false);
+    track.assignedTask = tag;
+    bundle.searcherTracks = tracks;
+    const name = track.baseName || track.caltopoName || track.id;
+    addActivityLogEntry('System', tag
+        ? `Searcher track "${name}" assigned to task ${tag}`
+        : `Searcher track "${name}" set back to automatic task assignment`, bundle);
+    const result = saveSearcherTracksChange(bundle);
+    if (isSearchLogPage()) buildSearchLogTable();
+    return result;
+}
+
+function removeSearcherTrack(trackId) {
+    const bundle = loadBundle();
+    const tracks = getSearcherTracks(bundle);
+    const index = tracks.findIndex(t => t.id === trackId);
+    if (index === -1) return Promise.resolve(false);
+    const [removed] = tracks.splice(index, 1);
+    bundle.searcherTracks = tracks;
+    logDeletion('Searcher Track', removed.baseName || removed.caltopoName || removed.id, bundle);
+    const result = saveSearcherTracksChange(bundle);
+    if (isSearchLogPage()) buildSearchLogTable();
+    return result;
+}
+
+// Put the fetched lines into the case (new ones added, ones already imported
+// re-measured with their pick kept). Resolves false when nothing came in.
+function importSearcherTracks(features) {
+    const bundle = loadBundle();
+    const tracks = getSearcherTracks(bundle);
+    let added = 0;
+    let updated = 0;
+    (Array.isArray(features) ? features : []).filter(isTrackLikeMapFeature).forEach(feature => {
+        const current = findSearcherTrackForFeature(feature, tracks);
+        const record = buildSearcherTrackRecord(feature, bundle, current);
+        if (!record) return;
+        if (current) {
+            tracks[tracks.indexOf(current)] = record;
+            updated++;
+        } else {
+            tracks.push(record);
+            added++;
+        }
+    });
+    if (!added && !updated) return Promise.resolve(false);
+    bundle.searcherTracks = tracks;
+    addActivityLogEntry('System', `Imported ${added} searcher track${added === 1 ? '' : 's'} from the CalTopo map${updated ? ` (${updated} re-measured)` : ''}`, bundle);
+    const result = saveSearcherTracksChange(bundle);
+    if (isSearchLogPage()) buildSearchLogTable();
+    showToast(`${added} track${added === 1 ? '' : 's'} imported${updated ? `, ${updated} re-measured` : ''}.`, 'Searcher Tracks');
+    return result;
+}
+
+// "Import Tracks": fetch the map's shapes (quietly - the copy in the case is
+// used when the fetch fails) and offer the lines that are not assignments.
+async function importSearcherTracksAction(btn = null) {
+    const bundle = loadBundle();
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    if (!map || !map.id) {
+        alert('No CalTopo map is linked to this case. Add the map on the Maps page first.');
+        return null;
+    }
+    let features = await caltopo_request(btn, {quiet: true});
+    if (!Array.isArray(features) || !features.length) {
+        features = getMapFeatures(loadBundle());
+    }
+    if (!features.length) {
+        alert('No shapes could be fetched from the CalTopo map. Check the sync server and the map on the Maps page.');
+        return null;
+    }
+    return showSearcherTracksImportPopup(features);
+}
+
+// The import preview: every line on the map with its type, length and the
+// segments it entered; lines already imported start unchecked.
+function showSearcherTracksImportPopup(features) {
+    const bundle = loadBundle();
+    const existing = getSearcherTracks(bundle);
+    const segmentRows = ensureSegmentsPageRows(bundle);
+    const mapFeatures = getMapFeatures(bundle);
+    const items = sortMapFeaturesByName((Array.isArray(features) ? features : []).filter(isTrackLikeMapFeature)).map(feature => {
+        const current = findSearcherTrackForFeature(feature, existing);
+        return {feature, current, measured: measureTrackMilesBySegment(feature, segmentRows, mapFeatures), selected: !current};
+    });
+
+    const popup = createPopup('Import Searcher Tracks from CalTopo', null);
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+    content.style.width = '90vw';
+    content.style.maxWidth = '960px';
+    content.style.maxHeight = '90vh';
+    content.style.display = 'flex';
+    content.style.flexDirection = 'column';
+
+    const body = document.createElement('div');
+    body.className = 'track-import-body';
+    const intro = document.createElement('p');
+    intro.className = 'track-import-intro';
+    intro.textContent = items.length
+        ? 'Tick the tracks to import. Each track is measured against the segment shapes; the miles inside a segment count toward that segment\'s task when Map Tracking is on. Tracks already imported are re-measured when ticked again.'
+        : 'The map has no lines to import: record or share the searchers\' tracks to the CalTopo map first, then fetch again.';
+    body.appendChild(intro);
+
+    let submitBtn = null;
+    const selectedCount = () => items.filter(item => item.selected).length;
+    const updateSubmit = () => {
+        if (submitBtn) {
+            submitBtn.textContent = `Import Selected (${selectedCount()})`;
+            submitBtn.disabled = selectedCount() === 0;
+        }
+    };
+
+    if (items.length) {
+        const tableWrap = document.createElement('div');
+        tableWrap.className = 'track-import-table-wrap';
+        const table = document.createElement('table');
+        table.className = 'grid-table';
+        const thead = document.createElement('thead');
+        thead.innerHTML = '<tr><th style="width: 40px;"></th><th>Name</th><th>Type</th><th>Length</th><th>Inside segments</th><th>Status</th></tr>';
+        table.appendChild(thead);
+        const tbody = document.createElement('tbody');
+        items.forEach(item => {
+            const tr = document.createElement('tr');
+            const checkTd = document.createElement('td');
+            const checkbox = document.createElement('input');
+            checkbox.type = 'checkbox';
+            checkbox.className = 'track-import-checkbox';
+            checkbox.checked = item.selected;
+            checkbox.onchange = () => {
+                item.selected = checkbox.checked;
+                updateSubmit();
+            };
+            checkTd.appendChild(checkbox);
+            tr.appendChild(checkTd);
+            const cells = [
+                getMapFeatureDisplayName(item.feature),
+                getSearcherTrackTypeLabel(item.feature),
+                formatTrackMiles(item.measured.totalMiles),
+                item.measured.segments.length
+                    ? item.measured.segments.map(s => `${s.segment} ${formatTrackMiles(s.miles)}`).join(', ')
+                    : 'outside every segment',
+                item.current ? 'Imported' : 'New'
+            ];
+            cells.forEach(text => {
+                const td = document.createElement('td');
+                const pill = document.createElement('div');
+                pill.className = 'pill-cell readonly-pill';
+                pill.textContent = text;
+                td.appendChild(pill);
+                tr.appendChild(td);
+            });
+            tbody.appendChild(tr);
+        });
+        table.appendChild(tbody);
+        tableWrap.appendChild(table);
+        body.appendChild(tableWrap);
+    }
+    content.insertBefore(body, btnContainer);
+
+    btnContainer.innerHTML = '';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => closePopup(popup);
+    btnContainer.appendChild(cancelBtn);
+    if (items.length) {
+        submitBtn = document.createElement('button');
+        submitBtn.className = 'popup-btn primary';
+        submitBtn.onclick = () => {
+            const selected = items.filter(item => item.selected).map(item => item.feature);
+            if (!selected.length) return;
+            closePopup(popup);
+            importSearcherTracks(selected);
+        };
+        btnContainer.appendChild(submitBtn);
+        updateSubmit();
+    }
+    return popup;
+}
+
+// "Refresh Tracks": fetch the map again and re-measure every imported track
+// (a live track grows while the searcher walks; a segment imported later gets
+// its share). A track no longer on the map is kept as it was measured; a
+// custom track has nothing on the map to measure.
+async function refreshSearcherTracks(btn = null) {
+    if (!getSearcherTracks(loadBundle()).some(track => !track.custom)) return false;
+    let features = await caltopo_request(btn, {quiet: true});
+    if (!Array.isArray(features) || !features.length) features = getMapFeatures(loadBundle());
+    const bundle = loadBundle();
+    const tracks = getSearcherTracks(bundle);
+    let refreshed = 0;
+    const missing = [];
+    tracks.forEach((track, index) => {
+        if (track.custom) return;
+        const feature = findFeatureForSearcherTrack(track, features);
+        if (!feature) {
+            missing.push(track.baseName || track.caltopoName || track.id);
+            return;
+        }
+        tracks[index] = buildSearcherTrackRecord(feature, bundle, track);
+        refreshed++;
+    });
+    bundle.searcherTracks = tracks;
+    addActivityLogEntry('System', `Re-measured ${refreshed} searcher track${refreshed === 1 ? '' : 's'} from the CalTopo map${missing.length ? ` (${missing.length} no longer on the map: ${missing.join(', ')})` : ''}`, bundle);
+    const result = saveSearcherTracksChange(bundle);
+    if (isSearchLogPage()) buildSearchLogTable();
+    showToast(`${refreshed} track${refreshed === 1 ? '' : 's'} re-measured${missing.length ? `; ${missing.length} not found on the map` : ''}.`, 'Searcher Tracks');
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// Custom tracks: a track the planner types in - a name, the miles walked and
+// the task # it counts toward - for a searcher whose GPS track never reached
+// the map (a paper log, a radio report, a dead battery). It is stored like an
+// imported track (type 'Custom', custom: true) with every mile placed in the
+// task's segment and the task as its pick, so the allocation and the PSR
+// maths treat it as a track wholly inside that segment; having no shape, it
+// is never re-measured, renamed or recolored on CalTopo.
+// ---------------------------------------------------------------------------
+
+// The Search Log tasks a custom track can be assigned to (a task # on a
+// segment), newest first, each with a label for the dropdown.
+function getCustomTrackTaskOptions(bundle) {
+    const rows = (Array.isArray(bundle?.pages?.page4) ? bundle.pages.page4 : [])
+        .filter(row => Array.isArray(row) && normalizeSearchTaskTag(row[0]) && String(row[4] || '').trim());
+    const utils = getMapSegmentUtils();
+    const stamp = typeof utils.searchLogRowTimestamp === 'function' ? utils.searchLogRowTimestamp : () => 0;
+    const taskNumber = row => parseInt(String(row[0]).replace('#', ''), 10) || 0;
+    return rows
+        .slice()
+        .sort((a, b) => (stamp(b) - stamp(a)) || (taskNumber(b) - taskNumber(a)))
+        .map(row => {
+            const tag = normalizeSearchTaskTag(row[0]);
+            const segment = String(row[4] || '').trim();
+            const region = String(row[3] || '').trim();
+            const details = [row[1], row[2], row[7]].map(v => String(v || '').trim()).filter(Boolean).join(' ');
+            return {tag, region, segment, label: `${tag} - ${segment}${region ? ` (${region})` : ''}${details ? ` - ${details}` : ''}`};
+        });
+}
+
+// Store a custom track. `name` may carry the "#task-segment " code already
+// (it is parsed off, never stacked); `miles` is the length walked; `taskTag`
+// the task # it counts toward. Resolves false when a value is unusable.
+function addCustomSearcherTrack({name, miles, taskTag}) {
+    const bundle = loadBundle();
+    const tag = normalizeSearchTaskTag(taskTag);
+    const option = getCustomTrackTaskOptions(bundle).find(o => o.tag === tag);
+    const lengthMiles = parseFloat(miles);
+    if (!option || !Number.isFinite(lengthMiles) || lengthMiles <= 0) return Promise.resolve(false);
+    const segmentNames = ensureSegmentsPageRows(bundle).map(row => (Array.isArray(row) ? row[1] : ''));
+    const baseName = parseSearcherTrackName(name, segmentNames).baseName || `Custom track ${tag}`;
+    const user = getCurrentUser();
+    const now = new Date().toISOString();
+    const utils = getMapSegmentUtils();
+    const record = {
+        id: `custom-${Date.now().toString(36)}-${Math.floor(Math.random() * 1e6).toString(36)}`,
+        featureId: '',
+        baseName,
+        caltopoName: '',
+        type: 'Custom',
+        custom: true,
+        lengthMiles: Math.round(lengthMiles * 10000) / 10000,
+        pointCount: 0,
+        segmentMiles: [{region: option.region, segment: option.segment, miles: Math.round(lengthMiles * 10000) / 10000}],
+        assignedTask: tag,
+        importedAt: now,
+        importedBy: user ? String(user.handle || user.username || '').trim() : '',
+        evaluatedAt: now
+    };
+    const track = typeof utils.normalizeSearcherTrack === 'function' ? utils.normalizeSearcherTrack(record) : record;
+    if (!track) return Promise.resolve(false);
+    const tracks = getSearcherTracks(bundle);
+    tracks.push(track);
+    bundle.searcherTracks = tracks;
+    addActivityLogEntry('System', `Custom track "${baseName}" added: ${formatTrackMiles(track.lengthMiles)} in ${option.segment} for task ${tag}`, bundle);
+    const result = saveSearcherTracksChange(bundle);
+    if (isSearchLogPage()) buildSearchLogTable();
+    showToast(`Custom track "${baseName}" added to ${tag}.`, 'Searcher Tracks');
+    return result;
+}
+
+// "Custom Track": the form behind the button - name, miles and the task #
+// picked from the Search Log's tasks.
+function showCustomTrackPopup() {
+    const bundle = loadBundle();
+    const options = getCustomTrackTaskOptions(bundle);
+    const popup = createPopup('Custom Track', null);
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+
+    const body = document.createElement('div');
+    body.className = 'custom-track-form';
+    const intro = document.createElement('p');
+    intro.className = 'track-import-intro';
+    intro.textContent = options.length
+        ? 'A track that never reached the map: give it a name, the miles the searcher walked and the task # it counts toward. Its miles are placed in that task\'s segment and used like an imported track when Map Tracking is on.'
+        : 'No task has been assigned yet. Assign a task on the Segments or Personnel page first, then add the custom track to it.';
+    body.appendChild(intro);
+
+    const field = (labelText, control) => {
+        const wrap = document.createElement('label');
+        wrap.className = 'custom-track-field';
+        const label = document.createElement('span');
+        label.className = 'custom-track-label';
+        label.textContent = labelText;
+        wrap.appendChild(label);
+        wrap.appendChild(control);
+        return wrap;
+    };
+
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.className = 'pill-input custom-track-name';
+    nameInput.placeholder = 'e.g. Team 3 handheld GPS';
+    nameInput.maxLength = 120;
+
+    const milesInput = document.createElement('input');
+    milesInput.type = 'number';
+    milesInput.className = 'pill-input custom-track-miles';
+    milesInput.placeholder = 'Miles walked, e.g. 1.25';
+    milesInput.min = '0';
+    milesInput.step = '0.01';
+    milesInput.inputMode = 'decimal';
+
+    const taskSelect = document.createElement('select');
+    taskSelect.className = 'pill-input custom-track-task';
+    options.forEach(option => {
+        const el = document.createElement('option');
+        el.value = option.tag;
+        el.textContent = option.label;
+        taskSelect.appendChild(el);
+    });
+    if (!options.length) {
+        const el = document.createElement('option');
+        el.value = '';
+        el.textContent = 'No tasks assigned yet';
+        taskSelect.appendChild(el);
+        taskSelect.disabled = true;
+    }
+
+    body.appendChild(field('Track name', nameInput));
+    body.appendChild(field('Length (miles)', milesInput));
+    body.appendChild(field('Task # (segment)', taskSelect));
+
+    const error = document.createElement('div');
+    error.className = 'custom-track-error';
+    error.style.display = 'none';
+    body.appendChild(error);
+    content.insertBefore(body, btnContainer);
+
+    btnContainer.innerHTML = '';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => closePopup(popup);
+    btnContainer.appendChild(cancelBtn);
+
+    const saveBtn = document.createElement('button');
+    saveBtn.className = 'popup-btn primary';
+    saveBtn.textContent = 'Add Track';
+    saveBtn.disabled = !options.length;
+    saveBtn.onclick = () => {
+        const name = String(nameInput.value || '').trim();
+        const miles = parseFloat(milesInput.value);
+        const tag = normalizeSearchTaskTag(taskSelect.value);
+        const problems = [];
+        if (!name) problems.push('a track name');
+        if (!Number.isFinite(miles) || miles <= 0) problems.push('a length in miles above 0');
+        if (!tag) problems.push('a task #');
+        if (problems.length) {
+            error.textContent = `Please enter ${problems.join(', ')}.`;
+            error.style.display = 'block';
+            return;
+        }
+        closePopup(popup);
+        addCustomSearcherTrack({name, miles, taskTag: tag});
+    };
+    btnContainer.appendChild(saveBtn);
+    if (typeof nameInput.focus === 'function') nameInput.focus();
+    return popup;
+}
+
+// The CalTopo object class to POST a track under: the class CalTopo reported
+// for it (AppTrack, LiveTrack, Shape, ...), then Shape.
+function getSearcherTrackApiObjectTypeCandidates(feature) {
+    const attrs = feature?.attributes || feature?.properties || {};
+    const raw = typeof attrs.class === 'string' ? attrs.class.trim() : '';
+    const candidates = [];
+    if (/^[A-Za-z]+$/.test(raw)) candidates.push(raw);
+    candidates.push('Shape');
+    return candidates.filter((type, index, all) => all.indexOf(type) === index);
+}
+
+// One rename on CalTopo: the fetched feature (geometry and all, so nothing
+// else about the shape changes) with its title set to `newName`. Only a track
+// whose shape is in the case's copy of the map is renamed - a POST without
+// the geometry could strip the line. Resolves true when CalTopo took it.
+async function pushSearcherTrackNameToCalTopo(map, track, feature, newName) {
+    const featureId = track.featureId || (feature ? getCalTopoWritableFeatureId(feature) : '');
+    if (!featureId || !feature || !cloneIfValidGeoJsonGeometry(feature.geometry)) return false;
+    const payload = buildCalTopoFeatureUpdatePayload(feature);
+    payload.id = featureId;
+    payload.properties.title = newName;
+    if (Object.prototype.hasOwnProperty.call(payload.properties, 'name')) payload.properties.name = newName;
+    for (const objectType of getSearcherTrackApiObjectTypeCandidates(feature)) {
+        const endpoint = `/api/v1/map/${encodeURIComponent(map.id)}/${encodeURIComponent(objectType)}/${encodeURIComponent(featureId)}`;
+        const result = await caltopo_api_call('POST', endpoint, payload, map.domain || 'caltopo.com', {silent: true});
+        if (result) return true;
+    }
+    return false;
+}
+
+// Forward the "#task-segment " names to CalTopo: every imported track whose
+// computed name differs from the one CalTopo has gets one POST, silently (a
+// failure is only logged and not retried for SEARCHER_TRACK_RENAME_RETRY_MS).
+// On success the record remembers the name CalTopo now has, so the same
+// rename is never sent twice - and a fetched name already carrying the code
+// is parsed, not prefixed again. Runs one batch at a time; resolves to the
+// number of names pushed.
+let _searcherTrackRenamePromise = null;
+const _searcherTrackRenameFailures = new Map();
+
+function getStaleSearcherTrackNames(allocation) {
+    const now = Date.now();
+    return (allocation && Array.isArray(allocation.tracks) ? allocation.tracks : []).filter(entry => {
+        const track = entry.track;
+        if (track.custom || !track.featureId || !entry.displayName || entry.displayName === track.caltopoName) return false;
+        const failedAt = _searcherTrackRenameFailures.get(track.id);
+        return !(failedAt && now - failedAt < SEARCHER_TRACK_RENAME_RETRY_MS);
+    });
+}
+
+function syncSearcherTrackNamesToCalTopo() {
+    if (_searcherTrackRenamePromise) return _searcherTrackRenamePromise;
+    const bundle = loadBundle();
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    if (!map || !map.id) return Promise.resolve(0);
+    const stale = getStaleSearcherTrackNames(allocateSearcherTracksForBundle(bundle));
+    if (!stale.length) return Promise.resolve(0);
+    const features = getMapFeatures(bundle);
+    _searcherTrackRenamePromise = (async () => {
+        const renamed = new Map();
+        for (const entry of stale) {
+            const feature = findFeatureForSearcherTrack(entry.track, features);
+            let ok = false;
+            try {
+                ok = await pushSearcherTrackNameToCalTopo(map, entry.track, feature, entry.displayName);
+            } catch (error) {
+                console.warn(`[TRACKS] CalTopo rename of "${entry.track.caltopoName}" failed: ${error && error.message ? error.message : error}`);
+            }
+            if (ok) {
+                renamed.set(entry.id, entry.displayName);
+            } else {
+                _searcherTrackRenameFailures.set(entry.id, Date.now());
+                console.warn(`[TRACKS] CalTopo did not take the name "${entry.displayName}" for track "${entry.track.caltopoName}".`);
+            }
+        }
+        if (renamed.size) {
+            // The case may have been saved meanwhile: write the names into the
+            // latest copy only - the track record (what CalTopo now has) and
+            // the case's copy of the shape itself, because every later push of
+            // that shape (the PSRc colors) carries its title and would rename
+            // the track back otherwise.
+            const latest = loadBundle();
+            const tracks = getSearcherTracks(latest);
+            const latestFeatures = getMapFeatures(latest);
+            let changed = false;
+            tracks.forEach(track => {
+                if (!renamed.has(track.id)) return;
+                const newName = renamed.get(track.id);
+                if (track.caltopoName !== newName) {
+                    track.caltopoName = newName;
+                    changed = true;
+                }
+                const feature = findFeatureForSearcherTrack(track, latestFeatures);
+                const attrs = feature ? (feature.attributes || feature.properties) : null;
+                if (attrs && getMapFeatureDisplayName(feature) !== newName) {
+                    attrs.name = newName;
+                    if (Object.prototype.hasOwnProperty.call(attrs, 'title')) attrs.title = newName;
+                    if (Object.prototype.hasOwnProperty.call(attrs, 'label')) attrs.label = newName;
+                    changed = true;
+                }
+            });
+            if (changed) {
+                latest.searcherTracks = tracks;
+                saveBundle(latest);
+            }
+        }
+        return renamed.size;
+    })().catch(error => {
+        console.warn(`[TRACKS] CalTopo rename failed: ${error && error.message ? error.message : error}`);
+        return 0;
+    }).finally(() => {
+        _searcherTrackRenamePromise = null;
+    });
+    return _searcherTrackRenamePromise;
 }
 
 function getLocalISOString(date) {
@@ -12088,6 +13238,10 @@ function calculateHourlyMetrics(startTimeTs, endTimeTs) {
     const searchLog = bundle.pages.page4 || [];
     const segments = bundle.pages.page2 || [];
     const regions = bundle.pages.index.rows || [];
+    // Map Tracking: a task's track miles stand in for the segment length (and
+    // the sweeps) in the spacing / coverage terms, as in recalculateEverything.
+    const mapTracking = isMapTrackingEnabled(bundle);
+    const trackAllocation = mapTracking ? allocateSearcherTracksForBundle(bundle) : null;
     
     const results = [];
     const totalDuration = endTimeTs - startTimeTs;
@@ -12132,10 +13286,15 @@ function calculateHourlyMetrics(startTimeTs, endTimeTs) {
                 const teamInfo = log[7] || '';
                 const match = teamInfo.match(/\((\d+)\)/);
                 const numMembers = match ? parseInt(match[1]) : 0;
+                const trackMiles = mapTracking ? getTaskTrackMiles(trackAllocation, log[0]) : 0;
                 
-                if (area > 0 && length > 0 && numMembers > 0) {
+                if (area > 0 && (mapTracking ? trackMiles > 0 : (length > 0 && numMembers > 0))) {
                     // Searcher Spacing (ft) = (Area (ac) / 640 / Length (mi) / NumSweeps / NumMembers) * 5280
-                    const spacing = (area / 640 / length / numSweeps / numMembers) * 5280;
+                    // Map Tracking: (Area (ac) / 640 / TrackMiles) * 5280 - the track
+                    // miles replace length x sweeps x members together.
+                    const spacing = mapTracking
+                        ? (area / 640 / trackMiles) * 5280
+                        : (area / 640 / length / numSweeps / numMembers) * 5280;
                     
                     // Coverage = Sweep Width (ft) / (Area (ac) / 640 / Length (mi) / NumMembers * 5280)
                     // Note: user's formula for coverage didn't include numSweeps in the denominator.
@@ -12143,7 +13302,10 @@ function calculateHourlyMetrics(startTimeTs, endTimeTs) {
                     // But if we have multiple sweeps, the spacing between searchers is different.
                     // Usually Coverage = SweepWidth / EffectiveSpacing.
                     // I'll stick to user's formula precisely:
-                    const spacingForCoverage = (area / 640 / length / numMembers) * 5280;
+                    // (Map Tracking: the task's track miles take the place of length x members.)
+                    const spacingForCoverage = mapTracking
+                        ? (area / 640 / trackMiles) * 5280
+                        : (area / 640 / length / numMembers) * 5280;
                     const coverage = sweepWidth / spacingForCoverage;
                     
                     const pod = 1 - Math.exp(-coverage);
@@ -16251,8 +17413,11 @@ function renderTaskForm(container, taskNum, formData) {
       addActivityLogEntry(formData.teamName || 'N/A', `Form #${taskNum} marked as completed by ${userName}`);
       if (isCustom) {
         // Completing the form is what finishes a custom search: the segment
-        // leaves the active-search map style and its sweep count becomes due.
-        showToast(`Custom search #${taskNum} finished - log its sweep count on the Segments page.`);
+        // leaves the active-search map style and its sweep count becomes due
+        // - unless Map Tracking is on, when the searcher tracks count instead.
+        showToast(isMapTrackingEnabled()
+          ? `Custom search #${taskNum} finished - its searcher tracks count toward it (Map Tracking is on).`
+          : `Custom search #${taskNum} finished - log its sweep count on the Segments page.`);
       }
       
       renderTaskForm(container, taskNum, formData);
@@ -17006,8 +18171,14 @@ function isTaskUnfinished(taskWithHash) {
   return false;
 }
 
+// The finished tasks whose Num of Sweeps is still blank. Behind every
+// "log sweeps" indication: the Search Log nav badge, the Segments page row
+// highlight and its "log sweeps" button, and the "Log Sweeps" notification /
+// toast. With the Search Log's Map Tracking switch on nothing is due - the
+// searcher tracks stand in for the sweeps, so a blank count is not a gap.
 function getLogSweepsDue() {
   const bundle = loadBundle();
+  if (isMapTrackingEnabled(bundle)) return [];
   const searchLog = bundle.pages.page4 || [];
   const due = [];
   searchLog.forEach(row => {

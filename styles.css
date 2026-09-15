@@ -4146,6 +4146,243 @@ tr.log-sweeps-due::after {
   }
 }
 
+/* Search Log page: Map Tracking (the "Searchers Tracks" section of app.js).
+   The switch sits at the right end of the tools row, opposite the sort
+   switch. While it is on the Num of Sweeps pills fade (they are not used) and
+   a tag riding each pill carries the miles of searcher track inside the
+   task's segment; a Task # whose segment carries two assignments gets a red
+   question mark, as does the undecided track in the Searchers Tracks card
+   below the log, which lists the imported tracks with one pill per segment
+   entered (the home segment's pill in the accent, the others green, a
+   segment without a task yet dashed). */
+.map-tracking-toggle {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  white-space: nowrap;
+}
+
+.map-tracking-toggle.is-on {
+  color: var(--text);
+}
+
+.pill-cell.map-tracking-faded {
+  opacity: 0.35;
+}
+
+/* Room above the pill for the half of the tag that sits outside it, taken
+   back with the negative margin (as .has-lpb-tag does). */
+.pill-cell-container.has-track-tag {
+  overflow: visible;
+  padding-top: 7px;
+  margin-top: -7px;
+}
+
+.track-miles-tag {
+  position: absolute;
+  top: 7px;
+  right: 14px;
+  transform: translateY(-50%);
+  z-index: 3;
+  padding: 1px 8px;
+  border-radius: 999px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 0.66rem;
+  font-weight: 800;
+  letter-spacing: 0.03em;
+  line-height: 1.5;
+  white-space: nowrap;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.35);
+  pointer-events: none;
+}
+
+.track-miles-tag.is-empty {
+  background: rgba(120, 130, 150, 0.9);
+}
+
+.pill-cell-container.has-track-question {
+  overflow: visible;
+}
+
+.track-question-badge {
+  appearance: none;
+  position: absolute;
+  top: -6px;
+  right: -6px;
+  z-index: 4;
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border-radius: 50%;
+  border: 2px solid #fff;
+  background: #e03131;
+  color: #fff;
+  font-size: 0.75rem;
+  font-weight: 900;
+  line-height: 1;
+  cursor: pointer;
+  box-shadow: 0 1px 4px rgba(0, 0, 0, 0.4);
+}
+
+.track-question-badge:hover {
+  background: #c92a2a;
+}
+
+.track-question-badge.inline {
+  position: static;
+  flex: 0 0 auto;
+  margin-right: 2px;
+}
+
+.searcher-tracks-card {
+  margin-top: calc(20px * var(--space-scale, 1));
+}
+
+.searcher-tracks-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: calc(16px * var(--space-scale, 1));
+  margin-bottom: calc(14px * var(--space-scale, 1));
+}
+
+.searcher-tracks-header h2 {
+  margin: 0 0 calc(6px * var(--space-scale, 1));
+  font-size: 1.15rem;
+}
+
+.searcher-tracks-header p {
+  margin: 0;
+  color: var(--muted);
+  font-size: 0.92rem;
+  line-height: 1.45;
+}
+
+.searcher-tracks-header .tool-actions {
+  flex: 0 0 auto;
+}
+
+.searcher-tracks-empty {
+  text-align: center;
+  padding: calc(24px * var(--space-scale, 1));
+  color: var(--muted);
+}
+
+.track-portions {
+  flex-wrap: wrap;
+  gap: 6px;
+}
+
+.track-portion-pill {
+  white-space: nowrap;
+  cursor: default;
+}
+
+.track-portion-pill.home {
+  background: rgba(var(--accent-rgb), 0.22);
+  border-color: rgba(var(--accent-rgb), 0.55);
+}
+
+.track-portion-pill.other {
+  background: rgba(64, 192, 87, 0.14);
+  border-color: rgba(64, 192, 87, 0.4);
+}
+
+.track-portion-pill.unassigned {
+  border-style: dashed;
+  background: transparent;
+  color: var(--muted);
+}
+
+.track-portion-pill.outside {
+  background: transparent;
+  color: var(--muted);
+  opacity: 0.8;
+}
+
+tr.track-row-ambiguous .searcher-track-name {
+  border-color: rgba(224, 49, 49, 0.55);
+}
+
+.searcher-tracks-status.is-on {
+  color: var(--text);
+}
+
+.track-task-picker p,
+.track-import-intro {
+  color: var(--muted);
+  line-height: 1.45;
+  margin: 0 0 calc(14px * var(--space-scale, 1));
+}
+
+.track-task-options {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  margin-bottom: calc(16px * var(--space-scale, 1));
+}
+
+.track-task-option {
+  text-align: left;
+  cursor: pointer;
+}
+
+.track-import-table-wrap {
+  max-height: 55vh;
+  overflow: auto;
+  background: rgba(0, 0, 0, 0.1);
+  border-radius: 12px;
+  margin-bottom: calc(12px * var(--space-scale, 1));
+}
+
+.track-import-checkbox {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+/* The "Custom Track" form: three stacked fields (name, miles, task #). */
+.custom-track-form {
+  display: flex;
+  flex-direction: column;
+  gap: calc(12px * var(--space-scale, 1));
+  margin-bottom: calc(16px * var(--space-scale, 1));
+}
+
+.custom-track-form .track-import-intro {
+  margin-bottom: 0;
+}
+
+.custom-track-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.custom-track-field .pill-input {
+  width: 100%;
+  min-width: 0;
+}
+
+.custom-track-label {
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+}
+
+.custom-track-error {
+  color: #ff6b6b;
+  font-size: 0.9rem;
+}
+
+@media (max-width: 860px) {
+  .searcher-tracks-header {
+    flex-direction: column;
+  }
+}
+
 /* ---------------------------------------------------------------------------
    Geek Mode (html.geek-mode, a login preference - see applyGeekMode in app.js).
 

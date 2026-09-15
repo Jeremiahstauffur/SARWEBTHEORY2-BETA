@@ -65,7 +65,8 @@
     const LIST_TABLES = {
         uploads: 'uploaded_files',
         maps: 'maps_settings',
-        activityLog: 'activity_log'
+        activityLog: 'activity_log',
+        searcherTracks: 'searcher_tracks'
     };
 
     // Top-level bundle keys that make up the single-record structured tables.
@@ -90,7 +91,8 @@
         mapUnaccountedAutoCheck: 'settings_page',
         mapFeatureTypeFilters: 'settings_page',
         caltopoColorSyncHeartbeatMinutes: 'settings_page',
-        caltopoColorSyncCooldownSeconds: 'settings_page'
+        caltopoColorSyncCooldownSeconds: 'settings_page',
+        mapTrackingEnabled: 'settings_page'
     };
 
     const hasOwn = (obj, key) => Object.prototype.hasOwnProperty.call(obj, key);

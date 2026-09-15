@@ -641,7 +641,8 @@ const COLLECTION_TABLES = [
     'uploaded_files', // Uploads page items
     'maps_settings',  // Maps page settings/entries
     'forms',          // Forms page entries
-    'activity_log'    // Activity log entries
+    'activity_log',   // Activity log entries
+    'searcher_tracks' // Search Log page: imported searcher tracks (Map Tracking)
 ];
 
 // Tables that hold a single record per (username, search_case).
@@ -830,7 +831,8 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
             forms: collection(formsArr, (item) => ({ label: item.key, data: item.value })),
             uploaded_files: collection(bundle.uploads, (u) => ({ label: u && (u.name || u.fileName || u.title) || '', data: u })),
             maps_settings: collection(bundle.maps, (m) => ({ label: m && (m.name || m.id || m.title) || '', data: m })),
-            activity_log: collection(bundle.activityLog, (e) => ({ label: e && (e.type || e.action || e.event || e.message) || '', data: e }))
+            activity_log: collection(bundle.activityLog, (e) => ({ label: e && (e.type || e.action || e.event || e.message) || '', data: e })),
+            searcher_tracks: collection(bundle.searcherTracks, (t) => ({ label: t && (t.baseName || t.caltopoName || t.id) || '', data: t }))
         },
         singles: {
             profile: bundle.profile || {},
@@ -854,7 +856,8 @@ const buildStructuredPlan = (bundle, fallbackCase) => {
                 mapUnaccountedAutoCheck: bundle.mapUnaccountedAutoCheck,
                 mapFeatureTypeFilters: bundle.mapFeatureTypeFilters,
                 caltopoColorSyncHeartbeatMinutes: bundle.caltopoColorSyncHeartbeatMinutes,
-                caltopoColorSyncCooldownSeconds: bundle.caltopoColorSyncCooldownSeconds
+                caltopoColorSyncCooldownSeconds: bundle.caltopoColorSyncCooldownSeconds,
+                mapTrackingEnabled: bundle.mapTrackingEnabled
             }
         }
     };
