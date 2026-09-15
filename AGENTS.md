@@ -271,7 +271,7 @@ to use, read from `process.env` per request), `/api/health` (also carries it), `
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260920`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260921`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
 - **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
@@ -533,6 +533,21 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   — put explanations in the block comment above the function, not inline. (6) Two devices opening a case
   at once both append the same blank row; the overlay drops a second *blank* copy (`isBlankLoginUserRow`)
   and never a worked-on one. (plan: `login-wide-users.md`)
+- **2026-09-14 — Maps page "Proxy Status" stuck on "Checking...".** Symptom: the dot under the Maps tabs
+  never left its placeholder although shapes fetched fine. Cause: the checker (`checkProxyHealth`) belonged
+  to the Settings page's removed "CalTopo Proxy Settings" section and went with it, while `buildMapsPage`
+  kept the markup — and `test_sync_server_config.js` pins `'proxy-status-dot'` / `checkProxyHealth` as
+  *gone* from `app.js`, so nothing could ever wire those ids again. Rules: the Maps dot has ids of its own
+  (`maps-proxy-status[-dot|-text]`) and its own probe `refreshMapsProxyStatus()` → `probeMapsProxyStatus()`
+  (`GET <getCalTopoProxy() server>/api/health`, `MAPS_PROXY_STATUS_TIMEOUT_MS`): green `Connected`,
+  amber `Server up, CalTopo credentials missing` (`caltopoSigningConfigured: false`), red `Error (HTTP n)`
+  for an answered error, grey **`Unproven Connection`** whenever the address could not be tested at all
+  (no answer / timeout / https→http mixed content — the proxy may still work, so never call it down).
+  The answer is remembered for `MAPS_PROXY_STATUS_RECHECK_INTERVAL_MS` (30 s) and painted at once on the
+  page's frequent rebuilds; a running probe is shared; clicking the dot forces a re-check. Before removing
+  a helper, grep for the ids it paints — a static "no longer wires X" guard must name the *page* it
+  guards, or it outlaws the other page's legitimate use. Test: `test_maps_proxy_status.js` (drives `Date`
+  through a `FakeDate` in the sandbox to reach the stale branch).
 
 ---
 
@@ -620,6 +635,12 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   the username) and is not shown on the other printouts; a change is logged to the open case's activity
   log (like the other Settings) but the value itself never enters the bundle. `test_incident_times_days.js`
   still pins `<h1>Activity Log</h1>` in the case printout.
+- Maps proxy-status follow-ups: the dot probes `/api/health` once per page build (cached 30 s, per tab, in
+  memory) — it is not re-checked on a timer, so a server that goes down while the page sits open keeps
+  its last colour until a rebuild or a click. An answered `/api/health` without JSON still counts as
+  `Connected` (an older server build). `Unproven Connection` does not distinguish "blocked by this
+  device" from "server asleep" — the login popup's **Set Server → Test** does that diagnosis. The
+  `.php` proxy path (`?health=1`) is still reachable through `getCalTopoProxyHealthUrl` but unexercised.
 
 ---
 

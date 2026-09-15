@@ -115,6 +115,12 @@ const CALTOPO_COLOR_SYNC_LAST_PUSH_STORAGE_KEY = 'sar-caltopo-color-sync-last-v1
 // yet, with its own Import / Decline buttons.
 const NEW_ASSIGNMENT_NOTIFICATION_TITLE = 'New Assignment';
 const NEW_ASSIGNMENT_NOTIFICATION_CLASS = 'map-assignment-new';
+// Maps page "Proxy Status" dot. The page is rebuilt on every change another
+// device makes, so the last answer is kept this long and painted straight away;
+// the server is only asked again once it is older than that (or when the dot
+// is clicked). One probe waits at most this long for an answer.
+const MAPS_PROXY_STATUS_RECHECK_INTERVAL_MS = 30000;
+const MAPS_PROXY_STATUS_TIMEOUT_MS = 8000;
 // At most this many "New Assignment" toasts pop up per refresh; the rest are
 // still listed in the notification sidebar.
 const NEW_ASSIGNMENT_TOAST_LIMIT = 5;
@@ -20043,6 +20049,99 @@ function syncViewportWidthVariable() {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Maps page "Proxy Status" indicator.
+// ---------------------------------------------------------------------------
+// The CalTopo proxy is the sync server (getCalTopoProxy()), so its health is
+// GET <server>/api/health: an answer means the server is up, and its
+// `caltopoSigningConfigured` flag says whether it can sign Team API requests
+// (without that, every "Fetch Shapes" fails with "Proxy Not Configured").
+// When the address cannot be tested at all - no answer came back, or the
+// browser would not send the request - the dot says "Unproven Connection"
+// rather than pronouncing the proxy down: the shapes may well still fetch.
+// The last answer is remembered (see MAPS_PROXY_STATUS_RECHECK_INTERVAL_MS)
+// so the frequent page rebuilds neither hammer the server nor flicker the dot
+// back to "Checking..."; a probe already running is shared rather than doubled.
+const MAPS_PROXY_STATUS_COLORS = {
+    ok: '#40c057',
+    warn: '#f59f00',
+    error: '#fa5252',
+    unproven: '#868e96',
+    checking: '#ccc',
+    none: '#ccc'
+};
+const MAPS_PROXY_STATUS_UNPROVEN_TEXT = 'Unproven Connection';
+let _mapsProxyStatus = null;
+let _mapsProxyStatusInFlight = null;
+
+function paintMapsProxyStatus(status) {
+    if (typeof document === 'undefined' || !status) return;
+    const dot = document.getElementById('maps-proxy-status-dot');
+    const text = document.getElementById('maps-proxy-status-text');
+    if (dot && dot.style) dot.style.background = MAPS_PROXY_STATUS_COLORS[status.state] || MAPS_PROXY_STATUS_COLORS.checking;
+    if (text) {
+        text.textContent = status.text || '';
+        text.title = status.detail || '';
+    }
+}
+
+// One GET /api/health of the proxy's server, reduced to {state, text, detail}.
+async function probeMapsProxyStatus(proxyUrl) {
+    const healthUrl = getCalTopoProxyHealthUrl(proxyUrl);
+    if (!healthUrl) {
+        return {state: 'none', text: 'No proxy', detail: 'No sync server is set: log out and use "Set Server" on the login popup.'};
+    }
+    if (isBlockedMixedContentUrl(healthUrl)) {
+        return {state: 'unproven', text: MAPS_PROXY_STATUS_UNPROVEN_TEXT, detail: `${proxyUrl} could not be tested: this page is served over HTTPS and cannot call an http:// server.`};
+    }
+    try {
+        const resp = await fetchWithTimeout(appendUrlQueryParam(healthUrl, '_', String(Date.now())), {method: 'GET', cache: 'no-store'}, MAPS_PROXY_STATUS_TIMEOUT_MS);
+        let body = {};
+        try {
+            body = await resp.json();
+        } catch (e) {
+            body = {};
+        }
+        if (!body || typeof body !== 'object') body = {};
+        if (!resp.ok) {
+            return {state: 'error', text: `Error (HTTP ${resp.status})`, detail: body.message || body.error || `${healthUrl} answered HTTP ${resp.status}`};
+        }
+        if (body.caltopoSigningConfigured === false) {
+            return {state: 'warn', text: 'Server up, CalTopo credentials missing', detail: body.message || 'The sync server answers but has no CalTopo credentials, so it cannot sign Team API requests.'};
+        }
+        return {state: 'ok', text: 'Connected', detail: `${proxyUrl} - ${body.message || `answered HTTP ${resp.status}`}`};
+    } catch (e) {
+        return {state: 'unproven', text: MAPS_PROXY_STATUS_UNPROVEN_TEXT, detail: `${proxyUrl} could not be tested: ${describeConnectionError(e)}`};
+    }
+}
+
+// Paints the remembered answer (or "Checking...") into the Maps page's dot and
+// asks the server again when it is stale, `force`d, or for another address.
+function refreshMapsProxyStatus({force = false} = {}) {
+    const proxyUrl = getCalTopoProxy();
+    const cached = _mapsProxyStatus && _mapsProxyStatus.proxyUrl === proxyUrl ? _mapsProxyStatus : null;
+    if (cached && !force && (Date.now() - cached.checkedAt) < MAPS_PROXY_STATUS_RECHECK_INTERVAL_MS) {
+        paintMapsProxyStatus(cached);
+        return Promise.resolve(cached);
+    }
+    if (_mapsProxyStatusInFlight && _mapsProxyStatusInFlight.proxyUrl === proxyUrl && !force) {
+        paintMapsProxyStatus(cached || {state: 'checking', text: 'Checking...', detail: proxyUrl});
+        return _mapsProxyStatusInFlight.promise;
+    }
+    paintMapsProxyStatus({state: 'checking', text: 'Checking...', detail: proxyUrl});
+    const inFlight = {proxyUrl, promise: null};
+    inFlight.promise = probeMapsProxyStatus(proxyUrl).then((result) => {
+        const status = {...result, proxyUrl, checkedAt: Date.now()};
+        _mapsProxyStatus = status;
+        if (_mapsProxyStatusInFlight === inFlight) _mapsProxyStatusInFlight = null;
+        // Only paint while this address is still the one the page shows.
+        if (getCalTopoProxy() === proxyUrl) paintMapsProxyStatus(status);
+        return status;
+    });
+    _mapsProxyStatusInFlight = inFlight;
+    return inFlight.promise;
+}
+
 function buildMapsPage() {
   const container = document.querySelector('main');
   if (!container) return;
@@ -20067,10 +20166,10 @@ function buildMapsPage() {
 
       <div style="background: rgba(64, 192, 87, 0.1); border-left: 4px solid #40c057; padding: 20px; margin-top: 15px; border-radius: 16px; display: flex; align-items: center;">
         <div id="proxy-status-container" style="font-size: 1rem; display: flex; align-items: center; gap: 30px; flex-wrap: wrap; width: 100%;">
-          <div style="display: flex; align-items: center; gap: 10px; padding-left: 20px;">
+          <div id="maps-proxy-status" style="display: flex; align-items: center; gap: 10px; padding-left: 20px; cursor: pointer;" title="Click to check the CalTopo proxy again">
             <span style="color: var(--muted);">Proxy Status:</span>
-            <span id="proxy-status-dot" style="width: 12px; height: 12px; border-radius: 50%; background: #ccc;"></span>
-            <span id="proxy-status-text" style="font-weight: 500;">Checking...</span>
+            <span id="maps-proxy-status-dot" style="width: 12px; height: 12px; border-radius: 50%; background: #ccc;"></span>
+            <span id="maps-proxy-status-text" style="font-weight: 500;">Checking...</span>
           </div>
         </div>
       </div>
@@ -20228,6 +20327,12 @@ function buildMapsPage() {
   // with the map is sized from the measured screen width.
   buildLostPersonBehaviorSection(document.getElementById('map-lpb-scroll'));
   syncViewportWidthVariable();
+
+  // The proxy dot: the remembered answer at once, a fresh probe when stale;
+  // clicking it asks the server again right away.
+  const proxyStatusEl = document.getElementById('maps-proxy-status');
+  if (proxyStatusEl) proxyStatusEl.onclick = () => refreshMapsProxyStatus({force: true});
+  refreshMapsProxyStatus();
 
   tabMap.onclick = () => {
     const newUrl = window.location.pathname + '?tab=map';
