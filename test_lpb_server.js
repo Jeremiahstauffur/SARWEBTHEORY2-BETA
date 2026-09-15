@@ -355,15 +355,23 @@ const run = async () => {
         assert.deepStrictEqual(shifts.map((entry) => entry.params), [[9999, 10000], [9999, 10000]]);
         assert.strictEqual(statements(/^ALTER TABLE `(\w+)` AUTO_INCREMENT = 10000$/).length, 2);
 
-        // Defaults: the planner's row kept its values and became 10000; the
-        // three seeded terrains follow in LPB_TERRAINS order.
+        // Defaults: the planner's row kept its values and became 10000; every
+        // other category x terrain was seeded after it, in LPB_CATEGORIES x
+        // LPB_TERRAINS order, with the ids following on without a gap.
         const defaults = tableRows(LPB_DEFAULTS_TABLE);
         assert.strictEqual(defaults.length, LPB_CATEGORIES.length * LPB_TERRAINS.length);
-        defaults.forEach((row) => assert.ok(isFiveDigitId(row.id), `${row.terrain} has a five-digit id (got ${row.id})`));
+        defaults.forEach((row) => assert.ok(isFiveDigitId(row.id), `${row.category} / ${row.terrain} has a five-digit id (got ${row.id})`));
         assert.strictEqual(new Set(defaults.map(r => r.id)).size, defaults.length, 'every row has its own id');
-        const byTerrain = Object.fromEntries(defaults.map(r => [r.terrain, r.id]));
-        assert.deepStrictEqual(byTerrain, {'Mtn Temperate': 10000, 'Flat Temperate': 10001, 'Dry': 10002, 'Urban': 10003});
-        assert.strictEqual(defaults.find(r => r.id === 10000).p25, '0.7');
+        const planner = defaults.find(r => r.category === 'Mental Illness' && r.terrain === 'Mtn Temperate');
+        assert.strictEqual(planner.id, 10000);
+        assert.strictEqual(planner.p25, '0.7');
+        const seededOrder = [];
+        LPB_CATEGORIES.forEach((c) => LPB_TERRAINS.forEach((t) => { if (!(c.label === 'Mental Illness' && t === 'Mtn Temperate')) seededOrder.push(`${c.label}|${t}`); }));
+        const byId = defaults.filter(r => r.id !== 10000).sort((a, b) => a.id - b.id);
+        assert.deepStrictEqual(byId.map(r => `${r.category}|${r.terrain}`), seededOrder, 'seeded in list order');
+        assert.deepStrictEqual(byId.map(r => r.id), seededOrder.map((_, i) => 10001 + i), 'ids follow the migrated row without a gap');
+        const mentalIllness = defaults.filter(r => r.category === 'Mental Illness').sort((a, b) => a.id - b.id).map(r => r.terrain);
+        assert.deepStrictEqual(mentalIllness, LPB_TERRAINS, 'the other Mental Illness terrains follow in LPB_TERRAINS order');
 
         // Overrides: both logins' rows kept their values and got 10000 / 10001
         // (numbered in key order: "Somebody Else" sorts before "Team Alpha").
@@ -420,8 +428,11 @@ const run = async () => {
         assert.deepStrictEqual(resp.body.categories, LPB_CATEGORIES);
         assert.deepStrictEqual(resp.body.terrains, LPB_TERRAINS);
         assert.deepStrictEqual(resp.body.brackets, LPB_BRACKETS);
-        assert.deepStrictEqual(Object.keys(resp.body.defaults), ['Mental Illness']);
+        assert.deepStrictEqual(Object.keys(resp.body.defaults), LPB_CATEGORIES.map(c => c.label), 'every category, in list order');
+        assert.ok(LPB_CATEGORIES.length >= 41, `all the lost person categories are known (${LPB_CATEGORIES.length})`);
         assert.deepStrictEqual(Object.keys(resp.body.defaults['Mental Illness']).sort(), [...LPB_TERRAINS].sort());
+        // A category the planner never touched is all seed placeholders.
+        assert.deepStrictEqual(resp.body.defaults['Dementia'], Object.fromEntries(LPB_TERRAINS.map(t => [t, LPB_SEED_DISTANCES])));
         // DECIMAL strings became numbers.
         assert.deepStrictEqual(resp.body.defaults['Mental Illness']['Mtn Temperate'], {p25: 0.7, p50: 1.4, p75: 2.6, p95: 5.1});
         // Combinations the table does not have are filled from the seed.
@@ -511,7 +522,7 @@ const run = async () => {
         const terrain = await call('PUT', '/api/lpb/distances', {category: 'mentalIllness', terrain: 'Swamp', values: {p25: 1}});
         assert.strictEqual(terrain.status, 400);
         assert.ok(typeof terrain.body.error === 'string' && terrain.body.error.length);
-        const category = await call('PUT', '/api/lpb/distances', {category: 'despondent', terrain: 'Dry', values: {p25: 1}});
+        const category = await call('PUT', '/api/lpb/distances', {category: 'unicorn', terrain: 'Dry', values: {p25: 1}});
         assert.strictEqual(category.status, 400);
         const negative = await call('PUT', '/api/lpb/distances', {category: 'mentalIllness', terrain: 'Dry', values: {p25: 1, p50: -2}});
         assert.strictEqual(negative.status, 400);
@@ -519,6 +530,26 @@ const run = async () => {
         const garbage = await call('PUT', '/api/lpb/distances', {category: 'mentalIllness', terrain: 'Dry', values: {p95: 'far'}});
         assert.strictEqual(garbage.status, 400);
         assert.strictEqual(statements(/lpb_user_distances/).filter((e) => !/^SELECT/.test(e.sql)).length, 0, 'nothing was written');
+    });
+
+    await check('every listed category is accepted, by key or by label, and stored under its label', async () => {
+        const dementia = await call('PUT', '/api/lpb/distances', {category: 'dementia', terrain: 'Dry', values: {p25: 2.2}});
+        assert.strictEqual(dementia.status, 200);
+        assert.strictEqual(dementia.body.category, 'Dementia');
+        assert.deepStrictEqual(dementia.body.override, {p25: 2.2});
+        assert.deepStrictEqual(dementia.body.effective, {p25: 2.2, p50: LPB_SEED_DISTANCES.p50, p75: LPB_SEED_DISTANCES.p75, p95: LPB_SEED_DISTANCES.p95});
+        const child = await call('PUT', '/api/lpb/distances', {category: 'Age 1-3', terrain: 'Urban', values: {p95: '0.9'}});
+        assert.strictEqual(child.status, 200);
+        assert.strictEqual(child.body.category, 'Age 1-3');
+        const read = await call('GET', '/api/lpb/distances');
+        assert.deepStrictEqual(read.body.overrides['Dementia'], {Dry: {p25: 2.2}});
+        assert.deepStrictEqual(read.body.overrides['Age 1-3'], {Urban: {p95: 0.9}});
+        assert.deepStrictEqual(overridesFor(read.body, 'Flat Temperate'), {p25: 0.4, p50: 1.3}, 'Mental Illness is untouched');
+        // Clean up so the checks below see the same override table as before.
+        await call('PUT', '/api/lpb/distances', {category: 'dementia', terrain: 'Dry', values: {}});
+        await call('PUT', '/api/lpb/distances', {category: 'Age 1-3', terrain: 'Urban', values: {}});
+        const after = await call('GET', '/api/lpb/distances');
+        assert.deepStrictEqual(Object.keys(after.body.overrides), ['Mental Illness']);
     });
 
     console.log('\nlpb_ipp follows bundle.lostPersonBehavior.ipp');

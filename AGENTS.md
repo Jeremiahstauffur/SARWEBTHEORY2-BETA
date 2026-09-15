@@ -120,7 +120,8 @@ bundle = {
   profile: {...}, permanentPersonnel: {...}, parChecks: {...},
   lostPersonBehavior: {           // Incident page "Lost Person Behavior" (canonical, see below)
     psrAdjustmentEnabled, ipp: {featureId, featureName, lat, lng, ...} | null,
-    categories: { mentalIllness: {enabled, terrain, distances: {p25, p50, p75, p95} | null} }
+    categories: { <key of every LPB_CATEGORIES entry, e.g. mentalIllness, dementia, hiker>:
+                  {enabled, terrain, distances: {p25, p50, p75, p95} | null} }   // any number may be on
   },
   theme, showTips, geekMode, background, deleteMode, parCheckFrequency, ...settings keys,
   lastModified                    // recomputed every save; never diffed
@@ -145,14 +146,22 @@ bundle = {
   start, so never write those tables with `REPLACE` (delete+insert changes the id) or `INSERT IGNORE`
   (an ignored insert still burns a number).
 - `INTERNAL_STORE_KEYS` (`bundle`, `all-files`, `user-<pin>` presence pings) are **never** a CASE #.
-- **Lost Person Behavior** (`lostPersonBehavior`): the pure maths (`resolveLpbBracket`,
-  `getLpbSegmentAdjustment`, `buildLpbContext`, centroid/haversine) lives in `map-segment-utils.js`;
-  `recalculateEverything()` multiplies a segment's *initial share* by `100 / bracket%` (25 % → ×4), so
-  PSRi, PSRc and Search Log PSR move together. Beyond the 95 % distance, or with no CalTopo shape for the
-  row (`findFeatureForSegmentRow`: column 9 id, else name), the factor is 1. The **case** holds its own
-  copy of the four distances (seeded from the login's `lpb_user_distances` ∪ defaults when a category
-  is switched on / terrain changes) so every device computes the same PSR. Plan:
-  `.junie/plans/lost-person-behavior-psr-adjustment.md`.
+- **Lost Person Behavior** (`lostPersonBehavior`): 41 categories in 7 groups (`LPB_CATEGORY_GROUPS` →
+  flattened `LPB_CATEGORIES = [{key, label, group}]`, `map-segment-utils.js`; `label` is the `category`
+  column of the distance tables). The pure maths (`computeLpbBracketRates`, `resolveLpbBracket`,
+  `getLpbSegmentAdjustment`, `buildLpbContext`, centroid/haversine) lives there too. Each bracket has a
+  **percentage per mile**: `(pct − prevPct) / (mi − prevMi)` with the 25 % bracket measured from 0 %/0 mi
+  (25 % at 1.9 mi → 13.16 %/mi; 50 % at 11.8 mi → 25 % / 9.9 mi = 2.53 %/mi). A segment in a bracket
+  *gains that rate as a share of its PSRi*; with several categories on each works out its own gain from
+  the plain PSRi and `factor = 1 + Σ rates / 100` is applied once to the *initial share* in
+  `recalculateEverything()`, so PSRi, PSRc and Search Log PSR move together. Beyond a category's 95 %
+  distance it adds nothing; with no CalTopo shape for the row (`findFeatureForSegmentRow`: column 9 id,
+  else name) the factor is 1. A bracket whose distance is not beyond the previous one has no rate
+  (`null`, adds nothing) — never a division by zero. The **case** holds its own copy of the four
+  distances per category (seeded from the login's `lpb_user_distances` ∪ defaults when a category is
+  switched on / terrain changes) so every device computes the same PSR. Plans:
+  `.junie/plans/lost-person-behavior-psr-adjustment.md` (section, tables),
+  `.junie/plans/lpb-categories-per-mile-psr.md` (category list, per-mile maths, multi-category sum).
 - **Geek Mode** is *not* a bundle key. It lives in the login's `user_settings` preference record
   (`sar-user-preferences-v1`) **per user account**: `geekModeByUser[<getAccountName>] = {enabled,
   paddingPercent}`, with the login-level `geekMode` / `geekPaddingPercent` as the fallback for an
@@ -236,7 +245,7 @@ to use, read from `process.env` per request), `/api/health` (also carries it), `
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260916`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260917`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
 - **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
@@ -406,6 +415,27 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   user with no account, and `checkAccess` now also matches by name for a row that had no PIN yet).
   Testing a popup needs a fake DOM whose `querySelector` understands `.a.b` — see `makeElement` in
   `test_sync_server_config.js`. (plan: `caltopo-sync-variable-and-login-profile-pick.md`)
+- **2026-09-14 — Toasts covered the header / went see-through on hover.** Cause: `showToastNotification`
+  and `repositionToasts` started the stack at a hard-coded `top: 20px`, and `.notif-toast:hover` swapped
+  the background for `--pill-focus` alone (a 16 % accent tint). Rules: the stack anchors at the measured
+  bottom of `.site-shell > header` (`getToastStackTop`, `TOAST_STACK_GAP_PX`; re-run on `resize`; a
+  hidden header measures 0, so mobile falls back to the viewport top) — z-index cannot do this because
+  `.site-shell`'s `backdrop-filter` is its own stacking context, so a body-level toast always paints over
+  the header. A hover tint on a translucent panel is layered `linear-gradient(tint, tint), <base>`, never
+  swapped in. Test: `test_toast_stack_position.js` (extracts the two functions from `app.js` by name and
+  runs them in a `vm` context with a stub `document` — cheap pattern for small DOM helpers).
+- **2026-09-14 — 41 LPB categories, per-mile PSR maths, several categories at once.** Traps met while
+  widening `LPB_CATEGORIES`: (1) tests that reached the only category with `getLpbCategories()[0]`,
+  `walk(section).find('.lpb-chart')` or `Object.keys(defaults)` silently pointed at *Abduction* once it
+  came first — address a category by `key` (`dataset.category`), never by position; (2) with one
+  category the server seed test pinned ids `10000..10003` by terrain — with N×4 seeded rows derive the
+  expected order from `LPB_CATEGORIES × LPB_TERRAINS` and skip the pre-existing planner row; (3) a label
+  that later became a real category (`despondent`) was used as the "unknown category" in a 400 test —
+  use a nonsense word. Maths rule: the additions are **summed, never compounded**
+  (`factor = 1 + Σ rates/100`), each computed from the plain PSRi, so category order is irrelevant; a
+  non-increasing distance pair yields `ratePercentPerMile: null` rather than `Infinity`. The Segments
+  page tag now reads `+13.2%` (total gain) with the per-category breakdown in the tooltip.
+  (plan: `lpb-categories-per-mile-psr.md`)
 
 ---
 
@@ -428,10 +458,16 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   `test_custom_search_task.js` ("segment sweep width is carried over like a normal search": `''` vs
   `'40 ft'`) and `test_ic_report.js` ("the subtitle shows the case # without .json": `No case selected`).
   Neither is in `package.json` `scripts.test`, which is why `npm test` still passes.
-- Lost Person Behavior follow-ups: `lpb_default_distances` holds the 0.5/1.0/1.5/2.0 placeholders until
-  the planner enters Koester's numbers; only **Mental Illness** exists — a new category is one entry in
-  `LPB_CATEGORIES` (`map-segment-utils.js`) plus a seeded row per terrain; with several categories on,
-  `buildLpbContext` uses the first enabled one (no combining rule was specified).
+- Lost Person Behavior follow-ups: `lpb_default_distances` holds the 0.5/1.0/1.5/2.0 placeholders for
+  all 41 categories × 4 terrains (164 rows, seeded on the next server start) until the planner enters
+  Koester's numbers; a new category is one entry in the right `LPB_CATEGORY_GROUPS` group
+  (`map-segment-utils.js`) — the seed, the API, the sanitizer and the Incident page all loop over it.
+  Labels follow the request with three spellings corrected (`Substance Intoxication`, `Mountaineer`,
+  `Snowshoer`); the Child rows are labelled `Age 1-3` … `Age 13-15` in the DB too (group title only in
+  the UI). The Incident section is now long (41 accordion rows); no search/filter or "collapse all" was
+  added. The per-mile maths applies the request literally — a rate of 13.16 %/mi adds 13.16 % of the
+  PSRi regardless of how far inside the bracket the segment lies (no distance weighting was asked for).
+  A category that is on but missing a distance is skipped and named in the Segments status line.
 - Segment centres come from the fetched CalTopo shape (`maps[0].features`); a segment typed by hand
   without a linked/like-named shape is never adjusted — the PSRi tooltip says so.
 - Geek Mode follow-ups: only the Segments, Personnel, Search Log, Incident (LPB heading/paragraph) and

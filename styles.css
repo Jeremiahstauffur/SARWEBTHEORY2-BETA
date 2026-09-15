@@ -1350,6 +1350,12 @@ footer {
   to { opacity: 0; }
 }
 
+/* Toasts stack down the right edge starting *under* the sticky header: app.js
+   (getToastStackTop / repositionToasts) overrides `top` with the header's
+   measured bottom edge, so this 20px is only the fallback while the header is
+   hidden (mobile). Stacking order cannot do that job: .site-shell's
+   backdrop-filter makes it its own stacking context, so the toast is always
+   painted above the whole shell, header included. */
 .notif-toast {
   position: fixed;
   top: 20px;
@@ -1375,8 +1381,11 @@ footer {
   animation: notifFadeOut 0.4s ease-in forwards !important;
 }
 
+/* Hovering tints the toast with the accent, layered over the same background
+   it rests on; the old plain `--pill-focus` swap (a 16% accent tint on its own)
+   let the page show through the toast. */
 .notif-toast:hover {
-  background: var(--pill-focus);
+  background: linear-gradient(var(--pill-focus), var(--pill-focus)), var(--glass-strong);
 }
 
 .toast-close-btn:hover {
@@ -3563,11 +3572,24 @@ tr.log-sweeps-due::after {
 }
 
 /* Incident page: "Lost Person Behavior" section. The heading carries the
-   shared IPP control (Import IPP button / imported marker pill); below it one
+   shared IPP control (Import IPP button / imported marker pill); below it the
+   categories under their group titles (External Forces, Water, ...), one
    accordion row per category (switch, name and - once the switch is on - the
    terrain dropdown on the same line) with the four-column distance graph. */
 .lpb-section {
   margin-top: calc(28px * var(--space-scale, 1));
+}
+
+/* A group title sits between the rows of one group and the next. */
+.lpb-group-title {
+  margin-top: calc(26px * var(--space-scale, 1));
+  padding-bottom: calc(6px * var(--space-scale, 1));
+  border-bottom: 1px solid var(--line);
+  color: var(--muted);
+  font-size: 0.78rem;
+  font-weight: 800;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
 }
 
 .lpb-section-title-row {
@@ -3820,6 +3842,16 @@ tr.log-sweeps-due::after {
 
 .lpb-reset-btn.reset-pill-btn {
   flex-shrink: 0;
+}
+
+/* The bracket's percentage per mile under its value: what a segment in the
+   bracket gains, as a share of its PSRi. */
+.lpb-chart-rate {
+  min-height: 1.1em;
+  color: var(--muted);
+  font-size: 0.74rem;
+  font-weight: 600;
+  white-space: nowrap;
 }
 
 /* "Import IPP" marker picker */

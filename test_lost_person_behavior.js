@@ -2,14 +2,16 @@
 //
 // Part 1 checks the pure maths shared through map-segment-utils.js: the centre
 // of a CalTopo shape, the distance to the IPP, which 25/50/75/95 % bracket a
-// distance falls into and the PSR factor that follows from it.
+// distance falls into, the bracket's percentage per mile and the PSR factor
+// that follows from it (1 + the summed rates of the switched-on categories).
 //
 // Part 2 drives the real app.js in a sandbox (in-memory store, fake DOM, a
 // scripted fetch that records every request) to check that
 //   - the section survives sanitizeBundle / saveBundle,
-//   - PSRi is divided by the bracket percentage (x4 in the 25 % bracket, x2 in
-//     the 50 % bracket), PSRc and the search log follow, segments beyond the
-//     95 % distance or without a shape are left alone,
+//   - a segment gains its bracket's percentage per mile of its PSRi (with the
+//     0.5/1.0/1.5/2.0 mi placeholders: 50 %/mi in the 25 % and 50 % brackets),
+//     several categories add up, PSRc and the search log follow, segments
+//     beyond every 95 % distance or without a shape are left alone,
 //   - the Segments page switch lifts and re-applies the adjustment without
 //     losing the Incident page settings,
 //   - importing the IPP marker stores its position in the case and sends the
@@ -102,21 +104,63 @@ check('haversineMiles: one degree of latitude is about 69.1 miles', () => {
     assert.strictEqual(utils.haversineMiles({lat: 'x', lng: 1}, IPP), null);
 });
 
-check('resolveLpbBracket picks the smallest distance that still contains the segment', () => {
+check('computeLpbBracketRates: each bracket\'s extra percentage over its extra miles', () => {
+    // The worked example from the request: 25 % at 1.9 mi is 13.16 %/mi; the
+    // 50 % bracket at 11.8 mi adds 25 % over 9.9 mi = 2.53 %/mi.
+    const rates = utils.computeLpbBracketRates({p25: 1.9, p50: 11.8, p75: 20, p95: 30});
+    assert.deepStrictEqual(rates.map(r => [r.key, r.percent, r.distance, r.previousPercent, r.previousDistance]), [
+        ['p25', 25, 1.9, 0, 0],
+        ['p50', 50, 11.8, 25, 1.9],
+        ['p75', 75, 20, 50, 11.8],
+        ['p95', 95, 30, 75, 20]
+    ]);
+    near(rates[0].ratePercentPerMile, 25 / 1.9, 1e-12, '25 % / 1.9 mi');
+    near(rates[0].ratePercentPerMile, 13.1579, 0.0001, 'about 13.16 %/mi');
+    near(rates[1].ratePercentPerMile, 25 / 9.9, 1e-12, '(50 - 25) % / (11.8 - 1.9) mi');
+    near(rates[1].ratePercentPerMile, 2.5253, 0.0001, 'about 2.53 %/mi');
+    near(rates[2].ratePercentPerMile, 25 / 8.2, 1e-12);
+    near(rates[3].ratePercentPerMile, 20 / 10, 1e-12, '(95 - 75) % / (30 - 20) mi');
+    // The placeholders: 50 %/mi for the first three brackets, 40 %/mi for the last.
+    assert.deepStrictEqual(utils.computeLpbBracketRates(DISTANCES).map(r => r.ratePercentPerMile), [50, 50, 50, 40]);
+    // A missing bracket has no rate; the next one measures from the last bracket that had a distance.
+    const gap = utils.computeLpbBracketRates({p25: 0.5, p75: 1.5, p95: 2});
+    assert.strictEqual(gap[1].ratePercentPerMile, null);
+    assert.strictEqual(gap[1].distance, null);
+    assert.strictEqual(gap[2].ratePercentPerMile, 50, '(75 - 25) % / (1.5 - 0.5) mi');
+    assert.strictEqual(gap[2].previousPercent, 25);
+    // A distance that does not lie beyond the previous bracket's has no rate
+    // (no division by zero or a negative span).
+    const flat = utils.computeLpbBracketRates({p25: 1, p50: 1, p75: 0.8, p95: 2});
+    assert.strictEqual(flat[1].ratePercentPerMile, null);
+    assert.strictEqual(flat[2].ratePercentPerMile, null);
+    near(flat[3].ratePercentPerMile, 20 / 1.2, 1e-12, 'the 95 % bracket measures from the 75 % distance');
+    assert.deepStrictEqual(utils.computeLpbBracketRates(null).map(r => r.ratePercentPerMile), [null, null, null, null]);
+    assert.strictEqual(utils.formatLpbPercent(13.157894), '13.2%');
+    assert.strictEqual(utils.formatLpbPercent(50), '50%');
+    assert.strictEqual(utils.formatLpbPercent(2.5252), '2.5%');
+    assert.strictEqual(utils.formatLpbPercent('x'), '');
+});
+
+check('resolveLpbBracket picks the smallest distance that still contains the segment, with its rate', () => {
     const at = (miles) => utils.resolveLpbBracket(miles, DISTANCES);
     assert.strictEqual(at(0.3).percent, 25);
-    assert.strictEqual(at(0.3).factor, 4);
+    assert.strictEqual(at(0.3).ratePercentPerMile, 50, '25 % over 0.5 mi');
     assert.strictEqual(at(0.5).percent, 25, 'exactly on the 25 % distance stays in the 25 % bracket');
     assert.strictEqual(at(0.7).percent, 50);
-    assert.strictEqual(at(0.7).factor, 2);
+    assert.strictEqual(at(0.7).ratePercentPerMile, 50, '(50 - 25) % over (1.0 - 0.5) mi');
+    assert.strictEqual(at(0.7).previousDistance, 0.5);
     assert.strictEqual(at(1.2).percent, 75);
-    near(at(1.2).factor, 100 / 75, 1e-12, '75 % factor');
+    assert.strictEqual(at(1.2).ratePercentPerMile, 50);
     assert.strictEqual(at(1.9).percent, 95);
-    near(at(1.9).factor, 100 / 95, 1e-12, '95 % factor');
+    assert.strictEqual(at(1.9).ratePercentPerMile, 40, '(95 - 75) % over (2.0 - 1.5) mi');
     assert.strictEqual(at(2.5), null, 'beyond the 95 % distance there is no bracket');
     assert.strictEqual(at(-1), null);
     assert.strictEqual(at('abc'), null);
     assert.strictEqual(utils.resolveLpbBracket(0.3, null), null);
+    // The request's example distances.
+    const example = utils.resolveLpbBracket(5, {p25: 1.9, p50: 11.8, p75: 20, p95: 30});
+    assert.strictEqual(example.percent, 50);
+    near(example.ratePercentPerMile, 2.5253, 0.0001);
     // With the 25 % distance missing the 50 % bracket is the smallest one left.
     assert.strictEqual(utils.resolveLpbBracket(0.3, {p50: 1, p75: 1.5, p95: 2}).percent, 50);
     // Two equal distances: the smaller percentage wins.
@@ -140,30 +184,60 @@ check('normalizeLpbDistanceMiles: miles to a tenth, positive numbers only', () =
     assert.strictEqual(utils.isCompleteLpbDistances(null), false);
 });
 
+// Every category off, on the default terrain, without distances.
+const blankCategories = () => Object.fromEntries(utils.LPB_CATEGORIES.map(cat => [cat.key, {enabled: false, terrain: 'Mtn Temperate', distances: null}]));
+
+check('the categories are listed in their groups, Mental Illness among the Mental State ones', () => {
+    assert.deepStrictEqual(utils.LPB_CATEGORY_GROUPS.map(g => g.title), ['External Forces', 'Water', 'Wheel/Motorized', 'Mental State', 'Child', 'Outdoor Activity', 'Snow Activity']);
+    const labels = utils.LPB_CATEGORY_GROUPS.map(g => g.categories.map(c => c.label));
+    assert.deepStrictEqual(labels[0], ['Abduction', 'Aircraft']);
+    assert.deepStrictEqual(labels[1], ['Non-Powered Boat', 'Person in Current Water', 'Person in Flat Water', 'Person in Flood Water', 'Power Boat']);
+    assert.deepStrictEqual(labels[2], ['ATV', 'Motorcycle', 'Mountain Bike', '4WD Vehicle', 'Road Vehicle']);
+    assert.deepStrictEqual(labels[3], ['Autism', 'Dementia', 'Despondent', 'Intellectual Disability', 'Mental Illness', 'Substance Intoxication']);
+    assert.deepStrictEqual(labels[4], ['Age 1-3', 'Age 4-6', 'Age 7-9', 'Age 10-12', 'Age 13-15']);
+    assert.deepStrictEqual(labels[5], ['Abandoned Vehicle', 'Angler', 'Car Camper', 'Caver', 'Day Climber', 'Extreme Race', 'Gatherer', 'Hiker', 'Horseback Rider', 'Hunter', 'Mountaineer', 'Runner', 'Worker']);
+    assert.deepStrictEqual(labels[6], ['Skier Alpine', 'Skier Nordic', 'Snowboarder', 'Snowmobiler', 'Snowshoer']);
+    // The flat list follows the groups and every key / label is unique.
+    assert.strictEqual(utils.LPB_CATEGORIES.length, 41);
+    assert.deepStrictEqual(utils.LPB_CATEGORIES.map(c => c.label), labels.flat());
+    assert.strictEqual(new Set(utils.LPB_CATEGORIES.map(c => c.key)).size, 41);
+    assert.strictEqual(new Set(utils.LPB_CATEGORIES.map(c => c.label)).size, 41);
+    utils.LPB_CATEGORIES.forEach(c => assert.ok(/^[a-z][A-Za-z0-9]*$/.test(c.key), `${c.key} is a camelCase bundle key`));
+    assert.deepStrictEqual(utils.LPB_CATEGORIES.find(c => c.key === 'mentalIllness'), {key: 'mentalIllness', label: 'Mental Illness', group: 'mentalState'});
+    assert.strictEqual(utils.getLpbCategory('dementia').label, 'Dementia');
+    assert.strictEqual(utils.getLpbCategory('Age 10-12').key, 'childAge10to12');
+    assert.strictEqual(utils.getLpbCategory('4wd vehicle').key, 'fourWdVehicle');
+    assert.strictEqual(utils.getLpbCategory('unicorn'), null);
+});
+
 check('normalizeLostPersonBehavior always yields the canonical shape', () => {
     assert.deepStrictEqual(utils.normalizeLostPersonBehavior(undefined), {
         psrAdjustmentEnabled: true,
         ipp: null,
-        categories: {mentalIllness: {enabled: false, terrain: 'Mtn Temperate', distances: null}}
+        categories: blankCategories()
     });
     const messy = utils.normalizeLostPersonBehavior({
         psrAdjustmentEnabled: false,
         ipp: {lat: '44.95', lng: -93.05, featureId: 'mk1', featureName: 'IPP', importedAt: 't', importedBy: 'Jane', extra: 1},
         categories: {
             mentalIllness: {enabled: 'yes', terrain: 'Lunar', distances: {p25: '0.25', p50: 'x', p75: 1.5, p95: 2}},
+            dementia: {enabled: true, terrain: 'Dry', distances: {p25: 1.9, p50: 11.8, p75: 20, p95: 30}},
             unknownCategory: {enabled: true}
         }
     });
     assert.deepStrictEqual(messy, {
         psrAdjustmentEnabled: false,
         ipp: {featureId: 'mk1', featureName: 'IPP', lat: 44.95, lng: -93.05, importedAt: 't', importedBy: 'Jane'},
-        categories: {mentalIllness: {enabled: false, terrain: 'Mtn Temperate', distances: {p25: 0.3, p75: 1.5, p95: 2}}}
+        categories: {
+            ...blankCategories(),
+            mentalIllness: {enabled: false, terrain: 'Mtn Temperate', distances: {p25: 0.3, p75: 1.5, p95: 2}},
+            dementia: {enabled: true, terrain: 'Dry', distances: {p25: 1.9, p50: 11.8, p75: 20, p95: 30}}
+        }
     });
     assert.strictEqual(utils.normalizeLostPersonBehavior({ipp: {lat: 200, lng: 0}}).ipp, null, 'an unusable position is no IPP');
     assert.strictEqual(utils.normalizeLpbTerrain('Dry'), 'Dry');
     assert.strictEqual(utils.getLpbCategory('mental illness').key, 'mentalIllness');
     assert.strictEqual(utils.getLpbCategory('mentalIllness').label, 'Mental Illness');
-    assert.strictEqual(utils.getLpbCategory('dementia'), null);
     assert.deepStrictEqual(utils.LPB_TERRAINS, ['Mtn Temperate', 'Flat Temperate', 'Dry', 'Urban']);
     assert.deepStrictEqual(utils.LPB_SEED_DISTANCES, {p25: 0.5, p50: 1.0, p75: 1.5, p95: 2.0});
 });
@@ -183,38 +257,107 @@ const activeBundle = (overrides = {}) => ({
     ]}]
 });
 
-check('buildLpbContext names why the adjustment is not active', () => {
-    assert.strictEqual(utils.buildLpbContext(activeBundle()).active, true);
+// The request's worked example as a second category.
+const DEMENTIA_DISTANCES = {p25: 1.9, p50: 11.8, p75: 20, p95: 30};
+const twoCategories = (overrides = {}) => activeBundle({
+    categories: {
+        mentalIllness: {enabled: true, terrain: 'Mtn Temperate', distances: DISTANCES},
+        dementia: {enabled: true, terrain: 'Dry', distances: DEMENTIA_DISTANCES}
+    },
+    ...overrides
+});
+
+check('buildLpbContext lists the applied categories and names why the adjustment is not active', () => {
+    const single = utils.buildLpbContext(activeBundle());
+    assert.strictEqual(single.active, true);
+    assert.deepStrictEqual(single.categories.map(c => [c.category.key, c.terrain]), [['mentalIllness', 'Mtn Temperate']]);
+    assert.deepStrictEqual(single.categories[0].rates.map(r => r.ratePercentPerMile), [50, 50, 50, 40]);
+    assert.strictEqual(single.category.key, 'mentalIllness', 'the first applied category is still exposed on its own');
+    assert.deepStrictEqual(single.incomplete, []);
     assert.strictEqual(utils.buildLpbContext(activeBundle({psrAdjustmentEnabled: false})).reason, 'disabled');
     assert.strictEqual(utils.buildLpbContext(activeBundle({categories: {mentalIllness: {enabled: false}}})).reason, 'no-category');
     assert.strictEqual(utils.buildLpbContext(activeBundle({categories: {mentalIllness: {enabled: true, distances: {p25: 0.5}}}})).reason, 'no-distances');
     assert.strictEqual(utils.buildLpbContext(activeBundle({ipp: null})).reason, 'no-ipp');
     assert.strictEqual(utils.buildLpbContext({}).active, false);
     assert.strictEqual(utils.buildLpbContext(null).reason, 'no-category');
+
+    // Two categories on: both are applied, in list order (Dementia comes before Mental Illness).
+    const both = utils.buildLpbContext(twoCategories());
+    assert.strictEqual(both.active, true);
+    assert.deepStrictEqual(both.categories.map(c => [c.category.key, c.terrain]), [['dementia', 'Dry'], ['mentalIllness', 'Mtn Temperate']]);
+    assert.strictEqual(both.category.key, 'dementia');
+    // One of them without complete distances: the other still applies, the
+    // incomplete one is listed so the status line can say so.
+    const partial = utils.buildLpbContext(twoCategories({categories: {
+        mentalIllness: {enabled: true, terrain: 'Mtn Temperate', distances: DISTANCES},
+        dementia: {enabled: true, terrain: 'Dry', distances: {p25: 1.9}}
+    }}));
+    assert.strictEqual(partial.active, true);
+    assert.deepStrictEqual(partial.categories.map(c => c.category.key), ['mentalIllness']);
+    assert.deepStrictEqual(partial.incomplete.map(c => c.key), ['dementia']);
+    // Both incomplete: nothing to apply.
+    const nothing = utils.buildLpbContext(twoCategories({categories: {
+        mentalIllness: {enabled: true, distances: {p25: 0.5}},
+        dementia: {enabled: true, distances: null}
+    }}));
+    assert.strictEqual(nothing.active, false);
+    assert.strictEqual(nothing.reason, 'no-distances');
+    assert.deepStrictEqual(nothing.incomplete.map(c => c.key), ['dementia', 'mentalIllness']);
 });
 
-check('getLpbSegmentAdjustment finds the shape by CalTopo id or by name and grades the distance', () => {
+check('getLpbSegmentAdjustment finds the shape by CalTopo id or by name and adds the bracket\'s rate', () => {
     const context = utils.buildLpbContext(activeBundle());
     const byId = utils.getLpbSegmentAdjustment(['R1', 'Renamed', '640 ac', '1 mi', '100 ft', '', '', '', '', 'a'], context);
     assert.strictEqual(byId.matched, true);
     near(byId.distanceMiles, 0.3, 0.01, 'Alpha is 0.3 mi from the IPP');
-    assert.strictEqual(byId.bracket.percent, 25);
-    assert.strictEqual(byId.factor, 4);
+    assert.strictEqual(byId.contributions.length, 1);
+    assert.strictEqual(byId.contributions[0].category.key, 'mentalIllness');
+    assert.strictEqual(byId.contributions[0].bracket.percent, 25);
+    assert.strictEqual(byId.contributions[0].addedPercent, 50, '25 % over 0.5 mi = 50 %/mi');
+    assert.strictEqual(byId.addedPercent, 50);
+    assert.strictEqual(byId.factor, 1.5, 'PSRi + 50 % of itself');
 
     const byFullName = utils.getLpbSegmentAdjustment(['R1', 'Bravo', '640 ac', '1 mi', '100 ft', '', '', '', '', 'gfx-2'], context);
     assert.strictEqual(byFullName.matched, true, '"Region - Segment" matches the shape name; a gfx- id is never used');
-    assert.strictEqual(byFullName.bracket.percent, 50);
-    assert.strictEqual(byFullName.factor, 2);
+    assert.strictEqual(byFullName.contributions[0].bracket.percent, 50);
+    assert.strictEqual(byFullName.factor, 1.5, '(50 - 25) % over (1.0 - 0.5) mi = 50 %/mi');
 
     const far = utils.getLpbSegmentAdjustment(['R1', 'Charlie', '640 ac', '1 mi', '100 ft', '', '', '', '', ''], context);
     assert.strictEqual(far.matched, true);
-    assert.strictEqual(far.bracket, null, 'beyond the 95 % distance');
+    assert.strictEqual(far.contributions[0].bracket, null, 'beyond the 95 % distance');
+    assert.strictEqual(far.contributions[0].addedPercent, 0);
+    assert.strictEqual(far.addedPercent, 0);
     assert.strictEqual(far.factor, 1);
 
     const none = utils.getLpbSegmentAdjustment(['R1', 'Delta', '640 ac', '1 mi', '100 ft', '', '', '', '', ''], context);
-    assert.deepStrictEqual(none, {matched: false, distanceMiles: null, bracket: null, factor: 1});
+    assert.deepStrictEqual(none, {matched: false, distanceMiles: null, contributions: [], addedPercent: 0, factor: 1});
 
     assert.strictEqual(utils.getLpbSegmentAdjustment(['R1', 'Alpha'], utils.buildLpbContext(activeBundle({psrAdjustmentEnabled: false}))), null);
+});
+
+check('with several categories on, each works out its own addition and the additions are summed', () => {
+    const context = utils.buildLpbContext(twoCategories());
+    // Alpha, 0.3 mi: Dementia 25 % bracket (25 % / 1.9 mi = 13.16 %/mi) + Mental
+    // Illness 25 % bracket (50 %/mi) = 63.16 % of the PSRi added.
+    const alpha = utils.getLpbSegmentAdjustment(['R1', 'Alpha', '640 ac', '1 mi', '100 ft', '', '', '', '', 'a'], context);
+    assert.deepStrictEqual(alpha.contributions.map(c => [c.category.key, c.bracket && c.bracket.percent]), [['dementia', 25], ['mentalIllness', 25]]);
+    near(alpha.contributions[0].addedPercent, 25 / 1.9, 1e-12);
+    assert.strictEqual(alpha.contributions[1].addedPercent, 50);
+    near(alpha.addedPercent, 50 + 25 / 1.9, 1e-12, 'the additions are summed, not compounded');
+    near(alpha.factor, 1 + (50 + 25 / 1.9) / 100, 1e-12);
+    // Charlie, 5 mi: beyond Mental Illness's 2.0 mi, in Dementia's 50 % bracket
+    // (25 % over 9.9 mi = 2.53 %/mi).
+    const charlie = utils.getLpbSegmentAdjustment(['R1', 'Charlie', '640 ac', '1 mi', '100 ft', '', '', '', '', 'c'], context);
+    assert.strictEqual(charlie.contributions[0].bracket.percent, 50);
+    assert.strictEqual(charlie.contributions[1].bracket, null);
+    near(charlie.addedPercent, 25 / 9.9, 1e-12);
+    near(charlie.factor, 1 + 25 / 9.9 / 100, 1e-12);
+    // The order of the categories does not matter to the sum.
+    const swapped = utils.buildLpbContext(activeBundle({categories: {
+        dementia: {enabled: true, terrain: 'Dry', distances: DEMENTIA_DISTANCES},
+        mentalIllness: {enabled: true, terrain: 'Mtn Temperate', distances: DISTANCES}
+    }}));
+    near(utils.getLpbSegmentAdjustment(['R1', 'Alpha', '640 ac', '1 mi', '100 ft', '', '', '', '', 'a'], swapped).factor, alpha.factor, 1e-12);
 });
 
 check('sync-delta mirrors the section into its own single-record table', () => {
@@ -422,7 +565,7 @@ check('the section survives sanitizeBundle / saveBundle and starts out canonical
     assert.strictEqual(reloaded.lostPersonBehavior.categories.mentalIllness.enabled, true);
 });
 
-check('PSRi is divided by the bracket percentage; PSRc and the search log follow', () => {
+check('PSRi gains its bracket\'s percentage per mile; PSRc and the search log follow', () => {
     const plainApp = createSandbox({store: seedStore(), fetch: createServer().fetch});
     plainApp.recalculateEverything();
     // ((100 ft * 1 mi) / 2 hr) * (0.6 * 640 / 2560) / (640 / 640) = 7.5 for every segment.
@@ -431,31 +574,50 @@ check('PSRi is divided by the bracket percentage; PSRc and the search log follow
     const app = createSandbox({store: seedStore({lpb: FULL_LPB}), fetch: createServer().fetch});
     app.recalculateEverything();
     assert.deepStrictEqual(psri(app), {
-        Alpha: '30.0000',   // 0.3 mi: 25 % bracket, PSRi / 0.25
-        Bravo: '15.0000',   // 0.7 mi (matched as "R1 - Bravo"): 50 % bracket, PSRi / 0.50
+        Alpha: '11.2500',   // 0.3 mi: 25 % bracket, 25 % / 0.5 mi = 50 %/mi -> 7.5 + 0.5 x 7.5
+        Bravo: '11.2500',   // 0.7 mi (matched as "R1 - Bravo"): 50 % bracket, (50 - 25) % / (1.0 - 0.5) mi = 50 %/mi
         Charlie: '7.5000',  // 5 mi: beyond the 95 % distance
         Delta: '7.5000'     // no shape on the map
     });
     assert.deepStrictEqual(psrc(app), psri(app), 'nothing searched yet: PSRc equals PSRi');
 
-    // A search of Alpha: PSR before uses the adjusted share (x4), then decays.
+    // A search of Alpha: PSR before uses the adjusted share (x1.5), then decays.
     const searched = createSandbox({
         store: seedStore({lpb: FULL_LPB, searchLog: [['#1', '', '', 'R1', 'Alpha', '', '', 'Team A (2)', '100 ft', '2']]}),
         fetch: createServer().fetch
     });
     searched.recalculateEverything();
     const log = searched.loadBundle().pages.page4[0];
-    assert.strictEqual(log[5], '30.0000', 'PSR before the sweep is the adjusted PSRi');
-    assert.ok(parseFloat(log[6]) < 30 && parseFloat(log[6]) > 0, `PSR after the sweep decays from the adjusted share (${log[6]})`);
+    assert.strictEqual(log[5], '11.2500', 'PSR before the sweep is the adjusted PSRi');
+    assert.ok(parseFloat(log[6]) < 11.25 && parseFloat(log[6]) > 0, `PSR after the sweep decays from the adjusted share (${log[6]})`);
     assert.strictEqual(psrc(searched).Alpha, log[6], 'PSRc of the searched segment is its PSR after');
-    assert.strictEqual(psri(searched).Alpha, '30.0000');
+    assert.strictEqual(psri(searched).Alpha, '11.2500');
+});
+
+check('two categories on: every category\'s addition is worked out from the plain PSRi, then all are summed onto it', () => {
+    const app = createSandbox({store: seedStore({lpb: twoCategories().lostPersonBehavior}), fetch: createServer().fetch});
+    app.recalculateEverything();
+    const values = psri(app);
+    // Alpha / Bravo: Mental Illness adds 50 %, Dementia (25 % / 1.9 mi) 13.16 %: 7.5 x 1.6316 = 12.2368.
+    assert.strictEqual(values.Alpha, (7.5 * (1 + (50 + 25 / 1.9) / 100)).toFixed(4));
+    assert.strictEqual(values.Alpha, '12.2368');
+    assert.strictEqual(values.Bravo, '12.2368');
+    // Charlie (5 mi): only Dementia's 50 % bracket reaches it, 25 % / 9.9 mi = 2.53 %: 7.5 x 1.0253 = 7.6894.
+    assert.strictEqual(values.Charlie, (7.5 * (1 + 25 / 9.9 / 100)).toFixed(4));
+    assert.strictEqual(values.Charlie, '7.6894');
+    assert.strictEqual(values.Delta, '7.5000', 'no shape: nothing added');
+    assert.deepStrictEqual(psrc(app), values);
+    // Switching Dementia off leaves Mental Illness's addition alone.
+    app.updateLostPersonBehavior((lpb) => { lpb.categories.dementia.enabled = false; return 'off'; });
+    app.recalculateEverything();
+    assert.deepStrictEqual(psri(app), {Alpha: '11.2500', Bravo: '11.2500', Charlie: '7.5000', Delta: '7.5000'});
 });
 
 check('the Segments page switch lifts and re-applies the adjustment without losing the settings', async () => {
     const server = createServer();
     const app = createSandbox({store: seedStore({lpb: FULL_LPB}), fetch: server.fetch});
     app.recalculateEverything();
-    assert.strictEqual(psri(app).Alpha, '30.0000');
+    assert.strictEqual(psri(app).Alpha, '11.2500');
 
     await app.setLpbPsrAdjustmentEnabled(false);
     app.recalculateEverything();
@@ -470,7 +632,7 @@ check('the Segments page switch lifts and re-applies the adjustment without losi
 
     await app.setLpbPsrAdjustmentEnabled(true);
     app.recalculateEverything();
-    assert.strictEqual(psri(app).Alpha, '30.0000');
+    assert.strictEqual(psri(app).Alpha, '11.2500');
     lpb = app.loadBundle().lostPersonBehavior;
     assert.strictEqual(lpb.psrAdjustmentEnabled, true);
     assert.strictEqual(await app.setLpbPsrAdjustmentEnabled(true), false, 'no change, nothing saved');
@@ -508,7 +670,7 @@ check('importing the IPP marker stores its position in the case and sends the se
     assert.ok(rowBatches.some(r => /\/api\/v1\/LPB-1_tester\/rows/.test(r.url)), 'under this login\'s bucket for the case');
 
     app.recalculateEverything();
-    assert.strictEqual(psri(app).Alpha, '30.0000', 'the adjustment applies as soon as the IPP is there');
+    assert.strictEqual(psri(app).Alpha, '11.2500', 'the adjustment applies as soon as the IPP is there');
     assert.strictEqual(app.setLostPersonIpp({attributes: {name: 'nowhere'}}), false, 'a marker without a position is refused');
 
     app.clearLostPersonIpp();
@@ -545,7 +707,8 @@ check('switching a category on copies the login\'s distances into the case; edit
     const server = createServer();
     const app = createSandbox({store: seedStore(), fetch: server.fetch, page: 'page6'});
     await app.loadLpbDistances();
-    const category = app.getLpbCategories()[0];
+    const category = app.getLpbCategories().find(cat => cat.key === 'mentalIllness');
+    assert.strictEqual(category.label, 'Mental Illness');
 
     // What the category switch does (buildLpbCategoryRow).
     app.updateLostPersonBehavior((lpb) => {
@@ -578,7 +741,7 @@ check('switching a category on copies the login\'s distances into the case; edit
     assert.strictEqual(app.getLpbOverrideDistance('Mental Illness', 'Dry', 'p75'), null);
 });
 
-check('the Incident page section renders (heading with the IPP control, one row per category, the graph)', async () => {
+check('the Incident page section renders (heading with the IPP control, group titles, one row per category, the graph)', async () => {
     const server = createServer();
     const app = createSandbox({store: seedStore({lpb: FULL_LPB}), fetch: server.fetch, page: 'page6'});
     app.buildProfilePage();
@@ -589,13 +752,30 @@ check('the Incident page section renders (heading with the IPP control, one row 
     const section = app.__byId['lpb-section'];
     assert.ok(/Lost Person Behavior/.test(section.innerHTML), 'the section heading');
     assert.ok(/lpb-section-ipp/.test(section.innerHTML), 'the IPP control sits in the heading row');
-    const rows = section.children.filter(el => el.classList.contains('lpb-category'));
-    assert.strictEqual(rows.length, 1, 'one row: Mental Illness');
-    assert.strictEqual(rows[0].classList.contains('collapsed'), false, 'switched on: the graph is open');
-    const header = rows[0].children[0];
+    assert.ok(/percentage per mile/.test(section.innerHTML), 'the paragraph explains the per-mile maths');
+
+    // Group titles and category rows, in list order: a title, then its rows.
+    const items = section.children.filter(el => el.classList.contains('lpb-group-title') || el.classList.contains('lpb-category'));
+    const titles = items.filter(el => el.classList.contains('lpb-group-title')).map(el => el.textContent);
+    assert.deepStrictEqual(titles, utils.LPB_CATEGORY_GROUPS.map(g => g.title));
+    const rows = items.filter(el => el.classList.contains('lpb-category'));
+    assert.strictEqual(rows.length, utils.LPB_CATEGORIES.length, 'one row per category');
+    assert.deepStrictEqual(rows.map(el => el.dataset.category), utils.LPB_CATEGORIES.map(c => c.key));
+    const expectedOrder = [];
+    utils.LPB_CATEGORY_GROUPS.forEach(g => { expectedOrder.push(`title:${g.key}`); g.categories.forEach(c => expectedOrder.push(c.key)); });
+    assert.deepStrictEqual(items.map(el => (el.classList.contains('lpb-group-title') ? `title:${el.dataset.group}` : el.dataset.category)), expectedOrder, 'each title sits right before its categories');
+
+    const mental = rows.find(el => el.dataset.category === 'mentalIllness');
+    assert.strictEqual(mental.classList.contains('collapsed'), false, 'switched on: the graph is open');
+    const header = mental.children[0];
     assert.ok(/lpb-category-toggle/.test(header.innerHTML) && /checked/.test(header.innerHTML), 'the switch is on');
     assert.ok(/Mental Illness/.test(header.innerHTML));
-    const chart = walk(rows[0]).find(el => el.classList.contains('lpb-chart'));
+    rows.filter(el => el !== mental).forEach(el => assert.strictEqual(el.classList.contains('collapsed'), true, `${el.dataset.category} is off and folded`));
+    const dementia = rows.find(el => el.dataset.category === 'dementia');
+    assert.ok(/Dementia/.test(dementia.children[0].innerHTML) && !/checked/.test(dementia.children[0].innerHTML), 'Dementia has its own switch, off');
+    assert.ok(walk(dementia).some(el => el.classList.contains('lpb-chart')), 'every category has its own graph');
+
+    const chart = walk(mental).find(el => el.classList.contains('lpb-chart'));
     assert.ok(chart, 'the column graph is rendered');
     const labels = walk(chart).filter(el => el.classList.contains('lpb-chart-col-label')).map(el => el.textContent);
     assert.deepStrictEqual(labels, ['25%', '50%', '75%', '95%']);
@@ -603,6 +783,11 @@ check('the Incident page section renders (heading with the IPP control, one row 
     assert.deepStrictEqual(bars, ['25%', '50%', '75%', '100%'], 'the bars scale from 0 mi to the largest distance (2.0 mi)');
     const values = walk(chart).filter(el => el.classList.contains('lpb-chart-value')).map(el => el.textContent);
     assert.deepStrictEqual(values, ['0.5 mi', '1.0 mi', '1.5 mi', '2.0 mi']);
+    const ratesShown = walk(chart).filter(el => el.classList.contains('lpb-chart-rate')).map(el => el.textContent);
+    assert.deepStrictEqual(ratesShown, ['50% / mi', '50% / mi', '50% / mi', '40% / mi'], 'each column shows its percentage per mile');
+    const barTitles = walk(chart).filter(el => el.classList.contains('lpb-chart-bar')).map(el => el.title);
+    assert.ok(/50% per mile \(25% over 0\.0 mi to 0\.5 mi\)/.test(barTitles[0]), barTitles[0]);
+    assert.ok(/40% per mile \(20% over 1\.5 mi to 2\.0 mi\)/.test(barTitles[3]), barTitles[3]);
     assert.strictEqual(walk(chart).filter(el => el.classList.contains('lpb-reset-btn')).length, 0, 'every value is the default: no reset buttons');
 
     // The IPP control: a pill for the imported marker (Import IPP only when there is none).
@@ -610,27 +795,39 @@ check('the Incident page section renders (heading with the IPP control, one row 
     assert.ok(ippPill, 'the imported IPP is shown as a pill');
     assert.strictEqual(walk(section).filter(el => el.classList.contains('lpb-import-ipp-btn')).length, 0);
 
-    // A category that is off: collapsed, and the case with no IPP shows Import IPP.
+    // Every category off: all collapsed, and the case with no IPP shows Import IPP.
     const offApp = createSandbox({store: seedStore(), fetch: server.fetch, page: 'page6'});
     offApp.buildProfilePage();
     await settle();
     const offSection = offApp.__byId['lpb-section'];
     const offRows = offSection.children.filter(el => el.classList.contains('lpb-category'));
-    assert.strictEqual(offRows[0].classList.contains('collapsed'), true);
+    assert.strictEqual(offRows.length, utils.LPB_CATEGORIES.length);
+    assert.ok(offRows.every(el => el.classList.contains('collapsed')));
     assert.ok(walk(offSection).some(el => el.classList.contains('lpb-import-ipp-btn')), 'Import IPP is offered when the case has no IPP');
+
+    // Two categories on: both rows open, each with its own graph values.
+    const twoApp = createSandbox({store: seedStore({lpb: twoCategories().lostPersonBehavior}), fetch: server.fetch, page: 'page6'});
+    twoApp.buildProfilePage();
+    await settle();
+    const twoRows = twoApp.__byId['lpb-section'].children.filter(el => el.classList.contains('lpb-category'));
+    assert.deepStrictEqual(twoRows.filter(el => !el.classList.contains('collapsed')).map(el => el.dataset.category), ['dementia', 'mentalIllness']);
+    const dementiaChart = walk(twoRows.find(el => el.dataset.category === 'dementia')).find(el => el.classList.contains('lpb-chart'));
+    assert.deepStrictEqual(walk(dementiaChart).filter(el => el.classList.contains('lpb-chart-value')).map(el => el.textContent), ['1.9 mi', '11.8 mi', '20.0 mi', '30.0 mi']);
+    assert.deepStrictEqual(walk(dementiaChart).filter(el => el.classList.contains('lpb-chart-rate')).map(el => el.textContent), ['13.2% / mi', '2.5% / mi', '3% / mi', '2% / mi']);
 
     // An edited value gets a reset button.
     const edited = {...FULL_LPB, categories: {mentalIllness: {enabled: true, terrain: 'Mtn Temperate', distances: {...DISTANCES, p50: 1.2}}}};
     const editedApp = createSandbox({store: seedStore({lpb: edited}), fetch: server.fetch, page: 'page6'});
     editedApp.buildProfilePage();
     await settle();
-    const editedChart = walk(editedApp.__byId['lpb-section']).find(el => el.classList.contains('lpb-chart'));
+    const editedRow = editedApp.__byId['lpb-section'].children.find(el => el.classList.contains('lpb-category') && el.dataset.category === 'mentalIllness');
+    const editedChart = walk(editedRow).find(el => el.classList.contains('lpb-chart'));
     const resets = walk(editedChart).filter(el => el.classList.contains('lpb-reset-btn'));
     assert.strictEqual(resets.length, 1, 'only the edited 50 % value has a reset button');
     assert.ok(/1.0 mi/.test(resets[0].title), 'the reset names the database default');
 });
 
-check('the Segments page shows the switch state and tags the PSRi pills with their bracket', async () => {
+check('the Segments page shows the switch state and tags the PSRi pills with what they gain', async () => {
     const server = createServer();
     const app = createSandbox({store: seedStore({lpb: FULL_LPB}), fetch: server.fetch});
     // The sandbox's getElementById creates the elements the page would have.
@@ -640,13 +837,35 @@ check('the Segments page shows the switch state and tags the PSRi pills with the
     await settle();
     assert.deepStrictEqual(app.__logs.error, [], `no errors while rendering: ${app.__logs.error.join(' | ')}`);
     assert.strictEqual(app.__byId['lpb-toggle'].checked, true, 'the switch shows the case\'s state');
-    assert.ok(/^Applying Mental Illness \(Mtn Temperate\) from IPP "IPP"/.test(app.__byId['lpb-label'].textContent), app.__byId['lpb-label'].textContent);
+    assert.ok(/^Applying Mental Illness \(Mtn Temperate\) from IPP "IPP"\.$/.test(app.__byId['lpb-label'].textContent), app.__byId['lpb-label'].textContent);
 
     const tags = walk(app.__byId['table-body']).filter(el => el.classList.contains('psri-bracket-tag'));
-    assert.deepStrictEqual(tags.map(t => t.textContent).sort(), ['25%', '50%'], 'Alpha (25 %) and Bravo (50 %) carry a tag; Charlie and Delta do not');
-    assert.ok(/0\.3 mi from the IPP falls in the 25% bracket/.test(tags.find(t => t.textContent === '25%').title));
+    assert.deepStrictEqual(tags.map(t => t.textContent), ['+50%', '+50%'], 'Alpha and Bravo gain 50 % and carry a tag; Charlie and Delta do not');
+    assert.ok(/0\.3 mi from the IPP, PSRi \+ 50% of itself \(x1\.5000\)/.test(tags[0].title), tags[0].title);
+    assert.ok(/Mental Illness \(Mtn Temperate\): 25% bracket \(25% over 0\.0 mi to 0\.5 mi = 50% per mile\), adds 50% of the PSRi\./.test(tags[0].title), tags[0].title);
     const tagged = walk(app.__byId['table-body']).filter(el => el.classList.contains('has-lpb-tag'));
     assert.strictEqual(tagged.length, 2, 'the tagged PSRi containers let the tag overflow');
+
+    // Two categories: the tag is the sum, the tooltip lists both.
+    const twoApp = createSandbox({store: seedStore({lpb: twoCategories().lostPersonBehavior}), fetch: server.fetch});
+    twoApp.document.getElementById('lpb-toggle');
+    twoApp.document.getElementById('lpb-label');
+    twoApp.buildSegmentsTable();
+    await settle();
+    assert.deepStrictEqual(twoApp.__logs.error, []);
+    assert.strictEqual(twoApp.__byId['lpb-label'].textContent, 'Applying Dementia (Dry), Mental Illness (Mtn Temperate) from IPP "IPP".');
+    const twoTags = walk(twoApp.__byId['table-body']).filter(el => el.classList.contains('psri-bracket-tag'));
+    assert.deepStrictEqual(twoTags.map(t => t.textContent), ['+63.2%', '+63.2%', '+2.5%'], 'Alpha, Bravo (both categories) and Charlie (Dementia only)');
+    assert.ok(/Dementia \(Dry\): 25% bracket \(25% over 0\.0 mi to 1\.9 mi = 13\.2% per mile\), adds 13\.2% of the PSRi\./.test(twoTags[0].title), twoTags[0].title);
+    assert.ok(/Mental Illness \(Mtn Temperate\): 25% bracket/.test(twoTags[0].title));
+    assert.ok(/Mental Illness \(Mtn Temperate\): beyond its 95% distance, adds nothing\./.test(twoTags[2].title), twoTags[2].title);
+    assert.ok(/Dementia \(Dry\): 50% bracket \(25% over 1\.9 mi to 11\.8 mi = 2\.5% per mile\)/.test(twoTags[2].title), twoTags[2].title);
+    // One category still without its distances is pointed out in the status line.
+    const partial = twoCategories({categories: {
+        mentalIllness: {enabled: true, terrain: 'Mtn Temperate', distances: DISTANCES},
+        dementia: {enabled: true, terrain: 'Dry', distances: {p25: 1.9}}
+    }}).lostPersonBehavior;
+    assert.strictEqual(app.describeLpbStatus(app.buildLpbContext({lostPersonBehavior: partial, maps: []})), 'Applying Mental Illness (Mtn Temperate) from IPP "IPP". Dementia: enter the four distances on the Incident page to include it.');
 
     // The switch: off lifts the adjustment and the tags.
     app.__byId['lpb-toggle'].checked = false;
@@ -675,14 +894,15 @@ check('appendLpbBracketTag: a tag inside a bracket, a tooltip only beyond it or 
     let {container, cell} = tagged();
     app.appendLpbBracketTag(container, cell, SEG('Bravo'), context);
     assert.strictEqual(container.children.length, 1);
-    assert.strictEqual(container.children[0].textContent, '50%');
+    assert.strictEqual(container.children[0].textContent, '+50%');
     assert.strictEqual(container.classList.contains('has-lpb-tag'), true);
-    assert.ok(/divided by 50%/.test(cell.title));
+    assert.ok(/50% bracket \(25% over 0\.5 mi to 1\.0 mi = 50% per mile\), adds 50% of the PSRi/.test(cell.title), cell.title);
 
     ({container, cell} = tagged());
     app.appendLpbBracketTag(container, cell, SEG('Charlie', 'c'), context);
     assert.strictEqual(container.children.length, 0, 'beyond the 95 % distance: no tag');
-    assert.ok(/beyond the 95% distance/.test(cell.title));
+    assert.ok(/nothing is added to the PSRi/.test(cell.title));
+    assert.ok(/beyond its 95% distance, adds nothing/.test(cell.title));
 
     ({container, cell} = tagged());
     app.appendLpbBracketTag(container, cell, SEG('Delta'), context);

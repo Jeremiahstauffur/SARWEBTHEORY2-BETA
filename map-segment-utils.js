@@ -535,23 +535,97 @@
     // ------------------------------------------------------------------
     // Lost Person Behavior (LPB).
     //
-    // On the Incident page the planner switches on a lost-person category
-    // (today: Mental Illness), picks the terrain and imports the IPP marker
-    // from the CalTopo map. Every category x terrain carries four distances
-    // in miles (to a tenth): how far 25 / 50 / 75 / 95 % of such subjects were
-    // found from the IPP. A segment whose centre lies within one of those
-    // distances falls into the smallest bracket that still contains it, and
-    // its PSR share is divided by that bracket's probability (a segment in the
-    // 25 % bracket gets four times its share, one in the 50 % bracket twice).
-    // Segments farther out than the 95 % distance, and segments without a
-    // shape on the map, keep their normal PSR. Everything here is pure so the
-    // website, the server (seeding and validating the distance tables) and
-    // the tests share one implementation.
+    // On the Incident page the planner switches on one or more lost-person
+    // categories (grouped as External Forces, Water, Wheel/Motorized, Mental
+    // State, Child, Outdoor Activity and Snow Activity), picks a terrain for
+    // each and imports the IPP marker from the CalTopo map. Every category x
+    // terrain carries four distances in miles (to a tenth): how far 25 / 50 /
+    // 75 / 95 % of such subjects were found from the IPP.
+    //
+    // The maths turns those four points into a percentage PER MILE for each
+    // bracket - what the category's probability gains per mile between the
+    // previous bracket's distance and this one's: 25 % / d25 for the first
+    // bracket, (50 - 25) % / (d50 - d25) for the second, and so on
+    // (computeLpbBracketRates; with 25 % at 1.9 mi and 50 % at 11.8 mi the
+    // rates are 13.16 %/mi and 25 % / 9.9 mi = 2.53 %/mi). A segment whose
+    // centre lies within one of the distances falls into the smallest bracket
+    // that still contains it, and that bracket's rate, taken as a share of the
+    // segment's PSRi, is what the category ADDS to it: a segment in the 13.16
+    // %/mi bracket gets PSRi + 0.1316 x PSRi. With several categories on,
+    // every category works out its own addition from the unadjusted PSRi and
+    // the additions are summed once at the end (factor = 1 + sum of the rates
+    // / 100), so the order of the categories never matters. Segments farther
+    // out than a category's 95 % distance, and segments without a shape on the
+    // map, get nothing from it. Everything here is pure so the website, the
+    // server (seeding and validating the distance tables) and the tests share
+    // one implementation.
     // ------------------------------------------------------------------
 
-    const LPB_CATEGORIES = [
-        {key: 'mentalIllness', label: 'Mental Illness'}
+    // The categories as they are listed on the Incident page: a title per
+    // group, the categories of the group under it. `label` is also the value
+    // of the `category` column in the distance tables on the server.
+    const LPB_CATEGORY_GROUPS = [
+        {key: 'externalForces', title: 'External Forces', categories: [
+            {key: 'abduction', label: 'Abduction'},
+            {key: 'aircraft', label: 'Aircraft'}
+        ]},
+        {key: 'water', title: 'Water', categories: [
+            {key: 'nonPoweredBoat', label: 'Non-Powered Boat'},
+            {key: 'personInCurrentWater', label: 'Person in Current Water'},
+            {key: 'personInFlatWater', label: 'Person in Flat Water'},
+            {key: 'personInFloodWater', label: 'Person in Flood Water'},
+            {key: 'powerBoat', label: 'Power Boat'}
+        ]},
+        {key: 'wheelMotorized', title: 'Wheel/Motorized', categories: [
+            {key: 'atv', label: 'ATV'},
+            {key: 'motorcycle', label: 'Motorcycle'},
+            {key: 'mountainBike', label: 'Mountain Bike'},
+            {key: 'fourWdVehicle', label: '4WD Vehicle'},
+            {key: 'roadVehicle', label: 'Road Vehicle'}
+        ]},
+        {key: 'mentalState', title: 'Mental State', categories: [
+            {key: 'autism', label: 'Autism'},
+            {key: 'dementia', label: 'Dementia'},
+            {key: 'despondent', label: 'Despondent'},
+            {key: 'intellectualDisability', label: 'Intellectual Disability'},
+            {key: 'mentalIllness', label: 'Mental Illness'},
+            {key: 'substanceIntoxication', label: 'Substance Intoxication'}
+        ]},
+        {key: 'child', title: 'Child', categories: [
+            {key: 'childAge1to3', label: 'Age 1-3'},
+            {key: 'childAge4to6', label: 'Age 4-6'},
+            {key: 'childAge7to9', label: 'Age 7-9'},
+            {key: 'childAge10to12', label: 'Age 10-12'},
+            {key: 'childAge13to15', label: 'Age 13-15'}
+        ]},
+        {key: 'outdoorActivity', title: 'Outdoor Activity', categories: [
+            {key: 'abandonedVehicle', label: 'Abandoned Vehicle'},
+            {key: 'angler', label: 'Angler'},
+            {key: 'carCamper', label: 'Car Camper'},
+            {key: 'caver', label: 'Caver'},
+            {key: 'dayClimber', label: 'Day Climber'},
+            {key: 'extremeRace', label: 'Extreme Race'},
+            {key: 'gatherer', label: 'Gatherer'},
+            {key: 'hiker', label: 'Hiker'},
+            {key: 'horsebackRider', label: 'Horseback Rider'},
+            {key: 'hunter', label: 'Hunter'},
+            {key: 'mountaineer', label: 'Mountaineer'},
+            {key: 'runner', label: 'Runner'},
+            {key: 'worker', label: 'Worker'}
+        ]},
+        {key: 'snowActivity', title: 'Snow Activity', categories: [
+            {key: 'skierAlpine', label: 'Skier Alpine'},
+            {key: 'skierNordic', label: 'Skier Nordic'},
+            {key: 'snowboarder', label: 'Snowboarder'},
+            {key: 'snowmobiler', label: 'Snowmobiler'},
+            {key: 'snowshoer', label: 'Snowshoer'}
+        ]}
     ];
+    // Every category in page order, each knowing its group: {key, label, group}.
+    const LPB_CATEGORIES = LPB_CATEGORY_GROUPS.reduce((list, group) => {
+        group.categories.forEach(cat => list.push({key: cat.key, label: cat.label, group: group.key}));
+        return list;
+    }, []);
     const LPB_TERRAINS = ['Mtn Temperate', 'Flat Temperate', 'Dry', 'Urban'];
     const LPB_DEFAULT_TERRAIN = LPB_TERRAINS[0];
     const LPB_BRACKETS = [
@@ -623,6 +697,39 @@
     function toFiniteNumber(value) {
         const num = typeof value === 'number' ? value : parseFloat(value);
         return Number.isFinite(num) ? num : null;
+    }
+
+    // "13.2%" - a percentage to a tenth, whole numbers without the decimal
+    // ("50%"); '' when it is not a number.
+    function formatLpbPercent(value) {
+        const num = toFiniteNumber(value);
+        if (num === null) return '';
+        const rounded = Math.round(num * 10) / 10;
+        return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
+    }
+
+    // The percentage per mile of every bracket of a category x terrain: the
+    // probability the bracket adds over the previous one, spread over the
+    // miles between the two distances (the 25 % bracket starts from 0 % at
+    // the IPP). One entry per bracket, in LPB_BRACKETS order:
+    //   {key, percent, distance, previousPercent, previousDistance, ratePercentPerMile}
+    // A bracket without a distance, or whose distance does not lie beyond the
+    // previous bracket's, has no rate (null) and can add nothing.
+    function computeLpbBracketRates(distances) {
+        const table = normalizeLpbDistances(distances) || {};
+        let previousPercent = 0;
+        let previousDistance = 0;
+        return LPB_BRACKETS.map(bracket => {
+            const distance = typeof table[bracket.key] === 'number' ? table[bracket.key] : null;
+            const entry = {key: bracket.key, percent: bracket.percent, distance, previousPercent, previousDistance, ratePercentPerMile: null};
+            if (distance !== null) {
+                const span = distance - previousDistance;
+                if (span > 0) entry.ratePercentPerMile = (bracket.percent - previousPercent) / span;
+                previousPercent = bracket.percent;
+                previousDistance = distance;
+            }
+            return entry;
+        });
     }
 
     function normalizeLatLng(lat, lng) {
@@ -820,48 +927,62 @@
     // The bracket a distance from the IPP falls into: the smallest of the four
     // distances that is at least as far (equal distances go to the smaller
     // percentage). Beyond the 95 % distance there is no bracket (null) and the
-    // PSR is left alone. `factor` is what the PSR share is multiplied by
-    // (100 / percent: dividing by the bracket's probability).
+    // category adds nothing. The bracket comes with its rate (see
+    // computeLpbBracketRates): `ratePercentPerMile` is the percentage of the
+    // PSRi the category adds for a segment in this bracket.
     function resolveLpbBracket(distanceMiles, distances) {
         const distance = toFiniteNumber(distanceMiles);
         const table = normalizeLpbDistances(distances);
         if (distance === null || distance < 0 || !table) return null;
         let best = null;
-        LPB_BRACKETS.forEach(bracket => {
-            const limit = table[bracket.key];
+        computeLpbBracketRates(table).forEach(bracket => {
+            const limit = bracket.distance;
             if (typeof limit !== 'number' || limit < distance) return;
             if (!best || limit < best.distance || (limit === best.distance && bracket.percent < best.percent)) {
-                best = {key: bracket.key, percent: bracket.percent, distance: limit, factor: 100 / bracket.percent};
+                best = Object.assign({}, bracket);
             }
         });
         return best;
     }
 
     // Everything the PSR maths needs from a search file, worked out once per
-    // recalculation. `active` is false - with a `reason` - when the adjustment
-    // is switched off on the Segments page ('disabled'), no category is on
-    // ('no-category'), the category has no complete set of distances
-    // ('no-distances') or no IPP was imported ('no-ipp'). With several
-    // categories on, the first one in LPB_CATEGORIES order is used.
+    // recalculation. `categories` lists every category that is switched on
+    // AND has a complete set of distances - {category, terrain, distances,
+    // rates} each - and `incomplete` the switched-on ones that still miss a
+    // distance (they add nothing until it is entered). `active` is false -
+    // with a `reason` - when the adjustment is switched off on the Segments
+    // page ('disabled'), no category is on ('no-category'), none of the
+    // switched-on categories has a complete set of distances ('no-distances')
+    // or no IPP was imported ('no-ipp'). `category` / `terrain` / `distances`
+    // are the first applied (else the first switched-on) category, for the
+    // status lines that name one.
     function buildLpbContext(bundle) {
         const lpb = normalizeLostPersonBehavior(bundle && bundle.lostPersonBehavior);
         const map = bundle && Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
         const features = map && Array.isArray(map.features) ? map.features : [];
-        const context = {active: false, reason: '', lpb, features, ipp: lpb.ipp, category: null, terrain: '', distances: null};
+        const context = {active: false, reason: '', lpb, features, ipp: lpb.ipp, categories: [], incomplete: [], category: null, terrain: '', distances: null};
         if (!lpb.psrAdjustmentEnabled) {
             context.reason = 'disabled';
             return context;
         }
-        const category = LPB_CATEGORIES.find(cat => lpb.categories[cat.key] && lpb.categories[cat.key].enabled) || null;
-        if (!category) {
+        const enabled = LPB_CATEGORIES.filter(cat => lpb.categories[cat.key] && lpb.categories[cat.key].enabled);
+        if (!enabled.length) {
             context.reason = 'no-category';
             return context;
         }
-        const entry = lpb.categories[category.key];
-        context.category = category;
-        context.terrain = entry.terrain;
-        context.distances = entry.distances;
-        if (!isCompleteLpbDistances(entry.distances)) {
+        enabled.forEach(cat => {
+            const entry = lpb.categories[cat.key];
+            if (isCompleteLpbDistances(entry.distances)) {
+                context.categories.push({category: cat, terrain: entry.terrain, distances: entry.distances, rates: computeLpbBracketRates(entry.distances)});
+            } else {
+                context.incomplete.push(cat);
+            }
+        });
+        const first = context.categories.length ? context.categories[0] : {category: enabled[0], terrain: lpb.categories[enabled[0].key].terrain, distances: lpb.categories[enabled[0].key].distances};
+        context.category = first.category;
+        context.terrain = first.terrain;
+        context.distances = first.distances;
+        if (!context.categories.length) {
             context.reason = 'no-distances';
             return context;
         }
@@ -875,21 +996,34 @@
 
     // How the Lost Person Behavior settings change one Segments row:
     //   null                                   - the adjustment is not active
-    //   {matched: false, factor: 1}            - no shape on the map for this row
-    //   {matched: true, distanceMiles, bracket, factor}
-    //                                          - bracket is null beyond the 95 %
-    //                                            distance (factor stays 1)
+    //   {matched: false, factor: 1, ...}       - no shape on the map for this row
+    //   {matched: true, distanceMiles, contributions, addedPercent, factor}
+    //     contributions  one per applied category: {category, terrain, bracket,
+    //                    addedPercent} - bracket (see resolveLpbBracket) is
+    //                    null beyond that category's 95 % distance, and
+    //                    addedPercent is the bracket's rate (0 without one)
+    //     addedPercent   the sum over the categories: the percentage of its
+    //                    PSRi the segment gains
+    //     factor         1 + addedPercent / 100, what the initial share is
+    //                    multiplied by (1 when nothing reaches the segment)
     function getLpbSegmentAdjustment(row, context) {
         if (!context || !context.active) return null;
         const feature = findFeatureForSegmentRow(context.features, row);
         const center = feature ? getFeatureCenter(feature) : null;
-        if (!center) return {matched: false, distanceMiles: null, bracket: null, factor: 1};
+        if (!center) return {matched: false, distanceMiles: null, contributions: [], addedPercent: 0, factor: 1};
         const distanceMiles = haversineMiles(center, context.ipp);
-        const bracket = resolveLpbBracket(distanceMiles, context.distances);
-        return {matched: true, distanceMiles, bracket, factor: bracket ? bracket.factor : 1};
+        let addedPercent = 0;
+        const contributions = (context.categories || []).map(applied => {
+            const bracket = resolveLpbBracket(distanceMiles, applied.distances);
+            const rate = bracket && typeof bracket.ratePercentPerMile === 'number' ? bracket.ratePercentPerMile : 0;
+            addedPercent += rate;
+            return {category: applied.category, terrain: applied.terrain, bracket, addedPercent: rate};
+        });
+        return {matched: true, distanceMiles, contributions, addedPercent, factor: 1 + addedPercent / 100};
     }
 
     return {
+        LPB_CATEGORY_GROUPS,
         LPB_CATEGORIES,
         LPB_TERRAINS,
         LPB_DEFAULT_TERRAIN,
@@ -902,6 +1036,8 @@
         normalizeLpbDistances,
         isCompleteLpbDistances,
         formatLpbMiles,
+        formatLpbPercent,
+        computeLpbBracketRates,
         normalizeLpbIpp,
         normalizeLostPersonBehavior,
         geometryCenterLngLat,

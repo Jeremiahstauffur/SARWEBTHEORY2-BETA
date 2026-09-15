@@ -250,10 +250,13 @@ function normalizeSegmentNameForMatch(value) {
 // ---------------------------------------------------------------------------
 // Lost Person Behavior (LPB).
 //
-// The Incident page's "Lost Person Behavior" section switches on a lost-person
-// category (Mental Illness today), picks the terrain and imports the IPP marker
-// from the CalTopo map. The maths (segment centre, distance to the IPP, which
-// 25/50/75/95 % bracket it falls into, the PSR factor) lives in
+// The Incident page's "Lost Person Behavior" section switches on any number of
+// lost-person categories (listed under their group titles: External Forces,
+// Water, Wheel/Motorized, Mental State, Child, Outdoor Activity, Snow
+// Activity), picks a terrain for each and imports the IPP marker from the
+// CalTopo map. The maths (segment centre, distance to the IPP, which
+// 25/50/75/95 % bracket it falls into, that bracket's percentage per mile and
+// the sum over the categories that becomes the PSR factor) lives in
 // map-segment-utils.js so the server and the tests share it; these wrappers
 // only fall back to "not active" on a page that loads app.js without it.
 //
@@ -269,7 +272,8 @@ function normalizeSegmentNameForMatch(value) {
 // therefore computes the PSR from the same numbers; a login's own edits live
 // on the server (lpb_user_distances) and only seed the next case / terrain.
 // ---------------------------------------------------------------------------
-const LPB_CATEGORIES_FALLBACK = [{key: 'mentalIllness', label: 'Mental Illness'}];
+const LPB_CATEGORIES_FALLBACK = [{key: 'mentalIllness', label: 'Mental Illness', group: 'mentalState'}];
+const LPB_CATEGORY_GROUPS_FALLBACK = [{key: 'mentalState', title: 'Mental State', categories: LPB_CATEGORIES_FALLBACK}];
 const LPB_TERRAINS_FALLBACK = ['Mtn Temperate', 'Flat Temperate', 'Dry', 'Urban'];
 const LPB_BRACKETS_FALLBACK = [
     {key: 'p25', percent: 25},
@@ -282,6 +286,13 @@ const LPB_SEED_DISTANCES_FALLBACK = {p25: 0.5, p50: 1.0, p75: 1.5, p95: 2.0};
 function getLpbCategories() {
     const utils = getMapSegmentUtils();
     return Array.isArray(utils.LPB_CATEGORIES) ? utils.LPB_CATEGORIES : LPB_CATEGORIES_FALLBACK;
+}
+
+// The categories in page order, grouped under their titles
+// ([{key, title, categories: [{key, label}]}]).
+function getLpbCategoryGroups() {
+    const utils = getMapSegmentUtils();
+    return Array.isArray(utils.LPB_CATEGORY_GROUPS) ? utils.LPB_CATEGORY_GROUPS : LPB_CATEGORY_GROUPS_FALLBACK;
 }
 
 function getLpbTerrains() {
@@ -308,6 +319,25 @@ function formatLpbMiles(value) {
     return miles === null ? '' : `${miles.toFixed(1)} mi`;
 }
 
+// "13.2%" / "50%" - how a percentage (a bracket's rate, a segment's gain) is shown.
+function formatLpbPercent(value) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.formatLpbPercent === 'function') return utils.formatLpbPercent(value);
+    const num = typeof value === 'number' ? value : parseFloat(value);
+    if (!Number.isFinite(num)) return '';
+    const rounded = Math.round(num * 10) / 10;
+    return `${Number.isInteger(rounded) ? rounded.toFixed(0) : rounded.toFixed(1)}%`;
+}
+
+// One entry per bracket with its percentage per mile (see
+// computeLpbBracketRates in map-segment-utils.js); without the shared module
+// no bracket has a rate.
+function computeLpbBracketRates(distances) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.computeLpbBracketRates === 'function') return utils.computeLpbBracketRates(distances);
+    return getLpbBrackets().map(bracket => ({key: bracket.key, percent: bracket.percent, distance: null, previousPercent: 0, previousDistance: 0, ratePercentPerMile: null}));
+}
+
 // The section in canonical form (see the block comment above). Without the
 // shared module the object is kept as it is, so nothing a fuller page saved is
 // thrown away by a page that cannot interpret it.
@@ -322,19 +352,23 @@ function getLostPersonBehavior(bundle) {
     return normalizeLostPersonBehavior((bundle || loadBundle()).lostPersonBehavior);
 }
 
-// Everything the PSR maths needs, worked out once per recalculation; `active`
-// is false when the Segments switch is off, no category is on, the category has
-// no complete distances or no IPP was imported (see buildLpbContext in
-// map-segment-utils.js for `reason`).
+// Everything the PSR maths needs, worked out once per recalculation: the
+// categories that are on with complete distances (`categories`), the ones
+// still missing a distance (`incomplete`) and the IPP. `active` is false when
+// the Segments switch is off, no category is on, none has complete distances
+// or no IPP was imported (see buildLpbContext in map-segment-utils.js for
+// `reason`).
 function buildLpbContext(bundle) {
     const utils = getMapSegmentUtils();
     if (typeof utils.buildLpbContext === 'function') return utils.buildLpbContext(bundle);
-    return {active: false, reason: 'unavailable', lpb: normalizeLostPersonBehavior(bundle && bundle.lostPersonBehavior), features: [], ipp: null, category: null, terrain: '', distances: null};
+    return {active: false, reason: 'unavailable', lpb: normalizeLostPersonBehavior(bundle && bundle.lostPersonBehavior), features: [], ipp: null, categories: [], incomplete: [], category: null, terrain: '', distances: null};
 }
 
 // null when the adjustment is not active; otherwise {matched, distanceMiles,
-// bracket, factor} for one Segments row (factor 1 beyond the 95 % distance and
-// for a segment without a shape on the map).
+// contributions, addedPercent, factor} for one Segments row: one contribution
+// per applied category (its bracket and the percentage of the PSRi it adds),
+// their sum, and factor = 1 + sum / 100 (1 for a segment without a shape on
+// the map or beyond every category's 95 % distance).
 function getLpbSegmentAdjustment(row, context) {
     const utils = getMapSegmentUtils();
     return typeof utils.getLpbSegmentAdjustment === 'function' ? utils.getLpbSegmentAdjustment(row, context) : null;
@@ -6699,9 +6733,10 @@ function recalculateEverything() {
   // 1. Recalculate Regions Consensus
   updateConsensusCells(regionsData);
 
-  // Lost Person Behavior (Incident page): a segment within one of the
-  // category's distance brackets of the IPP has its share divided by that
-  // bracket's probability. The factor goes into the initial share, so PSRi,
+  // Lost Person Behavior (Incident page): every switched-on category adds its
+  // bracket's percentage per mile (as a share of the unadjusted PSRi) to a
+  // segment within its distances of the IPP; the additions are summed once
+  // (factor = 1 + sum / 100). The factor goes into the initial share, so PSRi,
   // PSRc and the search log's PSR before/after all move together.
   const lpbContext = buildLpbContext(bundle);
 
@@ -7201,8 +7236,9 @@ function calculatePSR(data, rowIndex, bundle, lpbContext = null) {
   if (sumOfAreas <= 0) return '';
 
   // Formula: PSR = ((Sweep * Length ) / Time) * (Consensus * (Area / Sum of Areas)) / (Area / 640)
-  // The Lost Person Behavior factor (1 / bracket probability, or 1 when the
-  // adjustment is off or does not reach this segment) scales the share.
+  // The Lost Person Behavior factor (1 + the summed percentage per mile of
+  // the categories' brackets / 100, or 1 when the adjustment is off or does
+  // not reach this segment) scales the share: PSRi + the categories' additions.
   const lpbFactor = getLpbPsrFactor(row, lpbContext || buildLpbContext(bundle));
   const psr = ((sweep * length ) / timePerSweep) * (consensus * (area / sumOfAreas) * lpbFactor) / (area / 640);
 
@@ -7212,14 +7248,20 @@ function calculatePSR(data, rowIndex, bundle, lpbContext = null) {
 // updateAllPSRs removed, logic moved to recalculateEverything
 
 // One line for the Segments page's Lost Person Behavior panel saying what the
-// PSR values are (or are not) adjusted by right now.
+// PSR values are (or are not) adjusted by right now. With several categories
+// on, every applied one is named; one still missing a distance is pointed out.
 function describeLpbStatus(context) {
   const lpb = context && context.lpb ? context.lpb : normalizeLostPersonBehavior(null);
   const category = context && context.category ? context.category : null;
   const categoryText = category ? `${category.label} (${context.terrain})` : '';
+  const applied = context && Array.isArray(context.categories) && context.categories.length
+    ? context.categories.map(entry => `${entry.category.label} (${entry.terrain})`).join(', ')
+    : categoryText;
+  const incomplete = context && Array.isArray(context.incomplete) ? context.incomplete.map(cat => cat.label) : [];
   if (context && context.active) {
     const ipp = context.ipp || {};
-    return `Applying ${categoryText} from IPP ${ipp.featureName ? `"${ipp.featureName}"` : `(${Number(ipp.lat).toFixed(5)}, ${Number(ipp.lng).toFixed(5)})`}.`;
+    const pending = incomplete.length ? ` ${incomplete.join(', ')}: enter the four distances on the Incident page to include ${incomplete.length === 1 ? 'it' : 'them'}.` : '';
+    return `Applying ${applied} from IPP ${ipp.featureName ? `"${ipp.featureName}"` : `(${Number(ipp.lat).toFixed(5)}, ${Number(ipp.lng).toFixed(5)})`}.${pending}`;
   }
   switch (context && context.reason) {
     case 'disabled': {
@@ -7231,16 +7273,16 @@ function describeLpbStatus(context) {
     case 'no-category':
       return 'No lost person category is switched on (Incident page, Lost Person Behavior).';
     case 'no-distances':
-      return `${categoryText}: enter the four distances on the Incident page first.`;
+      return `${incomplete.length > 1 ? incomplete.join(', ') : categoryText}: enter the four distances on the Incident page first.`;
     case 'no-ipp':
-      return `${categoryText}: import the IPP marker on the Incident page first.`;
+      return `${applied}: import the IPP marker on the Incident page first.`;
     default:
       return 'Lost Person Behavior is not available on this page.';
   }
 }
 
 // The Segments page switch. It only flips psrAdjustmentEnabled in the case;
-// the category, terrain, distances and IPP entered on the Incident page are
+// the categories, terrains, distances and IPP entered on the Incident page are
 // kept, so the adjustment can be lifted and re-applied at will.
 function setLpbPsrAdjustmentEnabled(enabled) {
   const bundle = loadBundle();
@@ -7280,9 +7322,22 @@ function bindLpbSegmentsPanel(bundle, context) {
   }
 }
 
-// The small tag on the top-right border of a PSRi pill naming the 25/50/75/95 %
-// bracket the segment fell into. Segments the adjustment does not reach (no
-// shape on the map, beyond the 95 % distance) get an explanatory tooltip only.
+// One line of the PSRi tooltip per applied category: the bracket the segment
+// fell into and the percentage of the PSRi that bracket adds, or why the
+// category adds nothing.
+function describeLpbContribution(contribution) {
+  const name = `${contribution.category.label} (${contribution.terrain})`;
+  const bracket = contribution.bracket;
+  if (!bracket) return `${name}: beyond its 95% distance, adds nothing.`;
+  if (typeof bracket.ratePercentPerMile !== 'number') return `${name}: ${bracket.percent}% bracket, but its distance does not lie beyond the previous bracket's, so it adds nothing.`;
+  const span = `${formatLpbMiles(bracket.previousDistance) || '0.0 mi'} to ${formatLpbMiles(bracket.distance)}`;
+  return `${name}: ${bracket.percent}% bracket (${bracket.percent - bracket.previousPercent}% over ${span} = ${formatLpbPercent(bracket.ratePercentPerMile)} per mile), adds ${formatLpbPercent(contribution.addedPercent)} of the PSRi.`;
+}
+
+// The small tag on the top-right border of a PSRi pill showing what the
+// switched-on categories add to the segment ("+13.2%"), with the per-category
+// breakdown as the tooltip. Segments the adjustment does not reach (no shape
+// on the map, beyond every category's 95 % distance) get the tooltip only.
 function appendLpbBracketTag(container, cell, row, context) {
   if (!context || !context.active) return;
   const adjustment = getLpbSegmentAdjustment(row, context);
@@ -7292,15 +7347,16 @@ function appendLpbBracketTag(container, cell, row, context) {
     return;
   }
   const miles = Number.isFinite(adjustment.distanceMiles) ? adjustment.distanceMiles.toFixed(1) : '?';
-  if (!adjustment.bracket) {
-    cell.title = `Lost Person Behavior: ${miles} mi from the IPP is beyond the 95% distance, so the PSRi is unchanged.`;
+  const contributions = Array.isArray(adjustment.contributions) ? adjustment.contributions : [];
+  const breakdown = contributions.map(describeLpbContribution).join('\n');
+  if (!(adjustment.addedPercent > 0)) {
+    cell.title = `Lost Person Behavior: ${miles} mi from the IPP - nothing is added to the PSRi.\n${breakdown}`;
     return;
   }
-  const bracket = adjustment.bracket;
   const tag = document.createElement('span');
   tag.className = 'psri-bracket-tag';
-  tag.textContent = `${bracket.percent}%`;
-  tag.title = `Lost Person Behavior: ${miles} mi from the IPP falls in the ${bracket.percent}% bracket (within ${formatLpbMiles(bracket.distance)}), so the PSRi is divided by ${bracket.percent}%.`;
+  tag.textContent = `+${formatLpbPercent(adjustment.addedPercent)}`;
+  tag.title = `Lost Person Behavior: ${miles} mi from the IPP, PSRi + ${formatLpbPercent(adjustment.addedPercent)} of itself (x${adjustment.factor.toFixed(4)}).\n${breakdown}`;
   cell.title = tag.title;
   container.classList.add('has-lpb-tag');
   container.appendChild(tag);
@@ -13460,13 +13516,15 @@ function buildProfilePage() {
 //
 // The section heading carries the IPP control (Import IPP, or the imported
 // marker's pill) because the IPP is the same whichever categories are on.
-// Below it one dropdown-looking row per category (like the Personnel page's
-// team accordions): the switch, the category name and - once it is on - the
-// terrain dropdown on the same line to its right. Under the row the column
-// graph of the four distances (25 / 50 / 75 / 95 %) with a click-to-edit value
-// under each column and a reset button wherever the case's value differs from
-// the database default. See the block comment above getLpbCategories for
-// where each value is stored.
+// Below it the categories in their groups (External Forces, Water, ... Snow
+// Activity): a title line per group, then one dropdown-looking row per
+// category (like the Personnel page's team accordions): the switch, the
+// category name and - once it is on - the terrain dropdown on the same line
+// to its right. Any number of categories can be on at once. Under the row the
+// column graph of the four distances (25 / 50 / 75 / 95 %) with a
+// click-to-edit value under each column and a reset button wherever the
+// case's value differs from the database default. See the block comment above
+// getLpbCategories for where each value is stored.
 // ---------------------------------------------------------------------------
 
 function getFeatureCenter(feature) {
@@ -13650,12 +13708,20 @@ function renderLostPersonBehaviorSection() {
           <h2><span class="geek-full">Lost Person Behavior</span><span class="geek-abbr">LPB</span></h2>
           <div class="lpb-section-ipp"></div>
         </div>
-        <p>Import the IPP marker from the CalTopo map, then switch on what describes the lost person and pick the terrain. Segments within one of the distances below have their PSRi divided by that bracket's percentage (the Segments page has a switch to apply or lift this).</p>
+        <p>Import the IPP marker from the CalTopo map, then switch on everything that describes the lost person and pick the terrain for each. Every category turns its distances into a percentage per mile (25% over the first distance, then each bracket's extra percentage over its extra miles); a segment within a category's distances gains that bracket's percentage of its PSRi, and with several categories on the gains are summed onto the PSRi (the Segments page has a switch to apply or lift this).</p>
       </div>
     `;
     section.querySelector('.lpb-section-ipp').appendChild(buildLpbIppControl(lpb));
-    getLpbCategories().forEach(category => {
-        section.appendChild(buildLpbCategoryRow(category, lpb));
+    getLpbCategoryGroups().forEach(group => {
+        const title = document.createElement('div');
+        title.className = 'lpb-group-title';
+        title.dataset.group = group.key;
+        title.textContent = group.title;
+        section.appendChild(title);
+        (group.categories || []).forEach(member => {
+            const category = getLpbCategories().find(cat => cat.key === member.key) || Object.assign({group: group.key}, member);
+            section.appendChild(buildLpbCategoryRow(category, lpb));
+        });
     });
 }
 
@@ -13783,12 +13849,15 @@ function buildLpbCategoryRow(category, lpb) {
 
 // The column graph: four columns (25 / 50 / 75 / 95 %) scaled from 0 mi to the
 // largest of the four distances, a click-to-edit value under each column and
-// a reset button wherever the case's value is not the database default.
+// a reset button wherever the case's value is not the database default. Each
+// column's tooltip carries the bracket's percentage per mile - what a segment
+// in that bracket gains.
 function buildLpbDistanceChart(category, entry) {
     const chart = document.createElement('div');
     chart.className = 'lpb-chart';
     const distances = entry.distances || {};
     const brackets = getLpbBrackets();
+    const rates = computeLpbBracketRates(distances);
     const values = brackets.map(bracket => (typeof distances[bracket.key] === 'number' ? distances[bracket.key] : null));
     const max = Math.max(0, ...values.filter(v => v !== null));
 
@@ -13817,7 +13886,11 @@ function buildLpbDistanceChart(category, entry) {
         bar.className = 'lpb-chart-bar';
         const percent = value !== null && max > 0 ? Math.max(2, (value / max) * 100) : 0;
         bar.style.height = `${percent}%`;
-        bar.title = value !== null ? `${bracket.percent}% of subjects found within ${formatLpbMiles(value)} of the IPP` : `${bracket.percent}%: no distance entered`;
+        const rate = rates.find(r => r.key === bracket.key);
+        const rateText = rate && typeof rate.ratePercentPerMile === 'number'
+            ? ` - ${formatLpbPercent(rate.ratePercentPerMile)} per mile (${bracket.percent - rate.previousPercent}% over ${formatLpbMiles(rate.previousDistance) || '0.0 mi'} to ${formatLpbMiles(value)}), what a segment in this bracket gains`
+            : (value !== null ? ' - no rate: the distance must lie beyond the previous bracket\'s' : '');
+        bar.title = value !== null ? `${bracket.percent}% of subjects found within ${formatLpbMiles(value)} of the IPP${rateText}` : `${bracket.percent}%: no distance entered`;
         barWrap.appendChild(bar);
         column.appendChild(barWrap);
 
@@ -13886,6 +13959,14 @@ function buildLpbDistanceChart(category, entry) {
             valueRow.appendChild(resetBtn);
         }
         column.appendChild(valueRow);
+
+        // The bracket's percentage per mile, i.e. what a segment in this
+        // bracket gains (as a share of its PSRi).
+        const rateEl = document.createElement('div');
+        rateEl.className = 'lpb-chart-rate';
+        rateEl.textContent = rate && typeof rate.ratePercentPerMile === 'number' ? `${formatLpbPercent(rate.ratePercentPerMile)} / mi` : '';
+        rateEl.title = 'What a segment whose centre falls in this bracket gains: this percentage of its PSRi';
+        column.appendChild(rateEl);
         columns.appendChild(column);
     });
 
@@ -16662,15 +16743,39 @@ function renderNotificationActionButtons(container, buttons, afterClick) {
     });
 }
 
+// Gap kept between the stacked toasts, and between the first toast and the
+// header (or the top of the viewport when the header is hidden, as on mobile).
+const TOAST_STACK_GAP_PX = 12;
+
+// Toasts stack downward from just under the sticky site header, never over it:
+// the header is measured each time (it wraps to two lines on narrow desktops)
+// and a hidden header (display:none below the mobile breakpoint) measures 0,
+// which leaves the stack at the top of the viewport.
+function getToastStackTop() {
+    let headerBottom = 0;
+    try {
+        const header = document.querySelector('.site-shell > header');
+        if (header && typeof header.getBoundingClientRect === 'function') {
+            const rect = header.getBoundingClientRect();
+            if (rect && rect.height > 0 && Number.isFinite(rect.bottom)) {
+                headerBottom = Math.max(0, rect.bottom);
+            }
+        }
+    } catch (e) {
+        headerBottom = 0;
+    }
+    return headerBottom + TOAST_STACK_GAP_PX;
+}
+
 function showToastNotification(title, text, action, extraClass = '', buttons = null) {
     const toast = document.createElement('div');
     toast.className = 'notif-toast ' + extraClass;
     
     // Position toasts further down if there are others
     const existingToasts = document.querySelectorAll('.notif-toast');
-    let offset = 20;
+    let offset = getToastStackTop();
     existingToasts.forEach(t => {
-        offset += t.offsetHeight + 10;
+        offset += t.offsetHeight + TOAST_STACK_GAP_PX;
     });
     toast.style.top = offset + 'px';
 
@@ -16748,10 +16853,22 @@ function showToast(text, title = 'Info') {
 
 function repositionToasts() {
     const toasts = document.querySelectorAll('.notif-toast');
-    let offset = 20;
+    let offset = getToastStackTop();
     toasts.forEach(t => {
         t.style.top = offset + 'px';
-        offset += t.offsetHeight + 10;
+        offset += t.offsetHeight + TOAST_STACK_GAP_PX;
+    });
+}
+
+// The header's height changes when the window is resized (the nav wraps), so
+// the stack is re-anchored under it.
+if (typeof window !== 'undefined' && typeof window.addEventListener === 'function') {
+    window.addEventListener('resize', () => {
+        try {
+            repositionToasts();
+        } catch (e) {
+            /* no toasts to move */
+        }
     });
 }
 
