@@ -23,6 +23,11 @@ const sampleBundle = {
     parCheckFrequency: 20,
     caltopoColorSyncHeartbeatMinutes: 5,
     caltopoColorSyncCooldownSeconds: 30,
+    mapTrackingEnabled: true,
+    searcherTracks: [
+        {id: 'trk-1', featureId: 'trk-1', baseName: 'Team 1', caltopoName: '#1-Seg A Team 1', type: 'Track', lengthMiles: 1.9, segmentMiles: [{region: 'R1', segment: 'Seg A', miles: 1}]},
+        {id: 'custom-1', baseName: 'Paper log', type: 'Custom', custom: true, lengthMiles: 0.5, segmentMiles: [{region: 'R1', segment: 'Seg B', miles: 0.5}], assignedTask: '#2'}
+    ],
     activityLog: [
         {type: 'New Search File', message: 'created', ts: 1},
         {type: 'Edit', message: 'changed region', ts: 2}
@@ -131,6 +136,15 @@ check('activity_log: one row per entry', () => {
     assert.strictEqual(plan.collections.activity_log.length, 2);
 });
 
+check('searcher_tracks: one row per imported / custom track, labeled by its base name', () => {
+    assert.ok(COLLECTION_TABLES.includes('searcher_tracks'), 'searcher_tracks must be a declared collection table');
+    const plan = buildStructuredPlan(sampleBundle, 'x');
+    assert.strictEqual(plan.collections.searcher_tracks.length, 2);
+    assert.deepStrictEqual(plan.collections.searcher_tracks.map(r => r.label), ['Team 1', 'Paper log']);
+    assert.strictEqual(plan.collections.searcher_tracks[1].data.custom, true);
+    assert.deepStrictEqual(buildStructuredPlan({...sampleBundle, searcherTracks: undefined}, 'x').collections.searcher_tracks, [], 'a file without tracks yields no rows');
+});
+
 check('profile: single record captured', () => {
     const plan = buildStructuredPlan(sampleBundle, 'x');
     assert.strictEqual(plan.singles.profile.incidentNumber, 'INC-1');
@@ -142,6 +156,7 @@ check('settings_page: single record captures settings', () => {
     assert.strictEqual(plan.singles.settings_page.parCheckFrequency, 20);
     assert.strictEqual(plan.singles.settings_page.caltopoColorSyncHeartbeatMinutes, 5);
     assert.strictEqual(plan.singles.settings_page.caltopoColorSyncCooldownSeconds, 30);
+    assert.strictEqual(plan.singles.settings_page.mapTrackingEnabled, true, 'the Search Log Map Tracking switch travels with the settings');
 });
 
 check('lost_person_behavior: single record captured together with the IPP marker', () => {

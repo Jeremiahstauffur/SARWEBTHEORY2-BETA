@@ -26,19 +26,43 @@ segment as pills, delete), lets the planner import / refresh tracks and settle a
   keeps the base name `Team 1`; a new assignment replaces the code.
 - Formula term naming (follow-up): in Map Tracking mode the "Num of Sweeps" term reads as **Tracks**
   (column header `Tracks (mi)`, tag `1.23 mi`); the maths uses the track miles in that term.
+- **Team count not used** (follow-up): with Map Tracking on the track miles replace the whole
+  `length × numSweeps × numMembers` product — those three only ever estimated the miles walked.
+- **Sweep-count reminders off** (follow-up): with Map Tracking on `getLogSweepsDue()` is empty, so the
+  Search Log nav badge, the Segments page "log sweeps" button/row highlight and the "Log Sweeps"
+  notification/toast are all off; the custom-search "finished" toast says the tracks count instead.
+- **Dark red tracks on CalTopo** (follow-up): while PSRc Assignment Colors is on, every imported track is
+  pushed with stroke `#8b0000` (`CALTOPO_IMPORTED_TRACK_COLOR`); its own style is captured in
+  `caltopoAssignmentOverlayState.originals` and put back when the colors go off or the track is deleted.
+- **Custom Track** (follow-up): a button in the Searchers Tracks card opens a form — name, miles, task #
+  (dropdown of the Search Log tasks, newest first). Stored as a track record with `custom: true`, type
+  `Custom`, every mile in the task's segment and the task as its pick; never re-measured, renamed or
+  recolored on CalTopo.
+- **Maps page** (follow-up): a fetched line already in the Searchers Tracks table is *accounted for*
+  (`isFeatureImportedAsTrack`), so it leaves the unaccounted list and shows "Imported" in Fetch Shapes.
+  Import destination by type (`getFeatureImportTarget`): only CalTopo **Assignments** → Segments, only
+  **routes / tracks** → Searchers Tracks; markers, plain shapes and other are not importable. The
+  unaccounted panel is three tables (assignments with the Segments columns; routes with the Searchers
+  Tracks columns — proposed `#task-segment` name, type, length, miles per segment as pills; the rest with
+  name/type/id and no checkbox). Import Selected, the Fetch Shapes popup and the Features tab route each
+  shape to its destination.
 - Switch off → the Num of Sweeps entries are used again exactly as before (tracks stay listed).
 
 ### Formula
 Today: `z = sweepWidth / ((area / 640 / length / numSweeps / numMembers) × 5280)`; `share *= e^-z`.
-Map Tracking on: `z = sweepWidth / ((area / 640 / trackMiles / numMembers) × 5280)` where `trackMiles` is the
-task's allocated track mileage (home portions of its tracks + spill-over portions handed to it). A task with
-no track miles yet decays nothing. `numMembers` is kept (the request replaces only `numSweeps × length`).
-The same replacement applies in `calculatePSRAfter` (row blur) and the charts' `calculateHourlyMetrics`.
+Map Tracking on: `z = sweepWidth / ((area / 640 / trackMiles) × 5280)` where `trackMiles` is the task's
+allocated track mileage (home portions of its tracks + spill-over portions handed to it + custom tracks).
+A task with no track miles yet decays nothing. `numMembers` is **not** used (follow-up: the tracks replace
+`length × numSweeps × numMembers` together). The same replacement applies in `calculatePSRAfter` (row blur)
+and the charts' `calculateHourlyMetrics`. Shared term: `calculateSearchCoverage` in `app.js`.
 
 ### Out of scope / deliberately left
 - Time-based matching of tracks to tasks (only geometry + the planner's pick decide).
 - Linear (LineString) assignments have no area: a track inside one is not measured (0 mi).
 - Overlapping segment shapes count a shared stretch for both segments.
+- Plain polygon Shapes (not CalTopo Assignments) can no longer be imported as segments from the Maps page
+  (the request: only Assignments → segments). The Segments page's own import paths are untouched.
+- A custom track cannot be edited in place (delete and add again).
 
 # Technical Design
 
@@ -96,6 +120,7 @@ whole-case delete), `buildStructuredPlan` collection + `settings_page.mapTrackin
 
 # Delivery Steps
 
-### Step 1: Shared maths + allocation (`map-segment-utils.js`), sync maps, server table/plan
-### Step 2: `app.js` — bundle keys, formula, Search Log switch/column/tags, Searchers Tracks table, import/refresh/pick/rename; `page4.html`; `styles.css`
-### Step 3: Tests, `package.json`, `?v=` bump, AGENTS.md §3/§7/§8
+### ✓ Step 1: Shared maths + allocation (`map-segment-utils.js`), sync maps, server table/plan
+### ✓ Step 2: `app.js` — bundle keys, formula, Search Log switch/column/tags, Searchers Tracks table, import/refresh/pick/rename; `page4.html`; `styles.css`
+### ✓ Step 3: Follow-ups — no team count, sweep reminders off, dark-red tracks in the color push, Custom Track, Maps page destinations
+### ✓ Step 4: Tests (`test_search_log_map_tracking.js`, 24 checks; `test_structured_tables.js`), `package.json`, `?v=20260922`, AGENTS.md §3/§7/§8

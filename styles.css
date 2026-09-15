@@ -4377,6 +4377,29 @@ tr.track-row-ambiguous .searcher-track-name {
   font-size: 0.9rem;
 }
 
+/* Maps page, "Unaccounted Map Features": one table per import destination
+   (Assignments -> Segments, routes -> Searchers Tracks, the rest), each with
+   a small title above it. */
+.unaccounted-group-title {
+  margin: calc(6px * var(--space-scale, 1)) 0 calc(8px * var(--space-scale, 1));
+  color: var(--muted);
+  font-size: 0.85rem;
+  font-weight: 700;
+  letter-spacing: 0.02em;
+  text-transform: uppercase;
+}
+
+.unaccounted-group-arrow {
+  color: var(--accent);
+  padding: 0 4px;
+}
+
+.unaccounted-group-note {
+  font-weight: 400;
+  text-transform: none;
+  opacity: 0.8;
+}
+
 @media (max-width: 860px) {
   .searcher-tracks-header {
     flex-direction: column;

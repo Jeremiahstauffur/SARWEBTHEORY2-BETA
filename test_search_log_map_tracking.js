@@ -1020,6 +1020,92 @@ check('PSRc Assignment Colors: an imported track is pushed to CalTopo in dark re
     assert.ok(app.__posted.every(p => !/custom-/.test(p.endpoint)), 'the custom track never reaches CalTopo');
 });
 
+check('Maps page: an imported track is accounted for; routes go to the Searchers Tracks table, assignments to Segments, the rest nowhere', async () => {
+    // A new assignment, a route, a marker and a plain polygon on the map.
+    const newAssignment = {geometry: polygon(square(3)), attributes: {id: 'seg-4b', name: '4B', class: 'Assignment', ObjectID: 5}};
+    const marker = {geometry: {type: 'Point', coordinates: at(0, 0)}, attributes: {id: 'mk-1', name: 'IPP', class: 'Marker', ObjectID: 6}};
+    const plainShape = {geometry: polygon(square(5)), attributes: {id: 'sh-1', name: 'Hazard', class: 'Shape', ObjectID: 7}};
+    const features = [SEG_4D_SHAPE, SEG_4C_SHAPE, trackFeature(), trackFeature('Team 2', 'trk-2', 'AppTrack'), newAssignment, marker, plainShape];
+    const tracks = [TRACK('trk-1', 'Team 1', [{region: 'R1', segment: '4D', miles: 1.0}])];
+    const app = createSandbox({store: seedStore({features, tracks, tracking: true}), fetch: createServer().fetch, page: 'page10'});
+    assert.strictEqual(utils.getFeatureImportTarget(trackFeature()), 'track');
+    assert.strictEqual(utils.getFeatureImportTarget(newAssignment), 'segment');
+    assert.strictEqual(utils.getFeatureImportTarget(marker), '');
+    assert.strictEqual(utils.getFeatureImportTarget(plainShape), '', 'a plain polygon is not an assignment');
+    assert.strictEqual(utils.isFeatureImportedAsTrack(trackFeature(), tracks), true, 'by CalTopo id');
+    assert.strictEqual(utils.isFeatureImportedAsTrack(trackFeature('Team 1', 'other-id'), tracks), false, 'another id with the same name is another line');
+    assert.strictEqual(utils.isFeatureImportedAsTrack(trackFeature('Team 1', 'gfx-9'), [{id: 'x', baseName: 'Team 1', caltopoName: 'Team 1', segmentMiles: []}]), true, 'a shape without a real id matches the name it was imported under');
+    assert.strictEqual(utils.isFeatureImportedAsTrack(trackFeature('Paper', 'trk-9'), [{id: 'c', custom: true, baseName: 'Paper', segmentMiles: []}]), false, 'a custom track is no shape');
+    assert.strictEqual(utils.isFeatureAccountedFor(trackFeature(), [], tracks), true);
+    assert.strictEqual(utils.isFeatureAccountedFor(trackFeature(), []), false, 'without the tracks it is not');
+
+    // The unaccounted list: the imported track and the two segments are
+    // accounted for; Team 2, 4B, IPP and Hazard are not.
+    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures().map(app.getMapFeatureDisplayName)), ['4B', 'Hazard', 'IPP', 'Team 2']);
+    assert.strictEqual(app.isMapFeatureAccountedFor(trackFeature(), app.loadBundle()), true);
+    assert.strictEqual(app.isMapFeatureImportedAsTrack(trackFeature('Team 2', 'trk-2', 'AppTrack'), app.loadBundle()), false);
+
+    // The panel: one table per destination, each with its own columns.
+    const main = makeElement();
+    app.document.querySelector = (selector) => (selector === 'main' ? main : null);
+    app.buildMapsPage();
+    await settle();
+    assert.deepStrictEqual(app.__logs.error, [], `no errors while rendering: ${app.__logs.error.join(' | ')}`);
+    assert.ok(/id="unaccounted-tracks-body"/.test(main.innerHTML) && /id="unaccounted-other-body"/.test(main.innerHTML), 'the routes and the other-shapes tables are part of the page');
+    assert.ok(/Track Name<\/th>[\s\S]*Length per Segment<\/th>/.test(main.innerHTML), 'the routes table carries the Searchers Tracks columns');
+    assert.ok(/Segment<\/th>[\s\S]*Area \(acres\)<\/th>[\s\S]*Time per Sweep \(hr\)<\/th>/.test(main.innerHTML), 'the assignments table keeps the Segments columns');
+    assert.strictEqual(app.__byId['unaccounted-features-count'].textContent, '4');
+    const assignmentRows = app.__byId['unaccounted-features-body'].children;
+    assert.strictEqual(assignmentRows.length, 1, 'only the assignment is in the segments table');
+    assert.strictEqual(assignmentRows[0].dataset.importTarget, 'segment');
+    assert.strictEqual(assignmentRows[0].children[1].children[0].textContent, '4B');
+    assert.strictEqual(assignmentRows[0].children[2].children[0].textContent, 'Assignment');
+    const trackRows = app.__byId['unaccounted-tracks-body'].children;
+    assert.strictEqual(trackRows.length, 1, 'only the route is in the tracks table');
+    assert.strictEqual(trackRows[0].dataset.importTarget, 'track');
+    assert.strictEqual(trackRows[0].children[1].children[0].textContent, '#1-4D Team 2', 'named as the import would name it (its home segment 4D has task #1)');
+    assert.strictEqual(trackRows[0].children[2].children[0].textContent, 'Track');
+    assert.strictEqual(trackRows[0].children[3].children[0].textContent, '1.90 mi');
+    const portionPills = trackRows[0].children[4].children[0].children.filter(el => el.classList.contains('track-portion-pill'));
+    assert.deepStrictEqual(portionPills.map(p => p.textContent), ['#1-4D 1.00 mi', '#2-4C 0.40 mi', 'outside 0.50 mi'], 'the miles per segment, as pills');
+    assert.strictEqual(trackRows[0].children[5].children[0].textContent, 'trk-2');
+    const otherRows = app.__byId['unaccounted-other-body'].children;
+    assert.deepStrictEqual(otherRows.map(tr => tr.children[0].children[0].textContent), ['Hazard', 'IPP'], 'the marker and the plain shape cannot be imported');
+    assert.ok(otherRows.every(tr => tr.children.length === 3), 'no checkbox for them');
+    assert.strictEqual(app.__byId['unaccounted-tracks-wrap'].style.display, '', 'the routes table is shown');
+    assert.strictEqual(app.__byId['unaccounted-other-wrap'].style.display, '');
+
+    // Import Selected: the route becomes a searcher track, the assignment a
+    // segment; the unchecked marker and shape are marked unwanted.
+    app.getUnaccountedSelection().add(app.getMapFeatureIdentityKey(newAssignment));
+    app.getUnaccountedSelection().add(app.getMapFeatureIdentityKey(features[3]));
+    app.importSelectedUnaccountedFeatures();
+    await settle();
+    assert.deepStrictEqual(plain(app.loadBundle().pages.page2.map(r => r[1])), ['4D', '4C', '4B'], 'the assignment joined the Segments page');
+    assert.ok(!app.loadBundle().pages.page2.some(r => r[1] === 'Team 2'), 'the route did not');
+    const imported = app.loadBundle().searcherTracks.find(t => t.id === 'trk-2');
+    assert.ok(imported, 'the route joined the Searchers Tracks table');
+    assert.strictEqual(imported.type, 'Track');
+    near(imported.lengthMiles, 1.9, 0.005, 'measured on import');
+    assert.deepStrictEqual(plain(app.loadBundle().unwantedMapFeatures.map(e => e.name)).sort(), ['hazard', 'ipp'], 'the unchecked shapes are unwanted');
+    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures()), [], 'nothing is left');
+    assert.ok(app.loadBundle().activityLog.some(e => /Imported 1 searcher track from the CalTopo map/.test(e.action)));
+    assert.ok(/Every shape on the map is imported/.test(app.__byId['unaccounted-features-body'].innerHTML));
+    assert.strictEqual(app.__byId['unaccounted-tracks-wrap'].style.display, 'none', 'the routes table is hidden again');
+
+    // The Fetch Shapes popup renders (both lines are "Imported" now); the
+    // Features tab offers the right action per type.
+    app.showCalTopoShapesPopup(features);
+    await settle();
+    app.renderFeaturesList();
+    assert.deepStrictEqual(app.__logs.error, []);
+    const labels = app.__byId['features-list-body'].children.map(tr => {
+        const m = tr.innerHTML.match(/class="mini-pill import-feat"[^>]*>([^<]+)<\/button>/);
+        return m ? m[1] : '';
+    });
+    assert.deepStrictEqual(labels, ['Reimport', 'Reimport', 'Reimport', 'Not importable', 'Not importable', 'Re-measure track', 'Re-measure track'], 'per type (A-Z: 4B, 4C, 4D, Hazard, IPP, Team 1, Team 2): assignments reimport, lines re-measure, the rest cannot be imported');
+});
+
 check('the static wiring: the page markup carries the switch and the tracks card, the stylesheet the fade and the tags', () => {
     const page = fs.readFileSync(path.join(__dirname, 'page4.html'), 'utf8');
     const toolsRow = page.slice(page.indexOf('<div class="table-tools">'), page.indexOf('<table class="grid-table" aria-label="Search Log table">'));

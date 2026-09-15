@@ -860,10 +860,11 @@ function isMapFeatureUnwanted(feature, bundle) {
     return unwanted.some(entry => unwantedEntryMatchesIdentity(entry, identity));
 }
 
-function isMapFeatureAccountedFor(feature, bundle) {
+// Imported as a Segments row (by CalTopo id, else by name).
+function isMapFeatureImportedAsSegment(feature, bundle) {
     const utils = getMapSegmentUtils();
     const rows = ensureSegmentsPageRows(bundle);
-    if (typeof utils.isFeatureAccountedFor === 'function') return utils.isFeatureAccountedFor(feature, rows);
+    if (typeof utils.isFeatureImportedAsSegment === 'function') return utils.isFeatureImportedAsSegment(feature, rows);
     const identity = getMapFeatureIdentity(feature);
     return (Array.isArray(rows) ? rows : []).some(row => {
         if (!Array.isArray(row)) return false;
@@ -874,9 +875,43 @@ function isMapFeatureAccountedFor(feature, bundle) {
     });
 }
 
-// Fetched features that are neither a segment yet nor marked unwanted, A-Z.
-// Pass {ignoreTypeFilters: true} to also include the feature types the team
-// switched off below the map (normally those are hidden from every list).
+// Imported into the Search Log page's Searchers Tracks table.
+function isMapFeatureImportedAsTrack(feature, bundle) {
+    const utils = getMapSegmentUtils();
+    const tracks = (bundle || loadBundle()).searcherTracks;
+    return typeof utils.isFeatureImportedAsTrack === 'function' ? utils.isFeatureImportedAsTrack(feature, tracks) : false;
+}
+
+// Accounted for = imported somewhere: as a segment or as a searcher track.
+function isMapFeatureAccountedFor(feature, bundle) {
+    const b = bundle || loadBundle();
+    return isMapFeatureImportedAsSegment(feature, b) || isMapFeatureImportedAsTrack(feature, b);
+}
+
+// Where a fetched feature goes when it is imported: 'segment' (a CalTopo
+// Assignment -> Segments page), 'track' (a line -> Searchers Tracks on the
+// Search Log page) or '' (markers, plain shapes, other: not importable).
+function getMapFeatureImportTarget(feature) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getFeatureImportTarget === 'function') return utils.getFeatureImportTarget(feature);
+    const category = getMapFeatureCategoryKey(feature);
+    return category === 'assignment' ? 'segment' : (category === 'route' ? 'track' : '');
+}
+
+// {segment: [...], track: [...], other: [...]} - features by import target.
+function groupMapFeaturesByImportTarget(features) {
+    const groups = {segment: [], track: [], other: []};
+    (Array.isArray(features) ? features : []).forEach(feature => {
+        const target = getMapFeatureImportTarget(feature);
+        groups[target === 'segment' || target === 'track' ? target : 'other'].push(feature);
+    });
+    return groups;
+}
+
+// Fetched features that are neither imported (as a segment or a searcher
+// track) nor marked unwanted, A-Z. Pass {ignoreTypeFilters: true} to also
+// include the feature types the team switched off below the map (normally
+// those are hidden from every list).
 function getUnaccountedMapFeatures(bundle, options = {}) {
     const b = bundle || loadBundle();
     const map = Array.isArray(b.maps) && b.maps[0] ? b.maps[0] : null;
@@ -884,7 +919,7 @@ function getUnaccountedMapFeatures(bundle, options = {}) {
     const utils = getMapSegmentUtils();
     let unaccounted;
     if (typeof utils.getUnaccountedFeatures === 'function') {
-        unaccounted = utils.getUnaccountedFeatures(features, ensureSegmentsPageRows(b), getUnwantedMapFeatures(b));
+        unaccounted = utils.getUnaccountedFeatures(features, ensureSegmentsPageRows(b), getUnwantedMapFeatures(b), b.searcherTracks);
     } else {
         unaccounted = sortMapFeaturesByName(features.filter(feature => !isMapFeatureAccountedFor(feature, b) && !isMapFeatureUnwanted(feature, b)));
     }
@@ -12613,7 +12648,8 @@ function removeSearcherTrack(trackId) {
 
 // Put the fetched lines into the case (new ones added, ones already imported
 // re-measured with their pick kept). Resolves false when nothing came in.
-function importSearcherTracks(features) {
+// `options.quiet` skips the toast (the caller reports the whole import).
+function importSearcherTracks(features, options = {}) {
     const bundle = loadBundle();
     const tracks = getSearcherTracks(bundle);
     let added = 0;
@@ -12635,7 +12671,9 @@ function importSearcherTracks(features) {
     addActivityLogEntry('System', `Imported ${added} searcher track${added === 1 ? '' : 's'} from the CalTopo map${updated ? ` (${updated} re-measured)` : ''}`, bundle);
     const result = saveSearcherTracksChange(bundle);
     if (isSearchLogPage()) buildSearchLogTable();
-    showToast(`${added} track${added === 1 ? '' : 's'} imported${updated ? `, ${updated} re-measured` : ''}.`, 'Searcher Tracks');
+    if (!options.quiet) {
+        showToast(`${added} track${added === 1 ? '' : 's'} imported${updated ? `, ${updated} re-measured` : ''}.`, 'Searcher Tracks');
+    }
     return result;
 }
 
@@ -19990,7 +20028,7 @@ function showCalTopoShapesPopup(features) {
     const selectedCount = () => segmentsToPreview.filter(seg => selectionState.get(seg.featureIndex) !== false).length;
 
     bodyContainer.innerHTML = `
-      <p style="margin-bottom: 15px; opacity: 0.8; flex-shrink: 0;">Select the shapes you want to import as segments, then click <strong>Submit Import</strong> to open the same import preview used on the Segments page. Shapes left out of an import are remembered as <strong>unwanted</strong>, so <strong>Only new</strong> hides them the next time you fetch.</p>
+      <p style="margin-bottom: 15px; opacity: 0.8; flex-shrink: 0;">Select the shapes you want to import, then click <strong>Submit Import</strong>: <strong>Assignments</strong> go to the Segments page (through the same import preview), <strong>tracks and lines</strong> to the Searchers Tracks table on the Search Log page; markers and plain shapes cannot be imported. Shapes left out of an import are remembered as <strong>unwanted</strong>, so <strong>Only new</strong> hides them the next time you fetch.</p>
       <div style="display: flex; flex-wrap: wrap; gap: 12px; margin-bottom: 12px; align-items: center;">
         <input type="search" id="caltopo-shape-search" class="pill-input" placeholder="Search by segment name..." autocomplete="off" style="flex: 1; min-width: 200px; min-height: 40px;">
         <label style="display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; cursor: pointer; white-space: nowrap;">
@@ -20169,12 +20207,35 @@ function showCalTopoShapesPopup(features) {
           return;
       }
 
+      // Each selected shape goes where its type belongs: Assignments to the
+      // Segments page (through the import preview), lines to the Searchers
+      // Tracks table; anything else cannot be imported and is left alone
+      // (neither imported nor marked unwanted - the user did want it).
+      const groups = groupMapFeaturesByImportTarget(selected.map(seg => seg.feature));
+      const segmentItems = selected.filter(seg => groups.segment.includes(seg.feature));
+      const trackFeatures = groups.track;
+      const notImportable = groups.other;
+      const commit = (importedSegmentItems) => {
+          if (trackFeatures.length) {
+              importSearcherTracks(trackFeatures, {quiet: true});
+              showToast(`Imported ${trackFeatures.length} searcher track${trackFeatures.length === 1 ? '' : 's'}: ${trackFeatures.map(getMapFeatureDisplayName).join(', ')} (Search Log page, Searchers Tracks).`, 'Import Complete');
+          }
+          if (notImportable.length) {
+              showToast(`${notImportable.length} shape${notImportable.length === 1 ? '' : 's'} cannot be imported (only Assignments become segments and only tracks / lines become searcher tracks): ${notImportable.map(getMapFeatureDisplayName).join(', ')}.`, 'Not Imported');
+          }
+          finishCalTopoFeatureImport(features, [...(importedSegmentItems || []), ...trackFeatures.map(feature => ({feature}))], {keep: notImportable});
+      };
+
       closePopup(popup);
-      showSegmentsImportPreviewPopup(selected, {
+      if (!segmentItems.length) {
+          commit([]);
+          return;
+      }
+      showSegmentsImportPreviewPopup(segmentItems, {
           title: 'Import Segments from CalTopo',
-          description: 'Review the selected CalTopo shapes before importing them into Segments. Fetched shapes that are not imported will be marked unwanted so they stop showing up as new.',
+          description: `Review the selected CalTopo assignments before importing them into Segments.${trackFeatures.length ? ` The ${trackFeatures.length} selected track${trackFeatures.length === 1 ? '' : 's'} / line${trackFeatures.length === 1 ? '' : 's'} will be imported into the Searchers Tracks table at the same time.` : ''} Fetched shapes that are not imported will be marked unwanted so they stop showing up as new.`,
           onBack: () => showCalTopoShapesPopup(features),
-          onImported: imported => finishCalTopoFeatureImport(features, imported)
+          onImported: imported => commit(imported)
       });
   };
   btnContainer.appendChild(submitBtn);
@@ -20184,13 +20245,16 @@ function showCalTopoShapesPopup(features) {
 }
 
 // After an import that started from a list of fetched CalTopo shapes: every
-// shape in `features` that was NOT imported (and is not a segment already) goes
-// on the hidden unwanted list, so it stops clogging the "only new" and
-// unaccounted views. Returns how many shapes were newly marked.
-function finishCalTopoFeatureImport(features, importedItems) {
+// shape in `features` that was NOT imported (and is not a segment or a
+// searcher track already) goes on the hidden unwanted list, so it stops
+// clogging the "only new" and unaccounted views. `options.keep` lists shapes
+// to leave alone (selected but not importable). Returns how many shapes were
+// newly marked.
+function finishCalTopoFeatureImport(features, importedItems, options = {}) {
     const importedKeys = new Set((Array.isArray(importedItems) ? importedItems : [])
         .map(item => item && item.feature ? getMapFeatureIdentityKey(item.feature) : '')
         .filter(Boolean));
+    (Array.isArray(options.keep) ? options.keep : []).forEach(feature => importedKeys.add(getMapFeatureIdentityKey(feature)));
     const leftOut = (Array.isArray(features) ? features : []).filter(feature => !importedKeys.has(getMapFeatureIdentityKey(feature)));
     // markMapFeaturesUnwanted records the marked shapes in the activity log.
     const marked = markMapFeaturesUnwanted(leftOut);
@@ -20776,8 +20840,17 @@ function renderFeaturesList() {
     const name = attrs.name || 'Unnamed Graphic';
     const type = (f.geometry?.type || attrs.class || attrs.type || (attrs.vertices ? 'Shape' : 'Graphic'));
     const objectId = attrs.ObjectID || 'N/A';
-      const existingSegment = segmentNames.has(normalizeSegmentNameForMatch(name)) || isMapFeatureAccountedFor(f, bundle);
-      const importLabel = existingSegment ? 'Reimport' : 'Import';
+      // Where this shape goes: an Assignment to the Segments page, a line to
+      // the Searchers Tracks table, anything else nowhere.
+      const importTarget = getMapFeatureImportTarget(f);
+      const existingSegment = importTarget === 'segment' && (segmentNames.has(normalizeSegmentNameForMatch(name)) || isMapFeatureImportedAsSegment(f, bundle));
+      const existingTrack = importTarget === 'track' && isMapFeatureImportedAsTrack(f, bundle);
+      const importLabel = importTarget === 'track'
+          ? (existingTrack ? 'Re-measure track' : 'Import as track')
+          : (importTarget === 'segment' ? (existingSegment ? 'Reimport' : 'Import') : 'Not importable');
+      const importTitle = importTarget === 'track'
+          ? `${existingTrack ? 'Re-measure this line in' : 'Import this line into'} the Searchers Tracks table (Search Log page)`
+          : (importTarget === 'segment' ? `${existingSegment ? 'Reimport' : 'Import'} this assignment as a segment` : 'Only Assignments (segments) and tracks / lines (searcher tracks) can be imported');
 
     tr.innerHTML = `
       <td><div class="pill-cell readonly-pill" style="padding: 8px 12px; font-family: monospace; font-size: 0.8rem;">${objectId}</div></td>
@@ -20785,15 +20858,23 @@ function renderFeaturesList() {
       <td><div class="pill-cell readonly-pill" style="padding: 8px 12px;">${type}</div></td>
       <td style="padding: 8px 12px;">
         <div style="display: flex; gap: 6px; flex-wrap: wrap;">
-          <button class="mini-pill import-feat" style="background: rgba(64, 192, 87, 0.1); border-color: rgba(64, 192, 87, 0.3); padding: 5px 10px; font-size: 0.8rem; cursor: pointer;">${importLabel}</button>
+          <button class="mini-pill import-feat" ${importTarget ? '' : 'disabled'} title="${importTitle}" style="background: rgba(64, 192, 87, 0.1); border-color: rgba(64, 192, 87, 0.3); padding: 5px 10px; font-size: 0.8rem; cursor: ${importTarget ? 'pointer' : 'not-allowed'};${importTarget ? '' : ' opacity: 0.5;'}">${importLabel}</button>
         </div>
       </td>
     `;
 
     tr.querySelector('.import-feat').onclick = () => {
+        if (importTarget === 'track') {
+            importSearcherTracks([f]);
+            renderFeaturesList();
+            if (isMapsPage()) renderUnaccountedFeaturesPanel();
+            refreshUnaccountedMapFeatureNotifications();
+            return;
+        }
+        if (importTarget !== 'segment') return;
         showSegmentsImportPreviewPopup([buildCalTopoSegmentImportItem(f)], {
             title: 'Import Segments from CalTopo',
-            description: `Review the selected CalTopo shape before ${existingSegment ? 'reimporting' : 'importing'} "${name}" into Segments.`
+            description: `Review the selected CalTopo assignment before ${existingSegment ? 'reimporting' : 'importing'} "${name}" into Segments.`
         });
     };
 
@@ -21364,7 +21445,7 @@ function buildMapsPage() {
               <span id="caltopo-color-sync-countdown" class="mini-pill" style="display: none; padding: 3px 10px; font-size: 0.75rem;" title="Time until the PSRc segment colors are next pushed to CalTopo (at most once per cooldown, at least once per heartbeat - see Settings)."></span>
             </div>
             <div class="tool-actions" style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
-              <label style="display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; cursor: pointer;" title="Colors the CalTopo assignment shapes by PSRc, draws segments being searched in the active-search style, and appends a summary of each finished task (date/time, team and members, tracks, sweep width) to the shape's description.">
+              <label style="display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; cursor: pointer;" title="Colors the CalTopo assignment shapes by PSRc, draws segments being searched in the active-search style, draws the searcher tracks imported on the Search Log page in dark red, and appends a summary of each finished task (date/time, team and members, tracks, sweep width) to the shape's description.">
                 <span>PSRc Assignment Colors</span>
                 <span class="toggle-switch" style="transform: scale(0.9);">
                   <input type="checkbox" id="caltopo-assignment-overlay-toggle" ${isCalTopoAssignmentOverlayEnabled() ? 'checked' : ''}>
@@ -21385,7 +21466,7 @@ function buildMapsPage() {
               <span>Unaccounted Map Features</span>
               <span id="unaccounted-features-count" class="mini-pill" style="padding: 3px 10px; font-size: 0.75rem;">0</span>
             </h2>
-            <p style="margin: 8px 0 0; color: var(--muted); font-size: 0.9rem;">Shapes on the CalTopo map that are not imported as segments and not marked unwanted. Check the ones to import, then click <strong>Import Selected</strong>; everything left unchecked is marked unwanted so it stops showing up here. Clicking <strong>Import Selected</strong> with nothing checked marks every listed shape unwanted.</p>
+            <p style="margin: 8px 0 0; color: var(--muted); font-size: 0.9rem;">Shapes on the CalTopo map that are not imported and not marked unwanted. <strong>Assignments</strong> are imported as segments, <strong>routes and tracks</strong> as searcher tracks (Search Log page, Searchers Tracks); markers and plain shapes cannot be imported. Check the ones to import, then click <strong>Import Selected</strong>; everything left unchecked is marked unwanted so it stops showing up here. Clicking <strong>Import Selected</strong> with nothing checked marks every listed shape unwanted.</p>
           </div>
           <div class="tool-actions" style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
             <button id="check-unaccounted-btn" class="clear-btn" title="Check CalTopo for unaccounted segments" aria-label="Check for unaccounted segments" style="display: inline-flex; align-items: center; gap: 8px;">
@@ -21398,11 +21479,15 @@ function buildMapsPage() {
         <div id="unaccounted-type-filters" class="unaccounted-type-filters" style="display: flex; align-items: center; gap: 18px; flex-wrap: wrap; padding: 12px 0 4px; border-top: 1px solid var(--line); margin-top: 12px;">
           <span style="color: var(--muted); font-size: 0.9rem;" title="Feature types switched off are marked unwanted automatically (now and on every later fetch) and are not listed here. Switching a type back on restores the shapes that toggle hid.">Notify me about:</span>
         </div>
-        <div style="overflow-x: auto; padding-top: 10px;">
+        <!-- One table per import destination (renderUnaccountedFeaturesPanel): CalTopo
+             Assignments with the Segments page columns, routes / tracks with the
+             Searchers Tracks columns, and the shapes that cannot be imported. -->
+        <div id="unaccounted-assignments-wrap" style="overflow-x: auto; padding-top: 10px;">
+          <div class="unaccounted-group-title" id="unaccounted-assignments-title" style="display: none;">Assignments <span class="unaccounted-group-arrow">&rarr;</span> Segments</div>
           <table class="grid-table" style="width: 100%;">
             <thead>
               <tr>
-                <th style="width: 40px; text-align: center; padding: 12px;"><input type="checkbox" id="unaccounted-check-all" title="Check / uncheck all" style="width: 18px; height: 18px; cursor: pointer;"></th>
+                <th style="width: 40px; text-align: center; padding: 12px;"><input type="checkbox" id="unaccounted-check-all" title="Check / uncheck all assignments" style="width: 18px; height: 18px; cursor: pointer;"></th>
                 <th style="padding: 12px;">Segment</th>
                 <th style="padding: 12px;">Type</th>
                 <th style="padding: 12px;">Area (acres)</th>
@@ -21413,6 +21498,35 @@ function buildMapsPage() {
               </tr>
             </thead>
             <tbody id="unaccounted-features-body"></tbody>
+          </table>
+        </div>
+        <div id="unaccounted-tracks-wrap" style="overflow-x: auto; padding-top: 10px; display: none;">
+          <div class="unaccounted-group-title">Routes and tracks <span class="unaccounted-group-arrow">&rarr;</span> Searchers Tracks (Search Log page)</div>
+          <table class="grid-table" style="width: 100%;">
+            <thead>
+              <tr>
+                <th style="width: 40px; text-align: center; padding: 12px;"><input type="checkbox" id="unaccounted-tracks-check-all" title="Check / uncheck all routes and tracks" style="width: 18px; height: 18px; cursor: pointer;"></th>
+                <th style="padding: 12px;">Track Name</th>
+                <th style="padding: 12px;">Type</th>
+                <th style="padding: 12px;">Length</th>
+                <th style="padding: 12px;">Length per Segment</th>
+                <th style="padding: 12px;">CalTopo</th>
+              </tr>
+            </thead>
+            <tbody id="unaccounted-tracks-body"></tbody>
+          </table>
+        </div>
+        <div id="unaccounted-other-wrap" style="overflow-x: auto; padding-top: 10px; display: none;">
+          <div class="unaccounted-group-title" title="Only CalTopo Assignments become segments and only routes / tracks become searcher tracks. Import Selected marks these unwanted, or switch their type off above.">Other shapes <span class="unaccounted-group-note">(cannot be imported)</span></div>
+          <table class="grid-table" style="width: 100%;">
+            <thead>
+              <tr>
+                <th style="padding: 12px;">Name</th>
+                <th style="padding: 12px;">Type</th>
+                <th style="padding: 12px;">CalTopo</th>
+              </tr>
+            </thead>
+            <tbody id="unaccounted-other-body"></tbody>
           </table>
         </div>
         <div id="unaccounted-features-status" style="margin-top: 10px; font-size: 0.85rem; color: var(--muted);"></div>
@@ -21654,18 +21768,20 @@ function buildMapsPage() {
   if (importSelectedBtn) {
     importSelectedBtn.onclick = () => importSelectedUnaccountedFeatures();
   }
-  const unaccountedCheckAll = document.getElementById('unaccounted-check-all');
-  if (unaccountedCheckAll) {
-    unaccountedCheckAll.onchange = () => {
+  // One "check all" per import destination (assignments / routes).
+  [['unaccounted-check-all', 'segment'], ['unaccounted-tracks-check-all', 'track']].forEach(([id, target]) => {
+    const checkAll = document.getElementById(id);
+    if (!checkAll) return;
+    checkAll.onchange = () => {
       const selection = getUnaccountedSelection();
-      getUnaccountedMapFeatures().forEach(feature => {
+      groupMapFeaturesByImportTarget(getUnaccountedMapFeatures())[target].forEach(feature => {
         const key = getMapFeatureIdentityKey(feature);
-        if (unaccountedCheckAll.checked) selection.add(key);
+        if (checkAll.checked) selection.add(key);
         else selection.delete(key);
       });
       renderUnaccountedFeaturesPanel();
     };
-  }
+  });
 
   renderMaps(true);
 }
@@ -21699,21 +21815,47 @@ function renderUnaccountedFeaturesPanel() {
         if (!liveKeys.has(key)) selection.delete(key);
     });
 
+    // Three lists, one per import destination: CalTopo Assignments (-> Segments
+    // page, the Segments columns), routes / tracks (-> Searchers Tracks on the
+    // Search Log page, that table's columns) and the shapes that cannot be
+    // imported at all (markers, plain shapes, other - listed so they can be
+    // marked unwanted).
+    const groups = groupMapFeaturesByImportTarget(unaccounted);
+    const assignments = groups.segment;
+    const routes = groups.track;
+    const others = groups.other;
+
     const countEl = document.getElementById('unaccounted-features-count');
     if (countEl) countEl.textContent = String(unaccounted.length);
+    const isSelected = feature => selection.has(getMapFeatureIdentityKey(feature));
     const checkAll = document.getElementById('unaccounted-check-all');
     if (checkAll) {
-        checkAll.checked = unaccounted.length > 0 && unaccounted.every(feature => selection.has(getMapFeatureIdentityKey(feature)));
-        checkAll.disabled = unaccounted.length === 0;
+        checkAll.checked = assignments.length > 0 && assignments.every(isSelected);
+        checkAll.disabled = assignments.length === 0;
+    }
+    const tracksCheckAll = document.getElementById('unaccounted-tracks-check-all');
+    if (tracksCheckAll) {
+        tracksCheckAll.checked = routes.length > 0 && routes.every(isSelected);
+        tracksCheckAll.disabled = routes.length === 0;
     }
     const importBtn = document.getElementById('import-selected-unaccounted-btn');
-    if (importBtn) {
-        importBtn.textContent = selection.size > 0 ? `Import Selected (${selection.size})` : 'Import Selected';
+    const refreshImportButton = () => {
+        if (!importBtn) return;
+        const selectedSegments = assignments.filter(isSelected).length;
+        const selectedTracks = routes.filter(isSelected).length;
+        const total = selectedSegments + selectedTracks;
+        importBtn.textContent = total > 0 ? `Import Selected (${total})` : 'Import Selected';
         importBtn.disabled = unaccounted.length === 0;
-        importBtn.title = selection.size > 0
-            ? 'Import the checked shapes as segments; unchecked shapes are marked unwanted'
-            : 'Nothing is checked: mark every listed shape as unwanted';
-    }
+        if (total > 0) {
+            const parts = [];
+            if (selectedSegments) parts.push(`${selectedSegments} assignment${selectedSegments === 1 ? '' : 's'} as segment${selectedSegments === 1 ? '' : 's'}`);
+            if (selectedTracks) parts.push(`${selectedTracks} route${selectedTracks === 1 ? '' : 's'} as searcher track${selectedTracks === 1 ? '' : 's'}`);
+            importBtn.title = `Import ${parts.join(' and ')}; unchecked shapes are marked unwanted`;
+        } else {
+            importBtn.title = 'Nothing is checked: mark every listed shape as unwanted';
+        }
+    };
+    refreshImportButton();
     renderUnaccountedTypeFilterToggles(bundle);
     const statusEl = document.getElementById('unaccounted-features-status');
     if (statusEl) {
@@ -21731,24 +21873,36 @@ function renderUnaccountedFeaturesPanel() {
         statusEl.textContent = parts.join(' ');
     }
 
+    const tracksBody = document.getElementById('unaccounted-tracks-body');
+    const othersBody = document.getElementById('unaccounted-other-body');
+    const assignmentsWrap = document.getElementById('unaccounted-assignments-wrap');
+    const assignmentsTitle = document.getElementById('unaccounted-assignments-title');
+    const tracksWrap = document.getElementById('unaccounted-tracks-wrap');
+    const othersWrap = document.getElementById('unaccounted-other-wrap');
+    const show = (el, visible) => { if (el) el.style.display = visible ? '' : 'none'; };
+
     tbody.innerHTML = '';
+    if (tracksBody) tracksBody.innerHTML = '';
+    if (othersBody) othersBody.innerHTML = '';
+    // The assignments table doubles as the place for the empty states; the
+    // group titles only appear once there is a second list to tell apart.
+    const hasSecondList = routes.length > 0 || others.length > 0;
+    show(assignmentsWrap, !hasFeatures || unaccounted.length === 0 || assignments.length > 0);
+    show(assignmentsTitle, hasSecondList && assignments.length > 0);
+    show(tracksWrap, routes.length > 0);
+    show(othersWrap, others.length > 0);
     if (!hasFeatures) {
         tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 28px; color: var(--muted);">No features loaded yet. Use "Fetch Shapes" or the check button to load the map\'s shapes.</td></tr>';
         return;
     }
     if (unaccounted.length === 0) {
-        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 28px; color: var(--muted);">Every shape on the map is imported or marked unwanted.</td></tr>';
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align: center; padding: 28px; color: var(--muted);">Every shape on the map is imported (as a segment or a searcher track) or marked unwanted.</td></tr>';
         return;
     }
 
-    unaccounted.forEach(feature => {
-        const item = buildCalTopoSegmentImportItem(feature);
+    const caltopoIdOf = feature => (feature?.attributes?.id && !isSyntheticCalTopoFeatureId(feature.attributes.id) ? feature.attributes.id : '');
+    const buildCheckCell = (feature, groupFeatures, groupCheckAll) => {
         const key = getMapFeatureIdentityKey(feature);
-        const lengthVal = parseFloat(item.length) || 0;
-        const timeVal = lengthVal / 0.5;
-        const tr = document.createElement('tr');
-        tr.dataset.featureType = getMapFeatureCategoryKey(feature);
-
         const tdCheck = document.createElement('td');
         tdCheck.style.textAlign = 'center';
         const chk = document.createElement('input');
@@ -21761,12 +21915,36 @@ function renderUnaccountedFeaturesPanel() {
         chk.onchange = () => {
             if (chk.checked) selection.add(key);
             else selection.delete(key);
-            if (checkAll) checkAll.checked = unaccounted.every(f => selection.has(getMapFeatureIdentityKey(f)));
-            if (importBtn) importBtn.textContent = selection.size > 0 ? `Import Selected (${selection.size})` : 'Import Selected';
+            if (groupCheckAll) groupCheckAll.checked = groupFeatures.every(isSelected);
+            refreshImportButton();
         };
         tdCheck.appendChild(chk);
-        tr.appendChild(tdCheck);
+        return tdCheck;
+    };
+    const appendPillCell = (tr, val, {mono = false} = {}) => {
+        const td = document.createElement('td');
+        const pill = document.createElement('div');
+        pill.className = 'pill-cell readonly-pill';
+        pill.style.padding = '8px 12px';
+        if (mono) {
+            pill.style.fontFamily = 'monospace';
+            pill.style.fontSize = '0.8rem';
+        }
+        pill.textContent = val;
+        td.appendChild(pill);
+        tr.appendChild(td);
+        return pill;
+    };
 
+    // Assignments: the Segments page columns (what the import will write).
+    assignments.forEach(feature => {
+        const item = buildCalTopoSegmentImportItem(feature);
+        const lengthVal = parseFloat(item.length) || 0;
+        const timeVal = lengthVal / 0.5;
+        const tr = document.createElement('tr');
+        tr.dataset.featureType = getMapFeatureCategoryKey(feature);
+        tr.dataset.importTarget = 'segment';
+        tr.appendChild(buildCheckCell(feature, assignments, checkAll));
         [
             item.segment,
             getMapFeatureCategoryLabel(feature),
@@ -21774,22 +21952,72 @@ function renderUnaccountedFeaturesPanel() {
             item.length ? `${item.length} mi` : '',
             `${item.sweep || 20} ft`,
             timeVal > 0 ? `${timeVal.toFixed(2)} hr` : '',
-            feature?.attributes?.id && !isSyntheticCalTopoFeatureId(feature.attributes.id) ? feature.attributes.id : ''
-        ].forEach((val, idx) => {
-            const td = document.createElement('td');
-            const pill = document.createElement('div');
-            pill.className = 'pill-cell readonly-pill';
-            pill.style.padding = '8px 12px';
-            if (idx === 6) {
-                pill.style.fontFamily = 'monospace';
-                pill.style.fontSize = '0.8rem';
-            }
-            pill.textContent = val;
-            td.appendChild(pill);
-            tr.appendChild(td);
-        });
+            caltopoIdOf(feature)
+        ].forEach((val, idx) => appendPillCell(tr, val, {mono: idx === 6}));
         tbody.appendChild(tr);
     });
+
+    // Routes / tracks: the Searchers Tracks columns, measured against the
+    // segment shapes as the import would store them - the name it would get
+    // (with the "#task-segment " code once its home segment has a task), its
+    // type, length and one pill per segment it entered.
+    if (tracksBody && routes.length) {
+        const searchLogRows = Array.isArray(bundle.pages?.page4) ? bundle.pages.page4 : [];
+        const utils = getMapSegmentUtils();
+        routes.forEach(feature => {
+            const record = buildSearcherTrackRecord(feature, bundle);
+            const measured = record || {lengthMiles: 0, segmentMiles: []};
+            const allocation = record && typeof utils.allocateSearcherTracks === 'function'
+                ? utils.allocateSearcherTracks([record], searchLogRows)
+                : {tracks: []};
+            const entry = allocation.tracks[0] || null;
+            const tr = document.createElement('tr');
+            tr.dataset.featureType = getMapFeatureCategoryKey(feature);
+            tr.dataset.importTarget = 'track';
+            tr.appendChild(buildCheckCell(feature, routes, tracksCheckAll));
+            const namePill = appendPillCell(tr, entry && entry.displayName ? entry.displayName : getMapFeatureDisplayName(feature));
+            namePill.title = `On the map: ${getMapFeatureDisplayName(feature)}${entry && entry.task ? `\nCounts toward task ${entry.task} (its home segment ${entry.home.segment})` : ''}`;
+            appendPillCell(tr, getSearcherTrackTypeLabel(feature));
+            appendPillCell(tr, formatTrackMiles(measured.lengthMiles));
+            const perSegmentTd = document.createElement('td');
+            const perSegmentWrap = document.createElement('div');
+            perSegmentWrap.className = 'pill-cell-container track-portions';
+            if (entry && entry.portions.length) {
+                entry.portions.forEach(portion => perSegmentWrap.appendChild(buildTrackPortionPill(portion)));
+                const outsideMiles = measured.lengthMiles - entry.portions.reduce((sum, portion) => sum + portion.miles, 0);
+                if (outsideMiles > 0.005) {
+                    const outside = document.createElement('span');
+                    outside.className = 'mini-pill track-portion-pill outside';
+                    outside.textContent = `outside ${formatTrackMiles(outsideMiles)}`;
+                    perSegmentWrap.appendChild(outside);
+                }
+            } else {
+                const none = document.createElement('span');
+                none.className = 'mini-pill track-portion-pill outside';
+                none.textContent = 'outside every segment';
+                none.title = 'No part of this line lies inside a segment with a CalTopo shape.';
+                perSegmentWrap.appendChild(none);
+            }
+            perSegmentTd.appendChild(perSegmentWrap);
+            tr.appendChild(perSegmentTd);
+            appendPillCell(tr, caltopoIdOf(feature), {mono: true});
+            tracksBody.appendChild(tr);
+        });
+    }
+
+    // Everything else cannot be imported: name, type and id, no checkbox.
+    if (othersBody && others.length) {
+        others.forEach(feature => {
+            const tr = document.createElement('tr');
+            tr.dataset.featureType = getMapFeatureCategoryKey(feature);
+            tr.dataset.importTarget = '';
+            tr.title = 'Only Assignments become segments and only routes / tracks become searcher tracks. Import Selected marks this shape unwanted; switch its type off above to stop hearing about it.';
+            appendPillCell(tr, getMapFeatureDisplayName(feature));
+            appendPillCell(tr, getMapFeatureCategoryLabel(feature));
+            appendPillCell(tr, caltopoIdOf(feature), {mono: true});
+            othersBody.appendChild(tr);
+        });
+    }
 }
 
 // The toggle switches (Markers / Shapes / Assignments / Routes / Other) in the
@@ -21854,21 +22082,32 @@ function importSelectedUnaccountedFeatures() {
         return;
     }
     const selection = getUnaccountedSelection();
-    const selected = unaccounted.filter(feature => selection.has(getMapFeatureIdentityKey(feature)));
-    const leftOut = unaccounted.filter(feature => !selection.has(getMapFeatureIdentityKey(feature)));
+    // Only an Assignment can become a segment and only a route a searcher
+    // track: a checked shape of any other type is not importable and is left
+    // out (marked unwanted like the rest).
+    const checked = groupMapFeaturesByImportTarget(unaccounted.filter(feature => selection.has(getMapFeatureIdentityKey(feature))));
+    const selectedSegments = checked.segment;
+    const selectedTracks = checked.track;
+    const importedKeys = new Set([...selectedSegments, ...selectedTracks].map(getMapFeatureIdentityKey));
+    const leftOut = unaccounted.filter(feature => !importedKeys.has(getMapFeatureIdentityKey(feature)));
 
-    // Both steps write their own activity log entries ("Imported segments" /
-    // "Marked ... as unwanted").
-    if (selected.length) {
-        importSegmentsAction(selected.map(buildCalTopoSegmentImportItem));
+    // Every step writes its own activity log entry ("Imported segments" /
+    // "Imported N searcher tracks" / "Marked ... as unwanted").
+    if (selectedSegments.length) {
+        importSegmentsAction(selectedSegments.map(buildCalTopoSegmentImportItem));
+    }
+    if (selectedTracks.length) {
+        importSearcherTracks(selectedTracks, {quiet: true});
     }
     const marked = markMapFeaturesUnwanted(leftOut);
     selection.clear();
 
     let summary;
-    if (selected.length) {
-        const importedNames = selected.map(getMapFeatureDisplayName);
-        summary = `Imported ${selected.length} segment${selected.length === 1 ? '' : 's'}: ${importedNames.join(', ')}.`;
+    if (selectedSegments.length || selectedTracks.length) {
+        const parts = [];
+        if (selectedSegments.length) parts.push(`${selectedSegments.length} segment${selectedSegments.length === 1 ? '' : 's'}: ${selectedSegments.map(getMapFeatureDisplayName).join(', ')}`);
+        if (selectedTracks.length) parts.push(`${selectedTracks.length} searcher track${selectedTracks.length === 1 ? '' : 's'}: ${selectedTracks.map(getMapFeatureDisplayName).join(', ')}`);
+        summary = `Imported ${parts.join(' and ')}.`;
         if (marked > 0) {
             summary += ` ${marked} unchecked shape${marked === 1 ? ' was' : 's were'} marked unwanted.`;
         }

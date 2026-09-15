@@ -123,6 +123,10 @@ bundle = {
     categories: { <key of every LPB_CATEGORIES entry, e.g. mentalIllness, dementia, hiker>:
                   {enabled, terrain, distances: {p25, p50, p75, p95} | null} }   // any number may be on
   },
+  mapTrackingEnabled,             // Search Log "Map Tracking" switch (case-wide, see below)
+  searcherTracks: [ {id, featureId, baseName, caltopoName, type: 'Track'|'Route'|'Custom', custom,
+                     lengthMiles, pointCount, segmentMiles: [{region, segment, miles}], assignedTask,
+                     importedAt, importedBy, evaluatedAt} ],   // the searchers' tracks, measured per segment
   theme, showTips, geekMode, background, deleteMode, parCheckFrequency, ...settings keys,
   lastModified                    // recomputed every save; never diffed
 }
@@ -136,7 +140,7 @@ bundle = {
   `bucketToCaseNumber()`. Isolation is per **login username**, not per PIN. Keep the suffix logic in one place.
 - Server "structured tables" mirror the bundle per `(username, search_case)`:
   `COLLECTION_TABLES` = regions, segments, personnel, search_log, uploaded_files, maps_settings,
-  forms, activity_log; `SINGLE_TABLES` = profile, settings_page, lost_person_behavior. Plus
+  forms, activity_log, searcher_tracks; `SINGLE_TABLES` = profile, settings_page, lost_person_behavior. Plus
   `activity_log_entries`, `declined_assignment_features`, `lpb_ipp` (the case's IPP, derived from the
   bundle section by `syncLostPersonIppTable`), `user_assets`, `users`, `user_settings`, `user_buckets`,
   `store`. Not per case: `login_users` (the login's people, see below), `lpb_default_distances` (category × terrain miles, **edited by hand in the DB**,
@@ -176,6 +180,31 @@ bundle = {
   `saveUserPreferences`). `getFormsDisplayName()` returns it trimmed, else the login username. It is the
   title of the Case # Printout's first page (`getCasePrintoutTitleRowHTML(bundle, caseNumber)`: logo →
   `<h1>` display name over a `Case # …` subtitle, both left-aligned); the other printouts do not use it.
+- **Map Tracking / Searchers Tracks** (Search Log page). `bundle.mapTrackingEnabled` (case-wide, →
+  `settings_page`) and `bundle.searcherTracks` (→ `searcher_tracks`, one row per track). A track is a
+  CalTopo line imported from the map (`importSearcherTracks`) — measured **at import / refresh** against
+  the segment shapes (`measureTrackMilesBySegment`, exact clipping of every leg at the polygon edges) and
+  stored with its miles per segment — or a **custom** one typed in (`addCustomSearcherTrack`: name, miles,
+  task #; `custom: true`, type `Custom`, no shape, never re-measured/renamed/recolored). The pure maths
+  live in `map-segment-utils.js` (`allocateSearcherTracks`: home segment = most miles → that segment's
+  task, the planner's `assignedTask` pick wins, two tasks on the home segment = ambiguous + red `?` until
+  picked, miles in another segment → that segment's latest task; `getTaskTrackMiles`). With the switch
+  **on**, `calculateSearchCoverage` (`app.js`) uses `z = sweepWidth / ((area / 640 / trackMiles) × 5280)` —
+  the track miles replace `length × numSweeps × numMembers` **together** (no team count) — in
+  `recalculateEverything`, `calculatePSRAfter` and `calculateHourlyMetrics`; the Num of Sweeps column
+  reads `Tracks (mi)`, its pills fade and carry a miles tag, and every "log sweeps" reminder is off
+  (`getLogSweepsDue()` returns `[]`). Track names on CalTopo get the `#<task>-<segment> ` code
+  (`formatSearcherTrackName` / `parseSearcherTrackName` — parsed off a fetched name so it is replaced,
+  never stacked; `syncSearcherTrackNamesToCalTopo` POSTs it silently and also writes the new title into the
+  case's copy of the shape, or the next color push would rename it back). While *PSRc Assignment Colors*
+  is on, imported tracks are pushed in dark red (`CALTOPO_IMPORTED_TRACK_COLOR`, second pass of
+  `updateCalTopoAssignmentOverlay`; original style kept in `caltopoAssignmentOverlayState.originals` and
+  restored when the colors go off or the track is deleted). Maps page: a line already in the tracks table
+  is *accounted for* (`isFeatureImportedAsTrack`), and imports go by type (`getFeatureImportTarget`): only
+  CalTopo **Assignments** → segments, only **routes / tracks** → searcher tracks, everything else is not
+  importable (the unaccounted panel is three tables). Every change goes through
+  `saveSearcherTracksChange` (deferred save → `recalculateEverything({colorSyncDelay: 0})`). Plan:
+  `.junie/plans/search-log-map-tracking.md`; test: `test_search_log_map_tracking.js`.
 - **Geek Mode** is *not* a bundle key. It lives in the login's `user_settings` preference record
   (`sar-user-preferences-v1`) **per user account**: `geekModeByUser[<getAccountName>] = {enabled,
   paddingPercent}`, with the login-level `geekMode` / `geekPaddingPercent` as the fallback for an
@@ -271,7 +300,7 @@ to use, read from `process.env` per request), `/api/health` (also carries it), `
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260921`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260922`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
 - **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
@@ -548,6 +577,23 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   a helper, grep for the ids it paints — a static "no longer wires X" guard must name the *page* it
   guards, or it outlaws the other page's legitimate use. Test: `test_maps_proxy_status.js` (drives `Date`
   through a `FakeDate` in the sandbox to reach the stale branch).
+- **2026-09-14 — Search Log "Map Tracking" / Searchers Tracks.** Traps met on the way. (1) A CalTopo
+  rename POST that succeeds but leaves the case's copy of the shape with the old `name`/`title` is undone
+  by the very next color push, which re-sends the whole shape (`buildCalTopoFeatureUpdatePayload` carries
+  every attribute) — write the new title into `maps[0].features` too (`syncSearcherTrackNamesToCalTopo`),
+  and the test that caught it is the color-push check, not the rename check. (2) A `#<task>-<segment> `
+  code must be parsed with the *known* segment names (longest first) before the generic regex, or a
+  segment name with a space (`Seg A`) is cut at the space. (3) Point-in-polygon on its own under-counts a
+  track that leaves and re-enters a segment; cut every leg at the polygon edges it crosses and keep the
+  pieces whose midpoint is inside (`measurePathInsideGeometryMiles`) — the unit-square tests use
+  `1/69.09°` per mile so expectations can be written in miles. (4) The `?` badge and the miles tag are
+  appended to `.pill-cell-container` **after** the pill: the Search Log cell loop appends the pill at the
+  bottom, so anything added earlier ends up in front of it and breaks tests that read `children[0]`.
+  (5) Under Map Tracking a task's later PSR *before* is already lowered by an earlier task's tracked miles
+  on the same segment — assert `after === before` for "gets nothing", not `=== PSRi`. (6) `getLogSweepsDue`
+  is the single source behind every "log sweeps" indication (nav badge, Segments row/button,
+  notification), so gating it once switches them all off. (7) The Maps page test DOM has no `firstChild`
+  — have cell helpers return the element they created. (plan: `search-log-map-tracking.md`)
 
 ---
 
@@ -641,6 +687,23 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   `Connected` (an older server build). `Unproven Connection` does not distinguish "blocked by this
   device" from "server asleep" — the login popup's **Set Server → Test** does that diagnosis. The
   `.php` proxy path (`?health=1`) is still reachable through `getCalTopoProxyHealthUrl` but unexercised.
+- Map Tracking / Searchers Tracks follow-ups: (1) tracks are matched to tasks by geometry and the
+  planner's pick only — no time-based matching, so a segment searched twice always asks (red `?`).
+  (2) A track is measured when imported / refreshed, not on every poll: a live track that keeps growing
+  needs **Refresh Tracks** (or a re-import) to count its new miles; a segment shape imported later is only
+  seen after a refresh too. (3) Linear (LineString) assignments have no area, so a track along one measures
+  0 mi inside it; overlapping segment shapes count a shared stretch for both. (4) Plain polygon *Shapes*
+  (not CalTopo Assignments) can no longer be imported as segments from the Maps page (only Assignments →
+  segments, only routes → tracks, per the request); the Segments page's own import paths are untouched.
+  (5) A custom track cannot be edited in place — delete and add again. (6) The CalTopo rename is one POST
+  per track under its own class then `Shape`, silent, retried no sooner than
+  `SEARCHER_TRACK_RENAME_RETRY_MS` (5 min) after a refusal; a shape without a real CalTopo id is never
+  renamed. (7) The dark-red track color is pushed with the segment colors (same cooldown / heartbeat), so
+  a freshly imported track turns red at the next push, not instantly; a track deleted from the table gets
+  its own style back on the following push. (8) The Fetch Shapes popup's row status says "Imported" for a
+  line in the tracks table but its generic columns (Max Dim / Area / W x H) were left as they are; only
+  the unaccounted panel got the Searchers Tracks columns. (9) The "…not imported as segments" wording of
+  the unaccounted notification is pinned by two suites and was left, although a route now reads oddly there.
 
 ---
 

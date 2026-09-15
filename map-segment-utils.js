@@ -471,7 +471,7 @@
     }
 
     // Segments page rows: [region, segment, area, length, sweep, time, psri, psrc, notes, caltopoId]
-    function isFeatureAccountedFor(feature, segmentRows) {
+    function isFeatureImportedAsSegment(feature, segmentRows) {
         const identity = getFeatureIdentity(feature);
         return (Array.isArray(segmentRows) ? segmentRows : []).some(row => {
             if (!Array.isArray(row)) return false;
@@ -482,11 +482,42 @@
         });
     }
 
-    // Features that are neither a segment yet nor marked unwanted, sorted A-Z.
-    function getUnaccountedFeatures(features, segmentRows, unwantedList) {
+    // A fetched line that is already in the Searchers Tracks table (Search Log
+    // page): the track that carries its CalTopo id, or - for a shape without a
+    // real id - the track that was imported under the name CalTopo has for it.
+    // A custom track (typed in, no shape) never matches.
+    function isFeatureImportedAsTrack(feature, tracks) {
+        const identity = getFeatureIdentity(feature);
+        return normalizeSearcherTracks(tracks).some(track => {
+            if (track.custom) return false;
+            if (identity.id) return !!track.featureId && track.featureId === identity.id;
+            return !track.featureId && !!identity.name && normalizeSegmentName(track.caltopoName) === identity.name;
+        });
+    }
+
+    // Accounted for = imported somewhere: as a Segments row or (a line) as a
+    // searcher track. `tracks` is the case's searcherTracks list.
+    function isFeatureAccountedFor(feature, segmentRows, tracks = []) {
+        return isFeatureImportedAsSegment(feature, segmentRows) || isFeatureImportedAsTrack(feature, tracks);
+    }
+
+    // Where a fetched feature can be imported: a CalTopo Assignment becomes a
+    // Segments row ('segment'), a line - a recorded track or a drawn route -
+    // becomes a Searchers Tracks row ('track'); markers, plain shapes and
+    // everything else cannot be imported ('').
+    function getFeatureImportTarget(feature) {
+        const category = getFeatureCategoryKey(feature);
+        if (category === 'assignment') return 'segment';
+        if (category === 'route') return 'track';
+        return '';
+    }
+
+    // Features that are neither imported (segment or track) nor marked
+    // unwanted, sorted A-Z.
+    function getUnaccountedFeatures(features, segmentRows, unwantedList, tracks = []) {
         const unwanted = normalizeUnwantedFeatureList(unwantedList);
         return sortFeaturesByName((Array.isArray(features) ? features : []).filter(feature =>
-            !isFeatureAccountedFor(feature, segmentRows) && !isFeatureUnwanted(feature, unwanted)));
+            !isFeatureAccountedFor(feature, segmentRows, tracks) && !isFeatureUnwanted(feature, unwanted)));
     }
 
     // Returns a new list with `features` added (no duplicates); the input list
@@ -1516,9 +1547,11 @@
         sortFeaturesByName,
         filterFeaturesByName,
         normalizeUnwantedFeatureList,
-        buildUnwantedFeatureEntry,
         isFeatureUnwanted,
+        isFeatureImportedAsSegment,
+        isFeatureImportedAsTrack,
         isFeatureAccountedFor,
+        getFeatureImportTarget,
         getUnaccountedFeatures,
         markFeaturesUnwanted,
         unmarkFeaturesUnwanted,
