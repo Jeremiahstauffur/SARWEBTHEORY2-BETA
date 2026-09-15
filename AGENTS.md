@@ -171,6 +171,11 @@ bundle = {
   `.junie/plans/lost-person-behavior-psr-adjustment.md` (section, tables),
   `.junie/plans/lpb-categories-per-mile-psr.md` (category list, per-mile maths, multi-category sum,
   Maps page column, recalculation on change).
+- **Forms Display Name** is *not* a bundle key either: `formsDisplayName` in the login's preference
+  record (`getUserPreferences().formsDisplayName`, written by the Settings panel "Forms Display Name" via
+  `saveUserPreferences`). `getFormsDisplayName()` returns it trimmed, else the login username. It is the
+  title of the Case # Printout's first page (`getCasePrintoutTitleRowHTML(bundle, caseNumber)`: logo →
+  `<h1>` display name over a `Case # …` subtitle, both left-aligned); the other printouts do not use it.
 - **Geek Mode** is *not* a bundle key. It lives in the login's `user_settings` preference record
   (`sar-user-preferences-v1`) **per user account**: `geekModeByUser[<getAccountName>] = {enabled,
   paddingPercent}`, with the login-level `geekMode` / `geekPaddingPercent` as the fallback for an
@@ -266,7 +271,7 @@ to use, read from `process.env` per request), `/api/health` (also carries it), `
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260919`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260920`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
 - **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
@@ -499,6 +504,18 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   `localStorage` (as `test_ic_report.js` still does) gets an empty `loadBundle()`, which is that suite's
   pre-existing `No case selected` failure; (3) top-level `const`s of `app.js` are not sandbox properties —
   read them with `vm.runInContext('NAME', sandbox)`. Test: `test_print_logo.js`.
+- **2026-09-14 — Case # Printout: display name + case # header, 50 px form logos.** The Home page's
+  `printSearchFile` window is now titled `Case # Printout - <case>`; its first page opens with
+  `getCasePrintoutTitleRowHTML` (logo, then `.print-title-block`: `<h1>` Forms Display Name over
+  `.print-subtitle` `Case # <number>`), and its Task Assignment Forms get the logo at 50 px
+  (`getTaskFormPrintHTML(num, f, bundle, {logoWidth: PRINT_LOGO_SMALL_WIDTH_PX})` → `getPrintLogoHTML(bundle,
+  50)` adds `print-logo-small`); stand-alone forms keep 150 px. The reported "no logo on the Home page
+  printout" could not be reproduced in code (`getPrintTitleRowHTML` was already there and `loadUserAssets()`
+  runs on every page) — most likely a cached `app.js`, hence another `?v=` bump; if it recurs, check
+  `getUserAsset('logo')` in the console before printing. Trap: writing the `?v=` bump with PowerShell
+  `Set-Content -Encoding UTF8` prepends a BOM to every HTML file (PowerShell 5) — strip it or use
+  `[System.IO.File]::WriteAllBytes`. A vm test that needs `saveUserPreferences` to work must first set
+  `_serverSettingsLoaded = true` in-context (`setFormsDisplayName` in `test_print_logo.js`).
 - **2026-09-14 — "Not all users were loaded" — users moved from the case to the login.** Symptom: the
   post-login picker showed only the open case's personnel. Cause: users lived in `bundle.accounts`
   (per case) and the picker read `/api/v1/tables/personnel?case=` first. Rules: (1) the list is
@@ -598,6 +615,11 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   title (the page's top row already carries the logo); only the stand-alone IC Report printout puts the
   logo in the `IC Report` row (`getIcReportPrintHTML(bundle, {logo: true})`). The logo is placed at its
   natural height for 150 px width; a very tall logo will make the title row tall (no `max-height`).
+  Case # Printout: the Activity Log page still uses the plain `Activity Log` title row (only page one has
+  the display-name/case-# block); the Forms Display Name is per **login** (one name for everyone sharing
+  the username) and is not shown on the other printouts; a change is logged to the open case's activity
+  log (like the other Settings) but the value itself never enters the bundle. `test_incident_times_days.js`
+  still pins `<h1>Activity Log</h1>` in the case printout.
 
 ---
 

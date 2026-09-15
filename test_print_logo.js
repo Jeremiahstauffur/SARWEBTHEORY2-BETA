@@ -4,6 +4,12 @@
 // member activity reports and the whole Case # Printout. Without a logo the
 // title row holds just the title.
 //
+// The Case # Printout (Home page) differs: its window is titled "Case #
+// Printout", the first page opens with the logo, the login's Forms Display Name
+// (Settings; the login username until one is typed) as the title and "Case #
+// <number>" as a subtitle under it, and the Task Assignment Forms inside it
+// carry a 50 px logo instead of the 150 px one.
+//
 // The real print functions of app.js run in a vm sandbox whose window.open
 // records the HTML written into the print window.
 //
@@ -157,6 +163,13 @@ function capture(app, fn) {
 }
 
 const LOGO_IMG = `<img class="print-logo" src="${LOGO_DATA_URL}" alt="" width="150">`;
+const SMALL_LOGO_IMG = `<img class="print-logo print-logo-small" src="${LOGO_DATA_URL}" alt="" width="50">`;
+
+// The login's preference record, as the Settings page writes it.
+function setFormsDisplayName(app, name) {
+    vm.runInContext('_serverSettingsLoaded = true', app);
+    app.saveUserPreferences({formsDisplayName: name});
+}
 
 function countOf(haystack, needle) {
     return haystack.split(needle).length - 1;
@@ -189,6 +202,10 @@ function allPrintouts(app) {
     const styles = vm.runInContext('PRINT_LOGO_STYLES', app);
     assert.ok(/\.print-logo \{[^}]*width: 150px/.test(styles), 'the print styles size the logo at 150 px');
     assert.ok(/\.print-title-row \{[^}]*display: flex/.test(styles), 'logo and title share one flex row');
+    assert.strictEqual(vm.runInContext('PRINT_LOGO_SMALL_WIDTH_PX', app), 50, 'the small print logo is 50 px wide');
+    assert.ok(/\.print-logo\.print-logo-small \{[^}]*width: 50px/.test(styles), 'the print styles size the small logo at 50 px');
+    assert.ok(/\.print-title-block \{[^}]*flex-direction: column/.test(styles), 'display name and case # stack in a column');
+    assert.ok(/\.print-title-block \{[^}]*align-items: flex-start/.test(styles), '... both left-aligned');
 
     // No logo stored for the login and none in the case: just the title.
     assert.strictEqual(app.getPrintLogoHTML(app.loadBundle()), '', 'no logo -> no image');
@@ -210,6 +227,22 @@ function allPrintouts(app) {
     assert.strictEqual(app.getPrintLogoHTML(legacy), LOGO_IMG);
     assert.strictEqual(app.getPrintTitleRowHTML(legacy, 'Search Log: Case-9'),
         `<div class="print-title-row">${LOGO_IMG}<h1>Search Log: Case-9</h1></div>`, 'logo left, title right, one row');
+    assert.strictEqual(app.getPrintLogoHTML(legacy, 50), SMALL_LOGO_IMG, 'the 50 px variant');
+    assert.strictEqual(app.getPrintLogoHTML(legacy, 999), LOGO_IMG, 'any other width falls back to 150 px');
+
+    // The Case # Printout top row: logo, then display name over "Case # …".
+    // The login username stands in until a Forms Display Name is typed.
+    assert.strictEqual(app.getFormsDisplayName(), 'tester', 'no display name -> the login username');
+    assert.strictEqual(app.getCasePrintoutTitleRowHTML(legacy, 'Case-9'),
+        `<div class="print-title-row">${LOGO_IMG}<div class="print-title-block"><h1>tester</h1><div class="print-subtitle">Case # Case-9</div></div></div>`);
+    setFormsDisplayName(app, '  Summit County <SAR> ');
+    assert.strictEqual(app.getFormsDisplayName(), 'Summit County <SAR>', 'the typed display name wins, trimmed');
+    assert.strictEqual(app.getCasePrintoutTitleRowHTML(legacy, 'Case-9'),
+        `<div class="print-title-row">${LOGO_IMG}<div class="print-title-block"><h1>Summit County &lt;SAR&gt;</h1><div class="print-subtitle">Case # Case-9</div></div></div>`,
+        'display name (escaped) as the title, case # as the subtitle, both right of the logo');
+    setFormsDisplayName(app, '');
+    assert.strictEqual(app.getFormsDisplayName(), 'tester', 'clearing the name falls back to the username');
+
     app.saveUserAsset('logo', 'data:image/png;base64,"><script>x</script>', 'evil.png');
     const evil = app.getPrintLogoHTML(app.loadBundle());
     assert.ok(!evil.includes('<script>'), 'the logo address is attribute-escaped');
@@ -257,14 +290,33 @@ function allPrintouts(app) {
     assert.ok(out.allTeamReports.includes(`<div class="print-title-row">${LOGO_IMG}<h1>Team Activity Report: Alpha</h1></div>`));
     assert.ok(out.allMemberReports.includes(`<div class="print-title-row">${LOGO_IMG}<h1>Member Activity Report: Chris Ray</h1></div>`));
 
-    // The whole Case # Printout: top row of the first page, the Activity Log
-    // page and each task form; the IC Report block inside page one has no
-    // second logo of its own.
-    assert.ok(out.caseFile.includes(`<div class="print-title-row">${LOGO_IMG}<h1>Search Log: Case-9</h1></div>`), 'the case printout opens with logo + title');
+    // The whole Case # Printout: the window is titled "Case # Printout"; the
+    // first page opens with the 150 px logo, the display name (the login
+    // username here) and "Case # Case-9" under it; the Activity Log page has
+    // the logo + title row; each task form carries the 50 px logo; the IC
+    // Report block inside page one has no second logo of its own.
+    assert.ok(out.caseFile.includes('<title>Case # Printout - Case-9</title>'), 'the print window is the Case # Printout');
+    assert.ok(!out.caseFile.includes('Search File Printout'), 'no longer called Search File Printout');
+    assert.ok(out.caseFile.includes(`<div class="print-title-row">${LOGO_IMG}<div class="print-title-block"><h1>tester</h1><div class="print-subtitle">Case # Case-9</div></div></div>`),
+        'the case printout opens with logo, display name and case # subtitle');
     assert.ok(out.caseFile.includes(`<div class="print-title-row">${LOGO_IMG}<h1>Activity Log</h1></div>`), 'the Activity Log page has the logo too');
     assert.ok(out.caseFile.includes('<h2 class="ic-report-title">IC Report</h2>'));
-    assert.strictEqual(countOf(out.caseFile, LOGO_IMG), 2 + 2, 'Search Log page + Activity Log page + one per task form');
+    assert.strictEqual(countOf(out.caseFile, LOGO_IMG), 2, 'one 150 px logo each on the first page and the Activity Log page');
+    assert.strictEqual(countOf(out.caseFile, SMALL_LOGO_IMG), 2, 'one 50 px logo per task form');
+    const caseHeaders = out.caseFile.match(/<div class="form-header">([\s\S]*?)<\/div>/g) || [];
+    assert.strictEqual(caseHeaders.length, 2, 'both task forms are in the case printout');
+    caseHeaders.forEach((h) => {
+        assert.ok(h.indexOf(SMALL_LOGO_IMG) > -1 && h.indexOf(SMALL_LOGO_IMG) < h.indexOf('Task Assignment Form'),
+            'the small logo sits left of the form title in the same header row');
+    });
     assert.ok(out.caseFile.indexOf(LOGO_IMG) < out.caseFile.indexOf('class="charts-container"'), 'the logo row is the first thing on the page');
+
+    // A typed Forms Display Name replaces the username on the first page.
+    setFormsDisplayName(app, 'Summit County SAR');
+    const named = capture(app, () => app.printSearchFile());
+    assert.ok(named.includes(`<div class="print-title-row">${LOGO_IMG}<div class="print-title-block"><h1>Summit County SAR</h1><div class="print-subtitle">Case # Case-9</div></div></div>`),
+        'the display name from Settings is the title of the case printout');
+    assert.ok(!named.includes('<h1>tester</h1>'));
 }
 
 // --- 3. Without a logo: the same printouts, title row without an image ------
@@ -278,7 +330,8 @@ function allPrintouts(app) {
         assert.ok(!html.includes('print-logo" src'), `${name}: no logo image when the login has none`);
         assert.ok(html.includes('<div class="print-title-row"><h') || html.includes('<div class="form-header">'), `${name}: the title row is still there`);
     });
-    assert.ok(out.caseFile.includes('<h1>Search Log: Case-9</h1>'));
+    assert.ok(out.caseFile.includes('<div class="print-title-row"><div class="print-title-block"><h1>tester</h1><div class="print-subtitle">Case # Case-9</div></div></div>'),
+        'display name over case #, no image');
     assert.ok(out.caseFile.includes('<h1>Activity Log</h1>'));
     assert.ok(out.icReport.includes('<h2 class="ic-report-title">IC Report</h2>'));
     assert.ok(out.singleForm.includes('<span class="form-header-title" style="font-weight: bold; font-size: 16pt;">Task Assignment Form</span>'));

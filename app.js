@@ -13312,16 +13312,38 @@ function getLogoImageSource(bundle) {
 // shows (getLogoImageSource), so the print window - an about:blank page -
 // gets it as a data: URL or as an absolute address, never as a path relative
 // to a page it does not have.
+//
+// The Case # Printout (Home page) is the exception in two ways: its first page
+// opens with the logo, the login's "Forms Display Name" (Settings; the login
+// username until one is typed) as the title and the CASE # as a subtitle under
+// it, both left-aligned beside the logo (getCasePrintoutTitleRowHTML); and the
+// Task Assignment Forms inside it carry the logo at 50 px, not 150 px, so the
+// form header stays one line (PRINT_LOGO_SMALL_WIDTH_PX).
 // ---------------------------------------------------------------------------
 const PRINT_LOGO_WIDTH_PX = 150;
+const PRINT_LOGO_SMALL_WIDTH_PX = 50;
 
 const PRINT_LOGO_STYLES = `
     .print-title-row { display: flex; align-items: center; gap: 15px; border-bottom: 2px solid #000; margin: 0 0 15px 0; padding-bottom: 5px; page-break-inside: avoid; }
     .print-title-row h1, .print-title-row h2 { flex: 1; border-bottom: none; margin: 0; padding-bottom: 0; }
+    .print-title-row .print-title-block { flex: 1; display: flex; flex-direction: column; align-items: flex-start; text-align: left; min-width: 0; }
+    .print-title-row .print-title-block h1 { flex: none; width: 100%; }
+    .print-title-row .print-subtitle { font-size: 13pt; font-weight: 600; color: #333; margin: 3px 0 0 0; }
     .print-logo { flex: 0 0 ${PRINT_LOGO_WIDTH_PX}px; width: ${PRINT_LOGO_WIDTH_PX}px; max-width: ${PRINT_LOGO_WIDTH_PX}px; height: auto; object-fit: contain; display: block; }
+    .print-logo.print-logo-small { flex: 0 0 ${PRINT_LOGO_SMALL_WIDTH_PX}px; width: ${PRINT_LOGO_SMALL_WIDTH_PX}px; max-width: ${PRINT_LOGO_SMALL_WIDTH_PX}px; }
     .form-header { align-items: center; gap: 15px; }
     .form-header .form-header-title { flex: 1; }
 `;
+
+// The name printed as the title of the Case # Printout: the login's "Forms
+// Display Name" preference (Settings page), else the login username, else ''.
+function getFormsDisplayName() {
+  const prefs = getUserPreferences();
+  const own = typeof prefs.formsDisplayName === 'string' ? prefs.formsDisplayName.trim() : '';
+  if (own) return own;
+  const creds = getUserCredentials();
+  return creds && creds.name ? String(creds.name).trim() : '';
+}
 
 // The logo address for a print window, or '' when the login has none.
 function getPrintLogoSource(bundle) {
@@ -13336,11 +13358,14 @@ function getPrintLogoSource(bundle) {
   }
 }
 
-// `<img class="print-logo">` for the printouts, or '' without a logo.
-function getPrintLogoHTML(bundle) {
+// `<img class="print-logo">` for the printouts, or '' without a logo. `widthPx`
+// is 150 (the default) or PRINT_LOGO_SMALL_WIDTH_PX for the small variant.
+function getPrintLogoHTML(bundle, widthPx = PRINT_LOGO_WIDTH_PX) {
   const src = getPrintLogoSource(bundle);
   if (!src) return '';
-  return `<img class="print-logo" src="${escapeIcReportHtml(src)}" alt="" width="${PRINT_LOGO_WIDTH_PX}">`;
+  const small = widthPx === PRINT_LOGO_SMALL_WIDTH_PX;
+  const className = small ? 'print-logo print-logo-small' : 'print-logo';
+  return `<img class="${className}" src="${escapeIcReportHtml(src)}" alt="" width="${small ? PRINT_LOGO_SMALL_WIDTH_PX : PRINT_LOGO_WIDTH_PX}">`;
 }
 
 // The top row of a printout: logo (left) and title (right) in one row.
@@ -13350,6 +13375,17 @@ function getPrintTitleRowHTML(bundle, titleHtml, options = {}) {
   const level = options.tag === 'h2' ? 'h2' : 'h1';
   const classAttr = options.className ? ` class="${escapeIcReportHtml(options.className)}"` : '';
   return `<div class="print-title-row">${getPrintLogoHTML(bundle)}<${level}${classAttr}>${titleHtml}</${level}></div>`;
+}
+
+// The top row of the Case # Printout: logo (left), then the login's Forms
+// Display Name as the title with "Case # <number>" as a smaller subtitle under
+// it - one above the other, both left-aligned, right of the logo. Without a
+// display name (and no login username) the title reads "Case # Printout".
+function getCasePrintoutTitleRowHTML(bundle, caseNumber) {
+  const displayName = getFormsDisplayName();
+  const title = escapeIcReportHtml(displayName || 'Case # Printout');
+  const subtitle = escapeIcReportHtml(`Case # ${String(caseNumber || '').trim()}`.trim());
+  return `<div class="print-title-row">${getPrintLogoHTML(bundle)}<div class="print-title-block"><h1>${title}</h1><div class="print-subtitle">${subtitle}</div></div></div>`;
 }
 
 function applyLogo(bundle) {
@@ -13657,6 +13693,36 @@ function buildSettingsPage() {
       saveBundle(nextBundle);
       persistLoginPreference('parCheckFrequency', val);
       status.textContent = `Par check frequency updated to ${val} minutes.`;
+    };
+  }
+
+  // Forms Display Name: the title of the Case # Printout (getFormsDisplayName).
+  // A login preference only - it is the login's name, not case data - so it is
+  // kept in the preference record and never on the bundle. The placeholder
+  // shows the login username that is printed until a name is typed.
+  const formsDisplayNameInput = document.getElementById('forms-display-name-input');
+  if (formsDisplayNameInput) {
+    const creds = getUserCredentials();
+    const loginName = creds && creds.name ? String(creds.name).trim() : '';
+    const storedName = getUserPreferences().formsDisplayName;
+    formsDisplayNameInput.value = typeof storedName === 'string' ? storedName : '';
+    if (loginName) formsDisplayNameInput.placeholder = loginName;
+    formsDisplayNameInput.onchange = () => {
+      const previous = getFormsDisplayName();
+      const next = String(formsDisplayNameInput.value || '').trim().slice(0, 120);
+      formsDisplayNameInput.value = next;
+      const saved = saveUserPreferences({formsDisplayName: next});
+      const shown = next || loginName;
+      if (shown !== previous) {
+        const nextBundle = loadBundle();
+        logSettingChange('Forms display name', previous || '(none)', shown || '(none)', nextBundle);
+        saveBundle(nextBundle);
+      }
+      status.textContent = saved === null && !_serverSettingsLoaded
+        ? 'The display name could not be saved yet: the server settings have not been read.'
+        : (next
+          ? `Printouts will show "${next}" as the display name.`
+          : `Printouts will show your login username${loginName ? ` "${loginName}"` : ''} as the display name.`);
     };
   }
 
@@ -16251,8 +16317,11 @@ const TASK_FORM_PRINT_STYLES = `
     }
 `;
 
-// `bundle` supplies the login's logo for the form header (see getPrintLogoHTML).
-function getTaskFormPrintHTML(num, f, bundle) {
+// `bundle` supplies the login's logo for the form header (see getPrintLogoHTML);
+// `options.logoWidth` picks its size - 150 px on its own, 50 px
+// (PRINT_LOGO_SMALL_WIDTH_PX) inside the Case # Printout.
+function getTaskFormPrintHTML(num, f, bundle, options = {}) {
+    const logoWidth = options.logoWidth === PRINT_LOGO_SMALL_WIDTH_PX ? PRINT_LOGO_SMALL_WIDTH_PX : PRINT_LOGO_WIDTH_PX;
     const members = (f.teamMembers || []).map(m => {
         const details = [];
         if (m.leader) details.push('L');
@@ -16277,7 +16346,7 @@ function getTaskFormPrintHTML(num, f, bundle) {
     return `
                 <div class="task-form">
                     <div class="form-header">
-                        ${getPrintLogoHTML(bundle)}<span class="form-header-title" style="font-weight: bold; font-size: 16pt;">Task Assignment Form</span>
+                        ${getPrintLogoHTML(bundle, logoWidth)}<span class="form-header-title" style="font-weight: bold; font-size: 16pt;">Task Assignment Form</span>
                         <span style="font-weight: bold; font-size: 16pt;">Task # ${num}</span>
                     </div>
                     
@@ -16458,7 +16527,7 @@ function printSearchFile() {
     const forms = bundle.forms || {};
     const taskFormsHTML = Object.keys(forms)
         .sort((a, b) => parseInt(a) - parseInt(b))
-        .map(num => `<div class="print-section">${getTaskFormPrintHTML(num, forms[num], bundle)}</div>`)
+        .map(num => `<div class="print-section">${getTaskFormPrintHTML(num, forms[num], bundle, {logoWidth: PRINT_LOGO_SMALL_WIDTH_PX})}</div>`)
         .join('');
     const icReportHTML = getIcReportPrintHTML(bundle);
     // The Incident Times Report, compactly (only members/days with times).
@@ -16474,7 +16543,7 @@ function printSearchFile() {
 <!DOCTYPE html>
 <html lang="en">
 <head>
-    <title>Search File Printout - ${fileName}</title>
+    <title>Case # Printout - ${escapeIcReportHtml(fileName)}</title>
     <style>
         @page { size: auto; margin: 10mm; }
         body { font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif; font-size: 11pt; color: #000; background: #fff; margin: 0; padding: 0; }
@@ -16532,7 +16601,7 @@ function printSearchFile() {
     <div class="print-container">
         <!-- Search Log & Charts -->
         <div class="print-section">
-            ${getPrintTitleRowHTML(bundle, `Search Log: ${escapeIcReportHtml(fileName)}`)}
+            ${getCasePrintoutTitleRowHTML(bundle, fileName)}
             
             <div class="charts-container">
                 <div class="chart-item">
