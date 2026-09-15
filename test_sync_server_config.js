@@ -14,10 +14,11 @@
 //     Proxy Settings" section and app.js no longer carries their wiring - the
 //     login popup's "Set Server" is the only way to switch servers.
 //   * After the login is verified the popup asks WHO is at the device: the
-//     personnel stored under the login (server table `personnel`, the open
-//     case first), with "Anonymous" as the default and the Super Admin offered
-//     but never presumed. A tab without a pick works as Anonymous; "Switch
-//     User" opens the picker.
+//     login's users (GET /api/auth/users, see test_login_users.js) plus the
+//     personnel stored under the login in ANY case (server table `personnel`,
+//     never restricted to one case), with "Anonymous" as the default and the
+//     Super Admin offered but never presumed. A tab without a pick works as
+//     Anonymous; "Switch User" opens the picker.
 //
 // Run with: node test_sync_server_config.js
 
@@ -406,33 +407,47 @@ const check = async (name, fn) => {
             'a login without personnel still gets the two stand-ins');
     });
 
-    await check('the personnel are read from the server under the login: the open case first, every case as a fallback', async () => {
+    await check('the people are read from the server under the login only: its user list plus its personnel in EVERY case, never one case', async () => {
         const app = createSandbox({cookies: {'sar-user-name-v1': 'tester', 'sar-user-password-v1': '1234', 'sar-sync-url-config-v1': PUBLISHED_URL}});
         const asked = [];
         app.fetch = (url, init = {}) => {
             asked.push(String(url));
             if (String(url).includes('/api/auth/settings')) return jsonResponse({success: true});
-            if (String(url).includes('/api/v1/tables/personnel?case=CASE-1')) {
+            if (String(url).includes('/api/auth/users?_=')) {
                 assert.strictEqual((init.headers || {})['X-User-Name'], 'tester', 'the read is authenticated');
-                return jsonResponse([]);
+                return jsonResponse({users: [
+                    {username: 'Zoe', pin: '1401', color: 'blue', theme: 'light'},
+                    {username: 'Gone', pin: '1402', removed: true}
+                ]});
             }
             if (String(url).includes('/api/v1/tables/personnel?_=')) {
-                return jsonResponse([{label: 'Alex', data: ['Alex', '', '', '', '', '', '', '', '1400'], search_case: 'CASE-0'}]);
+                assert.strictEqual((init.headers || {})['X-User-Name'], 'tester', 'the read is authenticated');
+                return jsonResponse([
+                    {label: 'Alex', data: ['Alex', '', '', '', '', '', '', '', '1400'], search_case: 'CASE-0'},
+                    {label: 'Gone', data: ['Gone', '', '', '', '', '', '', '', '1402'], search_case: 'CASE-0'},
+                    {label: 'zoe', data: ['zoe', '', '', '', '', '', '', '', '1409'], search_case: 'CASE-2'}
+                ]);
             }
             return Promise.reject(new TypeError('Failed to fetch'));
         };
         await app.setSyncBucket('CASE-1');
         const choices = plain(await app.fetchLoginProfileChoices());
+        assert.ok(!asked.some(u => u.includes('case=')), 'no read is restricted to the open case');
         const personnelCalls = asked.filter(u => u.includes('/api/v1/tables/personnel'));
-        assert.strictEqual(personnelCalls.length, 2, 'the case-scoped read came back empty, so every case was asked');
-        assert.ok(personnelCalls[0].startsWith(`${PUBLISHED_URL}/api/v1/tables/personnel?case=CASE-1&_=`), personnelCalls[0]);
-        assert.ok(personnelCalls[1].startsWith(`${PUBLISHED_URL}/api/v1/tables/personnel?_=`), personnelCalls[1]);
-        assert.deepStrictEqual(choices.map(c => c.user.username), ['Anonymous', 'Alex', 'Super Admin']);
+        assert.strictEqual(personnelCalls.length, 1);
+        assert.ok(personnelCalls[0].startsWith(`${PUBLISHED_URL}/api/v1/tables/personnel?_=`), personnelCalls[0]);
+        assert.strictEqual(asked.filter(u => u.includes('/api/auth/users')).length, 1, 'the login\'s user list is read');
+        assert.deepStrictEqual(choices.map(c => c.user.username), ['Anonymous', 'Alex', 'Zoe', 'Super Admin'],
+            'the login\'s users and the personnel of other cases, a removed user never');
+        assert.deepStrictEqual(choices.map(c => c.user.pin), ['anonymous', '1400', '1401', '1976'], 'the list\'s PIN wins over a case row');
+        assert.strictEqual(choices[2].user.color, 'blue');
+        assert.strictEqual(choices[2].user.theme, 'light');
 
         const loggedOut = createSandbox();
         let fetched = 0;
         loggedOut.fetch = () => { fetched++; return jsonResponse([]); };
         assert.strictEqual((await loggedOut.fetchLoginProfilePersonnel()).length, 0, 'nothing is read without credentials');
+        assert.strictEqual((await loggedOut.loadLoginUsers()).length, 0);
         assert.strictEqual(fetched, 0);
     });
 

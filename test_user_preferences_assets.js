@@ -571,7 +571,7 @@ const run = async () => {
     await check('the logo and background come from the login\'s stored images, and the boot overlay is lifted', async () => {
         assert.strictEqual(settings.__dom.logo.src, LOGO_DATA, 'the header logo is applied on load (it used to be lost on refresh)');
         assert.strictEqual(settings.__dom.logo.style.display, '');
-        assert.ok(String(settings.document.body.style.backgroundImage).includes(BG_DATA), 'the uploaded background photo is used instead of the default');
+        assert.ok(String(settings.__html.style.getPropertyValue('--sar-background-image')).includes(BG_DATA), 'the uploaded background photo is used instead of the default');
         await waitFor(() => !settings.__html.classList.contains('sar-booting'), 'the boot overlay to be removed');
         assert.strictEqual(settings.__cookies['sar-ui-hint'], 'dark,geek,pad67', 'the hint for the next page load names the applied theme, Geek Mode and its padding reduction');
         assert.strictEqual(settings.__html.style.getPropertyValue('--geek-space-scale'), '0.33', 'a login without a stored percentage gets the one-third default');
@@ -763,7 +763,7 @@ const run = async () => {
         const input = settings.__byId['bg-image-input'];
         input.files = [{name: 'hills.jpg', dataUrl: BG_DATA}];
         await input.onchange();
-        assert.ok(String(settings.document.body.style.backgroundImage).includes(BG_DATA));
+        assert.ok(String(settings.__html.style.getPropertyValue('--sar-background-image')).includes(BG_DATA));
         assert.strictEqual(userAssets.get(`${USER}\u0000background`).data, BG_DATA);
     });
 
@@ -771,7 +771,7 @@ const run = async () => {
         const again = createSandbox({baseUrl, cookies: {'sar-ui-hint': settings.__cookies['sar-ui-hint']}});
         await loadPage(again);
         assert.strictEqual(again.__dom.logo.src, LOGO_DATA, 'the logo survives the refresh');
-        assert.ok(String(again.document.body.style.backgroundImage).includes(BG_DATA));
+        assert.ok(String(again.__html.style.getPropertyValue('--sar-background-image')).includes(BG_DATA));
         await waitFor(() => !again.__html.classList.contains('sar-booting'), 'the boot overlay to be removed');
         // The fake DOM cannot host every widget and the CalTopo proxy is
         // unreachable here; only failures of the features under test count.
@@ -785,7 +785,7 @@ const run = async () => {
         assert.strictEqual(settings.__dom.logo.style.display, 'none');
         await settings.__byId['reset-bg-btn'].onclick();
         assert.ok(!userAssets.has(`${USER}\u0000background`), 'the background row is gone');
-        assert.ok(String(settings.document.body.style.backgroundImage).includes('assets/us-night.jpg'), 'back to the default photo');
+        assert.ok(String(settings.__html.style.getPropertyValue('--sar-background-image')).includes('assets/us-night.jpg'), 'back to the default photo');
         const again = createSandbox({baseUrl});
         await loadPage(again);
         assert.strictEqual(again.__dom.logo.style.display, 'none', 'no logo after a refresh either');

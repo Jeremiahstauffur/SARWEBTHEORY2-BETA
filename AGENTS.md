@@ -85,7 +85,7 @@ in the repo are PowerShell (`update_nav.ps1`).
 | `page3` | `page3.html` | Personnel |
 | `page4` | `page4.html` | Search Log |
 | `page5` | `page5.html` | Forms |
-| `page10` | `page10.html` | Maps |
+| `page10` | `page10.html` | Maps (CalTopo map; the Incident page's LPB section beside it, see §3) |
 | `page7` | `page7.html` | Uploads |
 | `page8` | `page8.html` | Users / profile editor (`?tab=manage`) |
 | `settings` | `settings.html` | Settings |
@@ -139,7 +139,7 @@ bundle = {
   forms, activity_log; `SINGLE_TABLES` = profile, settings_page, lost_person_behavior. Plus
   `activity_log_entries`, `declined_assignment_features`, `lpb_ipp` (the case's IPP, derived from the
   bundle section by `syncLostPersonIppTable`), `user_assets`, `users`, `user_settings`, `user_buckets`,
-  `store`. Not per case: `lpb_default_distances` (category × terrain miles, **edited by hand in the DB**,
+  `store`. Not per case: `login_users` (the login's people, see below), `lpb_default_distances` (category × terrain miles, **edited by hand in the DB**,
   seeded 0.5/1.0/1.5/2.0) and `lpb_user_distances` (a login's edited values, username only). Both
   distance tables have `id` — a unique **five-digit** `AUTO_INCREMENT` primary key from `LPB_FIRST_ROW_ID`
   (10000) — with the old composite key kept as a `UNIQUE KEY`; `ensureLpbRowIds` adds/repairs it on every
@@ -159,9 +159,18 @@ bundle = {
   else name) the factor is 1. A bracket whose distance is not beyond the previous one has no rate
   (`null`, adds nothing) — never a division by zero. The **case** holds its own copy of the four
   distances per category (seeded from the login's `lpb_user_distances` ∪ defaults when a category is
-  switched on / terrain changes) so every device computes the same PSR. Plans:
+  switched on / terrain changes) so every device computes the same PSR. The section is **one component
+  on two pages**: `buildLostPersonBehaviorSection(container)` renders it (as `#lpb-section`) under the
+  profile form on the Incident page and into `#map-lpb-scroll` on the Maps page — the **left** half of the
+  screen-wide `.map-lpb-row`, the CalTopo map being the right half (`buildMapsPage`; row shown only with
+  a map; column as tall as the map, scrolling inside itself; stacked under 860 px). Every change —
+  `updateLostPersonBehavior` (both pages) and the Segments switch `setLpbPsrAdjustmentEnabled` — goes
+  through `saveLostPersonBehaviorChange`: deferred save → `recalculateEverything({colorSyncDelay: 0})`,
+  so PSRi/PSRc are recomputed **at once** (one row batch: section + log entry + recomputed rows) and the
+  CalTopo color push is asked for immediately (still gated by the cooldown). Plans:
   `.junie/plans/lost-person-behavior-psr-adjustment.md` (section, tables),
-  `.junie/plans/lpb-categories-per-mile-psr.md` (category list, per-mile maths, multi-category sum).
+  `.junie/plans/lpb-categories-per-mile-psr.md` (category list, per-mile maths, multi-category sum,
+  Maps page column, recalculation on change).
 - **Geek Mode** is *not* a bundle key. It lives in the login's `user_settings` preference record
   (`sar-user-preferences-v1`) **per user account**: `geekModeByUser[<getAccountName>] = {enabled,
   paddingPercent}`, with the login-level `geekMode` / `geekPaddingPercent` as the fallback for an
@@ -185,11 +194,23 @@ bundle = {
   The CalTopo proxy is always `<sync server>/api/proxy` (`getCalTopoProxy()`, derived on every call).
   The Settings page has no server/proxy section: switching servers = log out → login popup → "Set Server".
   Plan: `.junie/plans/caltopo-sync-variable-and-login-profile-pick.md`.
+- **The login's users belong to the login, not to a CASE #.** Table `login_users` (one row per login
+  username + lower-cased name: `pin, handle, color, theme, is_file_manager, removed` + `record` JSON),
+  `GET/PUT /api/auth/users` (verified credentials only; PUT upserts by name, **never deletes** — a removal
+  is `removed: true`). `app.js` "The login's users" section: `loadLoginUsers()` right after
+  `loadServerSettings()`, `applyLoginUsersToBundle()` lays the list over the open case **before drawing**
+  (`bundle.accounts` = Super Admin + login users; every user gets a Personnel row — `Off Duty`, not on
+  scene, PIN-linked — rows of removed users go), `syncLoginUsersFromBundle()` inside `saveBundle`
+  writes back every account change (a name typed on Personnel becomes a user). `removeLoginUser()`
+  (Users page "Remove", Personnel row delete) flags + drops; `noteLoginUserRename()` retires the old
+  name. `bundle.accounts` is therefore a **per-case mirror** of the login's list, not the source. Only
+  a user's Personnel row (team/status/times) is per case. Plan: `.junie/plans/login-wide-users.md`.
 - **Who is at the device** (`sessionStorage['sar-current-user']`) is picked right after login
-  (`showLoginProfilePopup`): the login's personnel from `GET /api/v1/tables/personnel[?case=]`, with the
-  virtual **"Anonymous"** (`createAnonymousUser()`, pin `anonymous`, not in `bundle.accounts`) as the
-  default and the Super Admin offered but never presumed. A tab with no pick works as Anonymous;
-  "Switch User" (`requestUserSwitch()`, flag `sar-open-user-popup`) opens the in-page picker.
+  (`showLoginProfilePopup`): the login's users (`GET /api/auth/users`) ∪ the login's personnel in **every**
+  case (`GET /api/v1/tables/personnel`, never `?case=`), with the virtual **"Anonymous"**
+  (`createAnonymousUser()`, pin `anonymous`, not in `bundle.accounts`) as the default and the Super Admin
+  offered but never presumed. A tab with no pick works as Anonymous; "Switch User"
+  (`requestUserSwitch()`, flag `sar-open-user-popup`) opens the in-page picker.
 
 **Nothing is persisted on the device.** The case lives in memory for the page lifetime; the device
 keeps only login cookies/sessionStorage and the sync-server URL cookies (the "Set Server" choice and
@@ -232,7 +253,7 @@ Server-side rules: every read/write filters by `req.user.username` (auth headers
 overwritten/deleted by the Super-Admin (403 otherwise). `DELETE /api/v1/:bucket` removes store rows,
 `user_buckets` history and every structured table for that case — even if the bundle is unreadable.
 
-Key endpoints: `/api/auth/{register,login,history,settings,assets[/:kind]}`,
+Key endpoints: `/api/auth/{register,login,history,settings,users,assets[/:kind]}`,
 `/api/v1/:bucket/{rows,state,activity,declined-assignments,page/:page,all-files,latest,:key}`,
 `/api/v1/tables[/:table]?case=`, `GET/PUT /api/lpb/distances` (login-scoped LPB distance defaults +
 overrides), `GET /api/config` (public, `no-store`: the `CALTOPO_SYNC` sync-server address the website is
@@ -245,7 +266,7 @@ to use, read from `process.env` per request), `/api/health` (also carries it), `
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260917`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260919`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
 - **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
@@ -436,6 +457,65 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   non-increasing distance pair yields `ratePercentPerMile: null` rather than `Infinity`. The Segments
   page tag now reads `+13.2%` (total gain) with the per-category breakdown in the tooltip.
   (plan: `lpb-categories-per-mile-psr.md`)
+- **2026-09-14 — LPB section beside the map (Maps page), full-screen row; PSRc stale after LPB edits.**
+  (1) A block that must be wider than `<main>` (1200 px) is broken out with `margin-left: calc(50% -
+  W / 2); width: W` — but `W = 100vw` counts the vertical scrollbar on Windows and leaves a horizontal
+  scrollbar behind. Rule: `W = var(--sar-viewport-width, 100vw)`, written on `<html>` by
+  `syncViewportWidthVariable()` from `documentElement.clientWidth` and kept current by a
+  `ResizeObserver` on `<html>` (a `resize` event does not fire when the scrollbar appears). (2) A
+  `.table-card` is `overflow-x: auto`; a card that must scroll *inside* needs its own `overflow: hidden`
+  + a flex column with a `min-height: 0; overflow-y: auto` child, and no `overscroll-behavior` (the page
+  must scroll on once the column ends). (3) A half-screen column cannot use the viewport media queries —
+  `.map-lpb-panel` is a query container (`container: map-lpb / inline-size`; safe because popups live on
+  `<body>`) and `@container map-lpb (max-width: 620px)` repeats the LPB 768 px compact rules. (4) LPB
+  edits used to leave PSRi/PSRc (and the CalTopo colors) stale until some page ran
+  `recalculateEverything()`. Rule: whatever changes an *input* of the PSR maths recomputes right there —
+  `saveLostPersonBehaviorChange` (`saveBundle(b, true)` → `recalculateEverything({colorSyncDelay: 0})`
+  → flush), never a bare `saveBundle`. Test traps: in the fake DOM find a control by its handler
+  (`typeof el.onchange === 'function'` minus `.lpb-terrain-select`), not by position; a static "no
+  overscroll-behavior" assertion must scan the rule blocks, not the file (the comment says the word).
+  Tests: `test_lost_person_behavior.js` (Maps render, stylesheet pins), `test_caltopo_color_sync_schedule.js`
+  (LPB change → PSRc at once, push at `now` outside the cooldown / at its end inside).
+  (plan: `lpb-categories-per-mile-psr.md`, Steps 4–5)
+- **2026-09-14 — Background photo scrolled away; a white sheet slid up (light mode).** Cause: the photo
+  was `body`'s own background with `background-attachment: fixed`, but `html, body { height: 100% }`
+  makes the body box one viewport tall and `<html>` has its own canvas colour (`theme-boot.js`), so
+  below the first viewport the html canvas (`#f4f7fb` / `#071022`) showed through. Rule: the page
+  background is the fixed, full-viewport `body::before` (photo, from `--sar-background-image` on
+  `<html>`, default `assets/us-night.jpg`) plus `body::after` (the `--bg-dim-*` tint), both `z-index: -1`
+  and hidden in `@media print`; `applyBackground()` sets the custom property, never
+  `body.style.backgroundImage`. Do not put a stacking context (`position`/`z-index`, `transform`,
+  `filter`) on `body` or the `-1` layers would paint over the content. `test_user_preferences_assets.js`
+  asserts on `documentElement.style.getPropertyValue('--sar-background-image')`.
+- **2026-09-14 — Login logo on every printout.** All seven print windows (`printSingleTaskForm`,
+  `downloadAllForms`, `printIcReport`, `printIncidentTimesReport`, `printCurrentReport`,
+  `printAllReports`, `printSearchFile`) now open with `getPrintTitleRowHTML(bundle, title)` — the
+  login's logo (`getPrintLogoHTML`, 150 px = `PRINT_LOGO_WIDTH_PX`) left of the `<h1>` in one flex row
+  (`PRINT_LOGO_STYLES`, appended to `TASK_FORM_PRINT_STYLES` and the three inline style blocks); the
+  Task form header got a third child (`getTaskFormPrintHTML(num, f, bundle)` — pass the bundle). Traps:
+  (1) a print window is `about:blank`, so a legacy `bundle.logo` path is made absolute
+  (`getPrintLogoSource`) — only the login's data: URL asset (`getLogoImageSource`) is used as is;
+  (2) `_memoryStorage` is now seeded through `window.SAR_MEMORY_STORAGE` — a vm sandbox that only fakes
+  `localStorage` (as `test_ic_report.js` still does) gets an empty `loadBundle()`, which is that suite's
+  pre-existing `No case selected` failure; (3) top-level `const`s of `app.js` are not sandbox properties —
+  read them with `vm.runInContext('NAME', sandbox)`. Test: `test_print_logo.js`.
+- **2026-09-14 — "Not all users were loaded" — users moved from the case to the login.** Symptom: the
+  post-login picker showed only the open case's personnel. Cause: users lived in `bundle.accounts`
+  (per case) and the picker read `/api/v1/tables/personnel?case=` first. Rules: (1) the list is
+  login-scoped (`login_users`, §3) and the case only mirrors it; anything that reads `bundle.accounts`
+  as the source of truth is now reading a copy. (2) The overlay must run **only on a case that really is
+  in memory for the open bucket** (`caseInMemory` in `DOMContentLoaded`) — running it on the empty
+  stand-in a failed read leaves behind would seed a blank case with every user. (3) Deleting a person's
+  Personnel row alone is not enough: `applyLoginUsersToBundle` puts the row back next load, so the delete
+  must also `removeLoginUser()`, and the removal must also clear `permanentPersonnel[name]` or
+  `syncPersonnelData` re-creates the row. (4) PIN uniqueness is per login: a case from before the list
+  may have handed Bob the PIN that Zoe owns login-wide — claim rows by PIN **only when the row is not
+  named after another present user**, then by name (`test_login_users.js` "PIN clash"). A removed
+  record's PIN is free again (that is how a rename keeps its PIN). (5) `saveBundle` static guard:
+  `test_row_level_sync.js` expects `pushBundleDelta(sanitized)` within 600 chars of `function saveBundle`
+  — put explanations in the block comment above the function, not inline. (6) Two devices opening a case
+  at once both append the same blank row; the overlay drops a second *blank* copy (`isBlankLoginUserRow`)
+  and never a worked-on one. (plan: `login-wide-users.md`)
 
 ---
 
@@ -456,7 +536,9 @@ Manual UI checks have no automation: state exactly what you clicked and on which
 - Two `patch*.js` families and scratch files clutter the root; safe to delete only with the user's OK.
 - **Pre-existing test failures (not caused by the LPB session, verified against `HEAD`):**
   `test_custom_search_task.js` ("segment sweep width is carried over like a normal search": `''` vs
-  `'40 ft'`) and `test_ic_report.js` ("the subtitle shows the case # without .json": `No case selected`).
+  `'40 ft'`) and `test_ic_report.js` ("the subtitle shows the case # without .json": `No case selected` —
+  its sandbox seeds a fake `localStorage`, but the case now lives in `_memoryStorage`; hand the store in
+  as `window.SAR_MEMORY_STORAGE` the way `test_print_logo.js` does to revive it).
   Neither is in `package.json` `scripts.test`, which is why `npm test` still passes.
 - Lost Person Behavior follow-ups: `lpb_default_distances` holds the 0.5/1.0/1.5/2.0 placeholders for
   all 41 categories × 4 terrains (164 rows, seeded on the next server start) until the planner enters
@@ -468,6 +550,13 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   added. The per-mile maths applies the request literally — a rate of 13.16 %/mi adds 13.16 % of the
   PSRi regardless of how far inside the bracket the segment lies (no distance weighting was asked for).
   A category that is on but missing a distance is skipped and named in the Segments status line.
+- Maps page LPB column follow-ups: under 860 px the columns stack in DOM order — the LPB section **above**
+  the map (flip with CSS `order` if the map should come first); the row is hidden when the case has no
+  map (the section is then only on the Incident page); a 20 px gutter is kept at the screen edges (none
+  under 600 px); before `buildMapsPage` runs the row is `100vw` wide (boot overlay hides it); container
+  queries need Chrome 105+/Safari 16+/Firefox 110+ — older browsers simply get the desktop rules in the
+  column. A full Maps page rebuild (`performSyncUIRefresh` after another device's change) resets the
+  column's scroll position and reloads the map iframe, as it always did for the map alone.
 - Segment centres come from the fetched CalTopo shape (`maps[0].features`); a segment typed by hand
   without a linked/like-named shape is never adjusted — the PSRi tooltip says so.
 - Geek Mode follow-ups: only the Segments, Personnel, Search Log, Incident (LPB heading/paragraph) and
@@ -488,10 +577,27 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   `.php` proxy path use them. A localhost page whose local server publishes a remote `CALTOPO_SYNC`
   will follow it (by design — the variable is authoritative).
 - Profile-pick follow-ups: Anonymous has no `bundle.accounts` record, so its theme/color/visible pages
-  are the defaults and the Users page only offers "Switch User" / "Log Out" for it. A personnel row that
-  exists in the structured table but not in the open case (picked from the "every case" fallback) is
-  matched by name/PIN on reload and otherwise behaves like Anonymous with that name in the log tag.
-  The picker shows *personnel names*; `bundle.accounts` handles are not consulted before the reload.
+  are the defaults and the Users page only offers "Switch User" / "Log Out" for it. A person offered
+  from the personnel table of another case (not yet in `login_users`) is adopted into the list only when
+  that case is next opened; until then the pick behaves like Anonymous with that name in the log tag.
+- Login-wide users follow-ups: (1) the `login_users` table is filled lazily — a login's old cases hand
+  their accounts to the list the first time each case is opened after this deploy (there is no one-off
+  migration); the picker bridges the gap with the personnel table. (2) Removal is *soft* (`removed`
+  flag) and other cases drop the person only when opened; the structured `personnel` table of a case
+  nobody opens still lists them. (3) A case's Personnel row is created for every user, so the Personnel
+  page of a login with many people gets long — no "hide Off Duty" filter was added. (4) `login_users` is
+  not in `COLLECTION_TABLES`/`SINGLE_TABLES` (it is per login, not per case) and not part of
+  `DELETE /api/v1/:bucket`. (5) The Users page "Remove" only shows for login users; the Super Admin stays
+  "Built-in". `data.php` knows nothing of `/api/auth/users`. (6) `npm test` now prints a few harmless
+  `[USERS] read failed: unhandled SQL in test stand-in … login_users` lines from older suites whose
+  mysql2 stand-ins do not model the table (the page tolerates the 500); teach their `query` stubs the
+  `SELECT … FROM \`login_users\`` shape to silence them.
+- Printout logo follow-ups: the logo is the *login's* header logo (`/api/auth/assets/logo`), so a device
+  that has not finished `loadUserAssets()` (or is offline with no cached asset) prints without it — no
+  "logo missing" hint is shown. In the Case # Printout the IC Report block on page one keeps its plain
+  title (the page's top row already carries the logo); only the stand-alone IC Report printout puts the
+  logo in the `IC Report` row (`getIcReportPrintHTML(bundle, {logo: true})`). The logo is placed at its
+  natural height for 150 px width; a very tall logo will make the title row tall (no `max-height`).
 
 ---
 

@@ -451,6 +451,54 @@ check('a heartbeat that changes a shape saves the case once and bumps updatedAt'
     assert.strictEqual(server.rows().length, rows, 'nothing saved by the heartbeat');
 });
 
+check('a Lost Person Behavior change (Incident / Maps page section, Segments switch) recomputes PSRc at once and asks for the push at the soonest the cooldown allows', async () => {
+    const {app, server, posted, clock} = await bootPage({page: 'page10'});
+    app.startCalTopoColorSyncTicker();
+    await clock.advance(600);
+    assert.strictEqual(posted.length, 2, 'the page load pushed');
+    const first = posted[0].at;
+    const psrc = () => plain(app.loadBundle().pages.page2.map(r => r[7]));
+    const before = psrc();
+    assert.ok(before[0] && before[0] === before[1], `both segments start with the same PSRc (${before})`);
+
+    // 12 s later (the cooldown is over) the planner imports the IPP at Seg A's
+    // centre and switches Hiker on - what the section's controls do on the
+    // Incident page and in its copy on the Maps page. Seg A sits in the 25 %
+    // bracket (25 % over 1 mi = 25 %/mi), Seg B is a few hundred miles away.
+    await clock.advance(12000);
+    const rowsBefore = server.rows().length;
+    app.updateLostPersonBehavior((lpb) => {
+        lpb.ipp = {featureId: 'ipp', featureName: 'IPP', lat: 2 / 3, lng: 1 / 3};
+        lpb.categories.hiker = {enabled: true, terrain: 'Mtn Temperate', distances: {p25: 1, p50: 2, p75: 3, p95: 4}};
+        return 'Hiker on';
+    });
+    const after = psrc();
+    assert.strictEqual(after[0], (parseFloat(before[0]) * 1.25).toFixed(4), 'Seg A gained 25 % of its PSRc the moment the section changed - no visit to the Segments page needed');
+    assert.strictEqual(after[1], before[1], 'Seg B, beyond the 95 % distance, is unchanged');
+    assert.strictEqual(app.getNextCalTopoColorSyncAt(), clock.now, 'the color push is asked for at once (delay 0): the cooldown is over, so it is due now');
+    await clock.advance(50);
+    assert.strictEqual(posted.length, 4, 'pushed straight away');
+    assert.strictEqual(posted[2].at, first + 12100, 'at the moment of the change (not 300 ms later)');
+    assert.deepStrictEqual(posted.slice(2).map(p => p.endpoint.split('/').pop()).sort(), ['cal-a', 'cal-b']);
+    const batch = server.rows().slice(rowsBefore).find(r => Array.isArray(r.json && r.json.changes) && r.json.changes.some(c => c.path[0] === 'lostPersonBehavior'));
+    assert.ok(batch, 'the section went to the server as a row batch');
+    assert.ok(batch.json.changes.some(c => c.path[0] === 'pages' && c.path[1] === 'page2'), 'in the same batch as the recomputed segment rows');
+    assert.ok(batch.json.changes.some(c => c.path[0] === 'activityLog'), 'with the log entry');
+
+    // Lifting the adjustment on the Segments page inside the cooldown: the
+    // values move back at once, the push waits for the end of the cooldown.
+    await clock.advance(3000);
+    await app.setLpbPsrAdjustmentEnabled(false);
+    assert.deepStrictEqual(psrc(), before, 'PSRc back to the plain values immediately');
+    assert.strictEqual(app.getNextCalTopoColorSyncAt(), first + 12100 + 10000, 'deferred to the end of the cooldown since the last push');
+    await clock.advance(6900);
+    assert.strictEqual(posted.length, 4, 'not before');
+    await clock.advance(200);
+    assert.strictEqual(posted.length, 6, 'pushed once the cooldown ended');
+    assert.strictEqual(posted[4].at, first + 22100);
+    assert.strictEqual(app.__logs.error.length, 0, 'no dialogs, no errors');
+});
+
 check('page load: pushes at once when the cooldown is over, otherwise at the end of the cooldown (sessionStorage clock)', async () => {
     const startAt = Date.UTC(2026, 8, 9, 12, 0, 0);
     // Last push 30 s ago -> the new page pushes right away.

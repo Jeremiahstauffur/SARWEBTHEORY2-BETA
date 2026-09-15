@@ -1,4 +1,5 @@
-// Lost Person Behavior (Incident page section + Segments page switch).
+// Lost Person Behavior (Incident page section, its copy beside the map on the
+// Maps page, Segments page switch).
 //
 // Part 1 checks the pure maths shared through map-segment-utils.js: the centre
 // of a CalTopo shape, the distance to the IPP, which 25/50/75/95 % bracket a
@@ -19,7 +20,10 @@
 //   - the login's edited distances go to PUT /api/lpb/distances and the
 //     defaults are read from GET /api/lpb/distances,
 //   - the Incident page section and the Segments table (with the bracket tags
-//     on the PSRi pills) render without errors.
+//     on the PSRi pills) render without errors,
+//   - the Maps page renders the same section in the left half of a
+//     screen-wide row, the map in the right half, and a switch flipped there
+//     changes the case (and the PSR values, at once) like on the Incident page.
 //
 // Run with: node test_lost_person_behavior.js
 
@@ -825,6 +829,97 @@ check('the Incident page section renders (heading with the IPP control, group ti
     const resets = walk(editedChart).filter(el => el.classList.contains('lpb-reset-btn'));
     assert.strictEqual(resets.length, 1, 'only the edited 50 % value has a reset button');
     assert.ok(/1.0 mi/.test(resets[0].title), 'the reset names the database default');
+});
+
+check('the Maps page shows the same section in the left half of a screen-wide row, the map in the right half, in a column that scrolls inside itself', async () => {
+    const server = createServer();
+    const app = createSandbox({store: seedStore({lpb: FULL_LPB}), fetch: server.fetch, page: 'page10'});
+    const main = makeElement();
+    app.document.querySelector = (selector) => (selector === 'main' ? main : null);
+    app.buildMapsPage();
+    await settle();
+    assert.deepStrictEqual(app.__logs.error, [], `no errors while rendering: ${app.__logs.error.join(' | ')}`);
+
+    // The row: the section's column first (left), the map second (right), the
+    // unaccounted features below the row.
+    const html = main.innerHTML;
+    const at = (marker) => html.indexOf(marker);
+    assert.ok(at('id="map-lpb-row"') !== -1 && at('id="map-lpb-panel"') !== -1 && at('id="map-lpb-scroll"') !== -1 && at('id="map-view-section"') !== -1, 'row, LPB column, its scroll area and the map card are rendered');
+    assert.ok(at('id="map-lpb-row"') < at('id="map-lpb-panel"') && at('id="map-lpb-panel"') < at('id="map-lpb-scroll"') && at('id="map-lpb-scroll"') < at('id="map-view-section"'), 'the LPB column comes before (left of) the map inside the row');
+    assert.ok(at('id="map-view-section"') < at('id="unaccounted-features-section"'), 'the unaccounted features follow the row');
+    assert.ok(/class="map-lpb-row"/.test(html) && /class="table-card map-lpb-panel"/.test(html) && /class="table-card map-lpb-map"/.test(html), 'the stylesheet hooks are in place');
+    assert.ok(!/id="map-view-section"[^>]*75vh/.test(html), 'the map card no longer sizes itself inline: the row sizes both columns');
+
+    // The section lands in the scroll area under its usual id, so every
+    // handler's renderLostPersonBehaviorSection() redraws it in place.
+    assert.ok(app.__byId['map-lpb-scroll'].children.some(el => el.classList.contains('lpb-section')), 'the section is appended to the scroll area');
+    const section = app.__byId['lpb-section'];
+    assert.ok(/Lost Person Behavior/.test(section.innerHTML) && /lpb-section-ipp/.test(section.innerHTML), 'the same heading with the IPP control');
+    const rows = section.children.filter(el => el.classList.contains('lpb-category'));
+    assert.strictEqual(rows.length, utils.LPB_CATEGORIES.length, 'one row per category');
+    assert.deepStrictEqual(section.children.filter(el => el.classList.contains('lpb-group-title')).map(el => el.textContent), utils.LPB_CATEGORY_GROUPS.map(g => g.title), 'the group titles');
+    const mental = rows.find(el => el.dataset.category === 'mentalIllness');
+    assert.ok(mental && !mental.classList.contains('collapsed') && walk(mental).some(el => el.classList.contains('lpb-chart')), 'Mental Illness is on, with its graph');
+    assert.ok(walk(section).some(el => el.classList.contains('lpb-ipp-pill')), 'the imported IPP pill');
+    assert.strictEqual(app.__byId['map-lpb-row'].style.display, '', 'the row is shown with the map (the inline display: none is lifted)');
+
+    // Flipping the switch in the Maps page copy changes the case exactly like on
+    // the Incident page - and the PSR values follow at once.
+    app.recalculateEverything();
+    assert.strictEqual(psri(app).Alpha, '11.2500');
+    const toggle = walk(mental).find(el => typeof el.onchange === 'function' && !el.classList.contains('lpb-terrain-select'));
+    assert.ok(toggle, 'the category switch');
+    toggle.checked = false;
+    await toggle.onchange();
+    await settle();
+    assert.strictEqual(app.loadBundle().lostPersonBehavior.categories.mentalIllness.enabled, false);
+    assert.strictEqual(psri(app).Alpha, '7.5000', 'the PSRi is recomputed by the switch itself, not by a later visit to the Segments page');
+    assert.ok(app.loadBundle().activityLog.some(e => /Mental Illness \(Mtn Temperate\) switched off/.test(e.action)), 'logged like on the Incident page');
+
+    // No map in the case: neither the map card nor the LPB column.
+    const noMapStore = seedStore({lpb: FULL_LPB});
+    const noMapBundle = JSON.parse(noMapStore[BUNDLE_KEY]);
+    noMapBundle.maps = [];
+    noMapStore[BUNDLE_KEY] = JSON.stringify(noMapBundle);
+    const noMapApp = createSandbox({store: noMapStore, fetch: server.fetch, page: 'page10'});
+    const noMapMain = makeElement();
+    noMapApp.document.querySelector = (selector) => (selector === 'main' ? noMapMain : null);
+    noMapApp.buildMapsPage();
+    await settle();
+    assert.deepStrictEqual(noMapApp.__logs.error, []);
+    assert.strictEqual(noMapApp.__byId['map-lpb-row'].style.display, 'none', 'hidden without a map');
+});
+
+check('styles.css / app.js: the Maps page row spans the whole screen, the LPB column is as tall as the map and scrolls inside itself, and the columns stack on mobile', () => {
+    const css = fs.readFileSync(path.join(__dirname, 'styles.css'), 'utf8');
+    const block = (selector) => {
+        const match = css.match(new RegExp(`${selector.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\s*\\{([^}]*)\\}`));
+        assert.ok(match, `${selector} is styled`);
+        return match[1];
+    };
+    const row = block('.map-lpb-row');
+    assert.ok(/width:\s*var\(--sar-viewport-width,\s*100vw\)/.test(row), 'the row is as wide as the screen (measured width, 100vw fallback)');
+    assert.ok(/margin-left:\s*calc\(50% - var\(--sar-viewport-width,\s*100vw\) \/ 2\)/.test(row), 'and starts at the screen\'s left edge, out of <main>');
+    assert.ok(/grid-template-columns:\s*minmax\(0, 1fr\) minmax\(0, 1fr\)/.test(row), 'two equal halves');
+    assert.ok(/--map-lpb-height:\s*75vh/.test(row), 'the shared height of both columns');
+    assert.ok(/height:\s*var\(--map-lpb-height\)/.test(block('.map-lpb-map')), 'the map card takes the shared height');
+    const panel = block('.map-lpb-panel.table-card');
+    assert.ok(/height:\s*var\(--map-lpb-height\)/.test(panel) && /overflow:\s*hidden/.test(panel), 'the LPB column is exactly as tall as the map');
+    const scroll = block('.map-lpb-scroll');
+    assert.ok(/overflow-y:\s*auto/.test(scroll) && /min-height:\s*0/.test(scroll), 'and scrolls inside itself');
+    assert.ok(!/overscroll-behavior/.test(scroll) && !/overscroll-behavior/.test(panel), 'no overscroll trap: at the end of the column the page scrolls on to the unaccounted features');
+    assert.ok(/@media \(max-width: 860px\) \{\s*\.map-lpb-row \{\s*grid-template-columns: minmax\(0, 1fr\);/.test(css), 'one column (stacked) in mobile mode');
+    assert.ok(/@container map-lpb \(max-width: 620px\)/.test(css) && /container: map-lpb \/ inline-size/.test(panel), 'a half-screen column gets the compact rules');
+
+    // The measured width: documentElement.clientWidth (no scrollbar) into the
+    // variable the row is sized from, kept current, asked for by the Maps page.
+    assert.ok(/function syncViewportWidthVariable\(\)/.test(appSource));
+    assert.ok(/root\.style\.setProperty\('--sar-viewport-width', `\$\{width\}px`\)/.test(appSource), 'the variable is written on <html>');
+    assert.ok(/const width = Number\(root\.clientWidth\)/.test(appSource), 'from the document width without the scrollbar');
+    assert.ok(/new ResizeObserver\(\(\) => syncViewportWidthVariable\(\)\)\.observe\(root\)/.test(appSource), 'kept current by a ResizeObserver on <html>');
+    const maps = appSource.slice(appSource.indexOf('function buildMapsPage()'));
+    assert.ok(/buildLostPersonBehaviorSection\(document\.getElementById\('map-lpb-scroll'\)\)/.test(maps), 'the Maps page renders the section into the scroll area');
+    assert.ok(/syncViewportWidthVariable\(\);/.test(maps), 'and measures the screen for the row');
 });
 
 check('the Segments page shows the switch state and tags the PSRi pills with what they gain', async () => {

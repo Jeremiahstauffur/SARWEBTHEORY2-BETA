@@ -55,9 +55,47 @@ body {
   margin: 0;
   font-family: Arial, Helvetica, sans-serif;
   color: var(--text);
-  background:
-    linear-gradient(var(--bg-dim-start), var(--bg-dim-end)),
-    url('assets/us-night.jpg') center center / cover fixed no-repeat;
+  /* The photo itself is painted by body::before below, not here. */
+  background: transparent;
+}
+
+/* The page background: a fixed, viewport-sized layer behind everything that
+   the content scrolls across. It used to be the body's own background with
+   background-attachment: fixed, but html/body are only 100% (one viewport)
+   tall and <html> has its own canvas colour (theme-boot.js), so once the page
+   scrolled past the first viewport the html canvas showed through as a white
+   (light mode) or navy sheet sliding up over the photo. A position: fixed
+   pseudo-element covers the viewport whatever the scroll position and does
+   not rely on background-attachment: fixed, which mobile browsers ignore.
+   app.js (applyBackground) swaps the photo by setting --sar-background-image
+   inline on <html>; the default here is the satellite photo. */
+body::before {
+  content: '';
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: -1;
+  pointer-events: none;
+  background-image: var(--sar-background-image, url('assets/us-night.jpg'));
+  background-position: center center;
+  background-size: cover;
+  background-repeat: no-repeat;
+}
+
+/* The dimming tint sits between the photo and the content so the theme's
+   --bg-dim-* colours still soften the picture. */
+body::after {
+  content: '';
+  position: fixed;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  left: 0;
+  z-index: -1;
+  pointer-events: none;
+  background: linear-gradient(var(--bg-dim-start), var(--bg-dim-end));
 }
 
 .site-shell {
@@ -2762,6 +2800,7 @@ tr.log-sweeps-due::after {
     display: none !important;
   }
   
+  body::before, body::after { display: none !important; }
   .site-shell { backdrop-filter: none !important; border: none !important; background: none !important; }
   main { padding: 0 !important; margin: 0 !important; max-width: none !important; }
   .table-card { border: none !important; box-shadow: none !important; background: transparent !important; padding: 0 !important; margin: 0 !important; }
@@ -3571,11 +3610,13 @@ tr.log-sweeps-due::after {
   }
 }
 
-/* Incident page: "Lost Person Behavior" section. The heading carries the
-   shared IPP control (Import IPP button / imported marker pill); below it the
-   categories under their group titles (External Forces, Water, ...), one
-   accordion row per category (switch, name and - once the switch is on - the
-   terrain dropdown on the same line) with the four-column distance graph. */
+/* "Lost Person Behavior" section: on the Incident page below the profile form
+   and, the very same section, on the Maps page in the column beside the map
+   (see .map-lpb-row further down). The heading carries the shared IPP control
+   (Import IPP button / imported marker pill); below it the categories under
+   their group titles (External Forces, Water, ...), one accordion row per
+   category (switch, name and - once the switch is on - the terrain dropdown
+   on the same line) with the four-column distance graph. */
 .lpb-section {
   margin-top: calc(28px * var(--space-scale, 1));
 }
@@ -3995,6 +4036,113 @@ tr.log-sweeps-due::after {
 
   .lpb-ipp-pill-name {
     max-width: 120px;
+  }
+}
+
+/* Maps page: the Lost Person Behavior section (the Incident page's, rendered
+   into #map-lpb-scroll) on the LEFT and the CalTopo map on the RIGHT, each
+   half of the WHOLE screen width. The row breaks out of <main>'s 1200px
+   container: 50% is half the container, so the negative margin puts the
+   row's left edge at the screen's, and the width is the screen's. That width
+   comes from --sar-viewport-width, set on <html> by syncViewportWidthVariable
+   (app.js) to the document width without the vertical scrollbar - 100vw, the
+   fallback, counts the scrollbar on Windows and would leave a horizontal one
+   behind. Both columns are as tall as the map (--map-lpb-height); the LPB
+   column scrolls inside itself, so the map stays in view while the planner
+   works through the categories, and the page scrolls on to the unaccounted
+   features below the row (no overscroll-behavior: at the end of the column
+   the wheel hands over to the page). Under 860px the columns stack in DOM
+   order (the section, then the map); under 600px the row runs edge to edge
+   like the other cards. */
+.map-lpb-row {
+  --map-lpb-height: 75vh;
+  --map-lpb-gutter: calc(20px * var(--space-scale, 1));
+  width: var(--sar-viewport-width, 100vw);
+  margin-left: calc(50% - var(--sar-viewport-width, 100vw) / 2);
+  margin-top: calc(20px * var(--space-scale, 1));
+  padding: 0 var(--map-lpb-gutter);
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) minmax(0, 1fr);
+  gap: calc(20px * var(--space-scale, 1));
+  align-items: stretch;
+}
+
+.map-lpb-map {
+  height: var(--map-lpb-height);
+  min-width: 0;
+}
+
+/* Also the query container for the compact rules below. */
+.map-lpb-panel.table-card {
+  container: map-lpb / inline-size;
+  height: var(--map-lpb-height);
+  min-width: 0;
+  padding: 0;
+  overflow: hidden;
+  display: flex;
+  flex-direction: column;
+}
+
+.map-lpb-scroll {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  overflow-x: hidden;
+  padding: calc(18px * var(--space-scale, 1)) calc(20px * var(--space-scale, 1)) calc(24px * var(--space-scale, 1));
+}
+
+/* The section's own top margin is for its place under the profile form. */
+.map-lpb-scroll .lpb-section {
+  margin-top: 0;
+}
+
+/* The column is about half a screen wide, so on a small desktop or a tablet
+   the section gets the same compact rules as on a narrow screen (the LPB
+   media query above cannot see the column's width; a container query can).
+   The panel is the query container; popups live on <body>, so its layout
+   containment reaches nothing that matters. */
+@container map-lpb (max-width: 620px) {
+  .lpb-category-controls {
+    flex-wrap: wrap;
+  }
+
+  .lpb-category-extras.is-visible {
+    flex-basis: 100%;
+  }
+
+  .lpb-terrain-select.pill-input {
+    width: 100%;
+  }
+
+  .lpb-chart {
+    padding-left: calc(10px * var(--space-scale, 1));
+    padding-right: calc(10px * var(--space-scale, 1));
+  }
+
+  .lpb-chart-columns {
+    gap: 6px;
+  }
+
+  .lpb-chart-value {
+    min-width: 56px;
+    padding: 4px 8px;
+    font-size: 0.82rem;
+  }
+
+  .lpb-ipp-pill-name {
+    max-width: 120px;
+  }
+}
+
+@media (max-width: 860px) {
+  .map-lpb-row {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+@media (max-width: 600px) {
+  .map-lpb-row {
+    --map-lpb-gutter: 0px;
   }
 }
 

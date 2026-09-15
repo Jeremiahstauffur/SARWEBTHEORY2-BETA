@@ -431,6 +431,23 @@ const initDatabaseSchema = () => {
             PRIMARY KEY (username, asset_kind)
         ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
 
+        // The people of a login (see LOGIN_USERS_TABLE): one row per (login
+        // username, lower-cased name), shared by every case of the login.
+        db.run(`CREATE TABLE IF NOT EXISTS \`${LOGIN_USERS_TABLE}\` (
+            username VARCHAR(191) NOT NULL,
+            user_key VARCHAR(191) NOT NULL,
+            user_name VARCHAR(255),
+            pin VARCHAR(64),
+            handle VARCHAR(255),
+            color VARCHAR(64),
+            theme VARCHAR(32),
+            is_file_manager TINYINT(1) DEFAULT 0,
+            removed TINYINT(1) DEFAULT 0,
+            record LONGTEXT,
+            updatedAt VARCHAR(64),
+            PRIMARY KEY (username, user_key)
+        ) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4`);
+
         // Super-Admin credentials that gate account registration. This table is
         // populated manually by the operator (no UI manages it): insert one row
         // per admin code you want to accept. Registration is allowed only when
@@ -664,6 +681,65 @@ const LPB_IPP_TABLE = 'lpb_ipp';
 // Per-login images from the Settings page (see initDatabaseSchema).
 const USER_ASSETS_TABLE = 'user_assets';
 const USER_ASSET_KINDS = ['logo', 'background'];
+
+// ---------------------------------------------------------------------------
+// The people of a login ("users"): the team members picked after logging in,
+// listed on the Users page and tagged onto the activity log. They belong to the
+// LOGIN username - never to a CASE # - so every case of the login lists the
+// same people with the same name, PIN, colour and theme; only what a person
+// does in a case (their Personnel row: team, status, times) stays per case.
+// One row per (login username, lower-cased name). A removed person keeps a
+// row flagged `removed` so a stale Personnel row in some other case cannot
+// bring them back; typing the name afresh revives the row. The typed columns
+// mirror the fields of `record` (the whole account as JSON) for the database
+// UI; `record` is what the website reads back.
+// ---------------------------------------------------------------------------
+const LOGIN_USERS_TABLE = 'login_users';
+// The Super Admin (PIN 1976) and the virtual "Anonymous" are never login users.
+const LOGIN_USER_RESERVED_KEYS = ['super admin', 'super-admin', 'anonymous'];
+const LOGIN_USER_SUPER_ADMIN_PIN = '1976';
+
+// The identity of a login user: the trimmed, lower-cased name.
+const loginUserKey = (name) => String(name == null ? '' : name).trim().toLowerCase();
+
+// Canonical form of one login user, or null when the input is not one (no
+// name, or one of the reserved stand-ins). Unknown fields are kept as they are
+// so the website can add preferences without a schema change.
+const normalizeLoginUser = (input) => {
+    if (!input || typeof input !== 'object' || Array.isArray(input)) { return null; }
+    const name = String(input.username == null ? '' : input.username).trim();
+    const key = loginUserKey(name);
+    if (!key || LOGIN_USER_RESERVED_KEYS.includes(key)) { return null; }
+    const pin = String(input.pin == null ? '' : input.pin).trim();
+    if (pin === LOGIN_USER_SUPER_ADMIN_PIN || input.isAnonymous === true) { return null; }
+    const record = {...input};
+    delete record.isAnonymous;
+    record.username = name;
+    record.pin = pin;
+    record.handle = String(input.handle == null || input.handle === '' ? name : input.handle).trim() || name;
+    record.color = typeof input.color === 'string' && input.color ? input.color : 'none';
+    record.theme = input.theme === 'light' ? 'light' : 'dark';
+    record.isFileManager = input.isFileManager === true;
+    record.removed = input.removed === true;
+    if (!Array.isArray(record.visiblePages)) { delete record.visiblePages; }
+    return record;
+};
+
+const loginUserRowToJson = (row) => {
+    const parsed = safeJsonParse(row && row.record);
+    const base = parsed && typeof parsed === 'object' && !Array.isArray(parsed) ? parsed : {};
+    return normalizeLoginUser({
+        ...base,
+        username: row.user_name || base.username,
+        pin: row.pin == null ? base.pin : row.pin,
+        handle: row.handle == null ? base.handle : row.handle,
+        color: row.color == null ? base.color : row.color,
+        theme: row.theme == null ? base.theme : row.theme,
+        isFileManager: row.is_file_manager == null ? base.isFileManager : Number(row.is_file_manager) === 1,
+        removed: row.removed == null ? base.removed : Number(row.removed) === 1,
+        updatedAt: row.updatedAt || base.updatedAt || null
+    });
+};
 
 // Promise wrapper around the sqlite-compatible db.run helper.
 const runAsync = (sql, params = []) => new Promise((resolve, reject) => {
@@ -1105,6 +1181,11 @@ if (typeof module !== 'undefined' && module.exports) {
     module.exports.CALTOPO_SYNC_ENV_KEY = CALTOPO_SYNC_ENV_KEY;
     module.exports.getConfiguredSyncServerUrl = getConfiguredSyncServerUrl;
     module.exports.getPublishedSyncConfig = getPublishedSyncConfig;
+    // The login-wide user list (GET/PUT /api/auth/users), testable without a DB.
+    module.exports.LOGIN_USERS_TABLE = LOGIN_USERS_TABLE;
+    module.exports.loginUserKey = loginUserKey;
+    module.exports.normalizeLoginUser = normalizeLoginUser;
+    module.exports.loginUserRowToJson = loginUserRowToJson;
     // Exposed so an integration test can drive the endpoints over HTTP without
     // the server having to bind a fixed port on its own.
     module.exports.app = app;
@@ -1298,6 +1379,64 @@ app.put('/api/auth/settings', authMiddleware, (req, res) => {
         if (err) return res.status(500).json({error: err.message});
         res.json({success: true});
     });
+});
+
+// ---------------------------------------------------------------------------
+// The people of a login (see LOGIN_USERS_TABLE). Both routes need the login's
+// verified username + password: the list is what the login popup offers right
+// after those were checked, and what every case of the login shows as its
+// users.
+//   GET /api/auth/users        -> {users: [...]} every row, removed ones included
+//                                 (flagged) so a device knows whom not to revive
+//   PUT /api/auth/users        body {users: [...]}: upsert the given people by
+//                                 name; never deletes - a removal is a record
+//                                 with removed: true. Answers the whole list.
+// ---------------------------------------------------------------------------
+const readLoginUsers = async (username) => {
+    const rows = await allAsync(
+        `SELECT user_name, pin, handle, color, theme, is_file_manager, removed, record, updatedAt FROM \`${LOGIN_USERS_TABLE}\` WHERE username = ? ORDER BY user_name`,
+        [username]
+    );
+    return rows.map(loginUserRowToJson).filter(Boolean);
+};
+
+app.get('/api/auth/users', authMiddleware, async (req, res) => {
+    try {
+        res.json({users: await readLoginUsers(req.user.username)});
+    } catch (err) {
+        console.error('[USERS] read failed:', err.message);
+        res.status(500).json({error: 'Failed to read the login users'});
+    }
+});
+
+app.put('/api/auth/users', authMiddleware, async (req, res) => {
+    const body = req.body && typeof req.body === 'object' && !Array.isArray(req.body) ? req.body : {};
+    const incoming = Array.isArray(body.users) ? body.users : (Array.isArray(req.body) ? req.body : null);
+    if (!incoming) {
+        return res.status(400).json({error: 'users must be an array'});
+    }
+    const users = incoming.map(normalizeLoginUser).filter(Boolean);
+    const nowIso = new Date().toISOString();
+    try {
+        for (const user of users) {
+            const record = JSON.stringify({...user, updatedAt: nowIso});
+            const removed = user.removed ? 1 : 0;
+            const fileManager = user.isFileManager ? 1 : 0;
+            // Update in place rather than REPLACE so a concurrent reader never
+            // sees the row missing between a delete and an insert.
+            await runAsync(
+                `INSERT INTO \`${LOGIN_USERS_TABLE}\` (username, user_key, user_name, pin, handle, color, theme, is_file_manager, removed, record, updatedAt)
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 ON DUPLICATE KEY UPDATE user_name = ?, pin = ?, handle = ?, color = ?, theme = ?, is_file_manager = ?, removed = ?, record = ?, updatedAt = ?`,
+                [req.user.username, loginUserKey(user.username), user.username, user.pin, user.handle, user.color, user.theme, fileManager, removed, record, nowIso,
+                    user.username, user.pin, user.handle, user.color, user.theme, fileManager, removed, record, nowIso]
+            );
+        }
+        res.json({success: true, saved: users.length, users: await readLoginUsers(req.user.username)});
+    } catch (err) {
+        console.error('[USERS] write failed:', err.message);
+        res.status(500).json({error: 'Failed to save the login users'});
+    }
 });
 
 // ---------------------------------------------------------------------------

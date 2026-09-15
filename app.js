@@ -384,7 +384,8 @@ function getLpbPsrFactor(row, context) {
 // The login's distance tables from the server (GET /api/lpb/distances):
 //   defaults   what the database holds for every category x terrain
 //   overrides  the brackets this login edited (lpb_user_distances)
-// Read once per page load by the Incident page; `effective` merges the two.
+// Read once per page load by the Incident and Maps pages (both show the
+// section); `effective` merges the two.
 let _lpbDistances = null;
 let _lpbDistancesPromise = null;
 
@@ -3395,21 +3396,406 @@ function createSuperAdminAccount() {
     };
 }
 
-// The choices the picker shows, from personnel rows - either the server's
-// structured `personnel` table rows ({label, data: [name, team, lead, ...,
-// pin at 8]}) or bare Personnel page rows. Anonymous first and marked as the
-// default, then every distinct person A-Z, then the Super Admin (offered, but
-// never the default). Rows that would duplicate those two are dropped.
-function buildLoginProfileChoices(personnelRows) {
+// ---------------------------------------------------------------------------
+// The login's users (its team).
+//
+// The people a login can pick from - name, PIN, handle, highlight colour, theme
+// and the other account preferences - belong to the LOGIN username, not to a
+// CASE #: they live in the database table `login_users` (GET/PUT
+// /api/auth/users, read only with the verified username + password) and are
+// the same in every case. What a person does in a case (their Personnel row:
+// team, status, incident times) stays per case. The website keeps one copy of
+// the list in memory for the page lifetime (`_loginUsers`, read right after
+// the login's settings) and:
+//   * lays it over the open case before anything is drawn
+//     (applyLoginUsersToBundle): the case's `accounts` become Super Admin +
+//     the login's users, everyone gets a Personnel row when the case has none
+//     for them yet (team "Off Duty", not on scene), and a user this case knows
+//     but the login does not yet is adopted into the list (how the cases from
+//     before this list existed fill it);
+//   * learns from every save (syncLoginUsersFromBundle): a name typed into
+//     the Personnel page, an account edited on the Users page, a colour or
+//     theme changed in Settings, is written back to the login's list at once.
+// A user is removed with removeLoginUser (Users page, or deleting their
+// Personnel row): the list keeps a record flagged `removed`, the open case
+// drops their account and rows, and every other case drops them when it is
+// next opened - a stale row there can never bring them back. Typing the name
+// again on the Personnel page revives the record.
+// ---------------------------------------------------------------------------
+let _loginUsers = null;
+// True once the server's list was read during this page load; nothing is
+// written to it - and no case is changed from it - before that.
+let _loginUsersLoaded = false;
+// True once applyLoginUsersToBundle ran on the open case during this page
+// load; the save hook only learns from a case that was laid over first.
+let _loginUsersApplied = false;
+let _loginUsersSavePromise = null;
+const LOGIN_USER_FIRST_PIN = 1400;
+const LOGIN_USER_DEFAULT_PAGES = ['index', 'page2', 'page3', 'page4', 'page5', 'page6', 'page7', 'settings', 'home', 'page8', 'page10'];
+
+// The identity of a login user: the trimmed, lower-cased name.
+function loginUserKey(name) {
+    return String(name == null ? '' : name).trim().toLowerCase();
+}
+
+// Whether an account record is (or could become) a login user: it has a name
+// and is neither the Super Admin nor the Anonymous stand-in.
+function isLoginUserCandidate(account) {
+    if (!account || typeof account !== 'object' || isAnonymousUser(account)) return false;
+    const key = loginUserKey(account.username);
+    if (!key || key === ANONYMOUS_USER_NAME.toLowerCase() || key === 'super admin' || key === 'super-admin') return false;
+    return String(account.pin == null ? '' : account.pin).trim() !== '1976';
+}
+
+// Canonical copy of one login user, or null when the input is not one.
+function normalizeLoginUser(input) {
+    if (!isLoginUserCandidate(input)) return null;
+    const name = String(input.username).trim();
+    const record = JSON.parse(JSON.stringify(input));
+    delete record.isAnonymous;
+    record.username = name;
+    record.pin = String(input.pin == null ? '' : input.pin).trim();
+    record.handle = String(input.handle == null || input.handle === '' ? name : input.handle).trim() || name;
+    record.color = typeof input.color === 'string' && input.color ? input.color : 'none';
+    record.theme = input.theme === 'light' ? 'light' : 'dark';
+    record.isFileManager = input.isFileManager === true;
+    record.visiblePages = Array.isArray(input.visiblePages) ? input.visiblePages.slice() : LOGIN_USER_DEFAULT_PAGES.slice();
+    record.removed = input.removed === true;
+    return record;
+}
+
+// The account object a case carries for a login user (the list's record
+// without its bookkeeping flag).
+function loginUserAsAccount(record) {
+    const account = JSON.parse(JSON.stringify(record));
+    delete account.removed;
+    delete account.updatedAt;
+    return account;
+}
+
+// The login's users: the ones still on the team unless `includeRemoved`.
+function getLoginUsers({includeRemoved = false} = {}) {
+    if (!Array.isArray(_loginUsers)) return [];
+    return _loginUsers.filter(u => includeRemoved || !u.removed).map(u => JSON.parse(JSON.stringify(u)));
+}
+
+function findLoginUserRecord(name) {
+    const key = loginUserKey(name);
+    if (!key || !Array.isArray(_loginUsers)) return null;
+    return _loginUsers.find(u => loginUserKey(u.username) === key) || null;
+}
+
+// The next PIN no present login user (and nothing in `alsoTaken`) has,
+// counting up from 1400 like the Personnel page always did.
+function nextFreeLoginUserPin(alsoTaken = []) {
+    const taken = new Set([...(Array.isArray(_loginUsers) ? _loginUsers : []).filter(u => !u.removed).map(u => u.pin), ...alsoTaken.map(String), '1976']);
+    let next = LOGIN_USER_FIRST_PIN;
+    while (taken.has(String(next))) next++;
+    return String(next);
+}
+
+// Read the login's users from the server. Resolves to the list (removed ones
+// included); [] without credentials. The in-memory copy is only replaced by a
+// good answer, so an unreachable server leaves the page working as before.
+async function loadLoginUsers({force = false} = {}) {
+    const creds = getUserCredentials();
+    if (!creds) return [];
+    if (_loginUsersLoaded && !force) return getLoginUsers({includeRemoved: true});
+    const serverUrl = normalizeSyncServerUrl(getSyncServerUrl());
+    if (!serverUrl) return getLoginUsers({includeRemoved: true});
+    try {
+        const resp = await apiFetch(`${serverUrl}/api/auth/users?_=${Date.now()}`, {headers: getAuthHeaders()});
+        if (resp && resp.ok) {
+            const body = await resp.json().catch(() => null);
+            const list = body && Array.isArray(body.users) ? body.users : (Array.isArray(body) ? body : null);
+            if (list) {
+                _loginUsers = list.map(normalizeLoginUser).filter(Boolean);
+                _loginUsersLoaded = true;
+            }
+        }
+    } catch (e) {
+        console.warn('[USERS] Could not read the login\'s users:', e);
+    }
+    return getLoginUsers({includeRemoved: true});
+}
+
+// Write the given user records to the server (upsert by name; the server never
+// deletes). Writes are queued one after another; nothing is written before the
+// server's list was read. Returns the save promise, or null when nothing went.
+function saveLoginUsers(records) {
+    const creds = getUserCredentials();
+    if (!creds || !_loginUsersLoaded) return null;
+    const users = (Array.isArray(records) ? records : []).map(normalizeLoginUser).filter(Boolean);
+    if (!users.length) return null;
+    const serverUrl = normalizeSyncServerUrl(getSyncServerUrl());
+    if (!serverUrl) return null;
+    const run = async () => {
+        try {
+            const resp = await apiFetch(`${serverUrl}/api/auth/users`, {
+                method: 'PUT',
+                headers: getAuthHeaders(),
+                body: JSON.stringify({users})
+            });
+            if (!resp || !resp.ok) {
+                console.warn('[USERS] The login\'s users were not saved:', resp ? resp.status : 'no response');
+            }
+        } catch (e) {
+            console.warn('[USERS] The login\'s users were not saved:', e);
+        }
+    };
+    _loginUsersSavePromise = (_loginUsersSavePromise || Promise.resolve()).then(run, run);
+    return _loginUsersSavePromise;
+}
+
+// Put `record` into the in-memory list (new, or replacing the record with the
+// same name). Returns the stored record.
+function upsertLoginUserRecord(record) {
+    if (!Array.isArray(_loginUsers)) _loginUsers = [];
+    const existing = findLoginUserRecord(record.username);
+    if (existing) {
+        Object.keys(existing).forEach((k) => { delete existing[k]; });
+        Object.assign(existing, record);
+        return existing;
+    }
+    _loginUsers.push(record);
+    return record;
+}
+
+// Take a case's own account into the login's list. Its PIN must be unique
+// among the login's users: when another (still present) user has it, the
+// newcomer gets the next free one and the case's Personnel rows are re-linked
+// to it. A removed record's PIN is free again - that is how a renamed user
+// keeps theirs.
+function adoptAccountIntoLoginUsers(account, personnelRows) {
+    const record = normalizeLoginUser(account);
+    if (!record) return null;
+    record.removed = false;
+    const owner = (_loginUsers || []).find(u => !u.removed && u.pin && u.pin === record.pin && loginUserKey(u.username) !== loginUserKey(record.username));
+    if (owner || !record.pin) {
+        const oldPin = record.pin;
+        record.pin = nextFreeLoginUserPin();
+        account.pin = record.pin;
+        (Array.isArray(personnelRows) ? personnelRows : []).forEach((row) => {
+            if (!Array.isArray(row)) return;
+            if (loginUserKey(row[0]) === loginUserKey(record.username) || (oldPin && String(row[8] || '').trim() === oldPin && !row[0])) {
+                row[8] = record.pin;
+            }
+        });
+    }
+    return upsertLoginUserRecord(record);
+}
+
+// A blank Personnel row for a login user who has none in this case yet: team
+// "Off Duty", not on scene, linked to the user by PIN; the GPS / Radio / Medic
+// toggles the case already remembers for the name are kept.
+function personnelRowForLoginUser(record, bundle) {
+    const row = Array.from({length: 14}, () => '');
+    row[0] = record.username;
+    row[1] = 'Off Duty';
+    row[6] = 'false';
+    row[8] = record.pin;
+    const roles = bundle && bundle.permanentPersonnel && bundle.permanentPersonnel[record.username];
+    if (roles && typeof roles === 'object') {
+        row[3] = roles.gps || '';
+        row[4] = roles.radio || '';
+        row[5] = roles.medic || '';
+    }
+    return row;
+}
+
+// Whether a Personnel row still is the blank one personnelRowForLoginUser
+// made: nothing but the name, the "Off Duty" team, the not-on-scene flag,
+// the PIN and the remembered role toggles.
+function isBlankLoginUserRow(row) {
+    if (!Array.isArray(row)) return false;
+    return row.every((cell, index) => {
+        const value = String(cell == null ? '' : cell).trim();
+        if (index === 0 || index === 8 || index === 3 || index === 4 || index === 5) return true;
+        if (index === 1) return value === '' || value === 'Off Duty';
+        if (index === 6) return value === '' || value === 'false';
+        return value === '';
+    });
+}
+
+// Lay the login's users over a case (once per page load, before it is drawn):
+//   1. accounts this case has that the login does not know are adopted;
+//   2. the case's accounts become Super Admin + the login's users;
+//   3. every user has a Personnel row (a missing one is added), rows are linked
+//      to the user's PIN, and rows of removed users go.
+// Returns true when the case changed (the caller saves it). Nothing happens
+// before the server's list was read.
+function applyLoginUsersToBundle(bundle) {
+    if (!bundle || typeof bundle !== 'object' || !_loginUsersLoaded || !Array.isArray(_loginUsers)) return false;
+    let changed = false;
+    const toSave = [];
+    const accounts = Array.isArray(bundle.accounts) ? bundle.accounts : [];
+    if (!bundle.pages || typeof bundle.pages !== 'object') bundle.pages = {};
+    const personnel = Array.isArray(bundle.pages.page3) ? bundle.pages.page3 : [];
+
+    accounts.filter(isLoginUserCandidate).forEach((account) => {
+        if (findLoginUserRecord(account.username)) return;
+        const record = adoptAccountIntoLoginUsers(account, personnel);
+        if (record) { toSave.push(record); changed = true; }
+    });
+
+    const superAdmin = accounts.find(a => a && a.pin === '1976') || createSuperAdminAccount();
+    const active = _loginUsers.filter(u => !u.removed);
+    const nextAccounts = [superAdmin, ...active.map(loginUserAsAccount)];
+    if (JSON.stringify(nextAccounts) !== JSON.stringify(accounts)) {
+        bundle.accounts = nextAccounts;
+        changed = true;
+    }
+
+    // Rows are claimed by PIN first (a user renamed on another device keeps
+    // their team and status here) - unless the row is named after another
+    // present user, whose row it is (a case from before the list handed out
+    // its own PINs) - then by name; only then do the rows of removed users
+    // go, together with the roles the case remembered for them, or
+    // syncPersonnelData would put a row back on the Personnel page.
+    const activeKeys = new Set(active.map(u => loginUserKey(u.username)));
+    let rows = personnel.slice();
+    active.forEach((user) => {
+        const key = loginUserKey(user.username);
+        let row = (user.pin && rows.find(r => Array.isArray(r) && String(r[8] || '').trim() === user.pin && String(r[0] || '').trim()
+                && (loginUserKey(r[0]) === key || !activeKeys.has(loginUserKey(r[0])))))
+            || rows.find(r => Array.isArray(r) && loginUserKey(r[0]) === key);
+        if (!row) {
+            rows.push(personnelRowForLoginUser(user, bundle));
+            changed = true;
+            return;
+        }
+        while (row.length < 14) { row.push(''); changed = true; }
+        if (String(row[0] || '').trim() !== user.username) { row[0] = user.username; changed = true; }
+        if (String(row[8] || '').trim() !== user.pin) { row[8] = user.pin; changed = true; }
+    });
+    // Two devices opening a case at the same moment may both have appended
+    // the blank row of the same person (row batches append, they do not
+    // dedupe): the second blank copy goes; a row somebody worked on stays.
+    const seenKeys = new Set();
+    const removedKeys = new Set(_loginUsers.filter(u => u.removed).map(u => loginUserKey(u.username)));
+    const kept = rows.filter((row) => {
+        if (!Array.isArray(row)) return true;
+        const key = loginUserKey(row[0]);
+        if (!key) return true;
+        if (removedKeys.has(key)) return false;
+        if (activeKeys.has(key) && seenKeys.has(key) && isBlankLoginUserRow(row)) return false;
+        seenKeys.add(key);
+        return true;
+    });
+    if (kept.length !== rows.length) { rows = kept; changed = true; }
+    if (bundle.permanentPersonnel && typeof bundle.permanentPersonnel === 'object') {
+        Object.keys(bundle.permanentPersonnel).forEach((name) => {
+            if (removedKeys.has(loginUserKey(name))) { delete bundle.permanentPersonnel[name]; changed = true; }
+        });
+    }
+    if (changed) bundle.pages.page3 = rows;
+
+    if (toSave.length) saveLoginUsers(toSave);
+    _loginUsersApplied = true;
+    return changed;
+}
+
+// The save hook: whatever the case now says about its users - a new name on
+// the Personnel page (the sanitizer made it an account), an edited account, a
+// changed colour or theme - goes into the login's list. A name the list has
+// as removed is revived (it was typed anew: the case dropped stale rows when
+// it was opened). Runs only on a case that was laid over this page load.
+function syncLoginUsersFromBundle(bundle) {
+    if (!_loginUsersApplied || !_loginUsersLoaded || !bundle || typeof bundle !== 'object') return false;
+    const accounts = Array.isArray(bundle.accounts) ? bundle.accounts : [];
+    const personnel = bundle.pages && Array.isArray(bundle.pages.page3) ? bundle.pages.page3 : [];
+    const toSave = [];
+    accounts.filter(isLoginUserCandidate).forEach((account) => {
+        const known = findLoginUserRecord(account.username);
+        if (!known) {
+            const record = adoptAccountIntoLoginUsers(account, personnel);
+            if (record) toSave.push(record);
+            return;
+        }
+        const next = normalizeLoginUser({...known, ...account, removed: false});
+        if (!next) return;
+        delete next.updatedAt;
+        const current = {...known};
+        delete current.updatedAt;
+        if (JSON.stringify(next) !== JSON.stringify(current)) {
+            toSave.push(upsertLoginUserRecord(next));
+        }
+    });
+    if (toSave.length) saveLoginUsers(toSave);
+    return toSave.length > 0;
+}
+
+// A user was renamed (Users page): the list keeps the old name as removed so
+// no case revives it, and the new name is adopted from the case on save.
+function noteLoginUserRename(oldName, newName) {
+    if (loginUserKey(oldName) === loginUserKey(newName)) return;
+    const known = findLoginUserRecord(oldName);
+    if (!known || known.removed) return;
+    known.removed = true;
+    saveLoginUsers([known]);
+}
+
+// Remove a person from the login: flagged as removed in the list, and taken
+// out of the case (account and Personnel rows). With a bundle passed in the
+// caller saves it; without one the open case is loaded and saved here.
+function removeLoginUser(name, bundle) {
+    const key = loginUserKey(name);
+    if (!key) return false;
+    const known = findLoginUserRecord(name);
+    if (known && !known.removed) {
+        known.removed = true;
+        saveLoginUsers([known]);
+    }
+    const own = !bundle;
+    const target = own ? loadBundle() : bundle;
+    let changed = false;
+    if (Array.isArray(target.accounts)) {
+        const kept = target.accounts.filter(a => !(isLoginUserCandidate(a) && loginUserKey(a.username) === key));
+        if (kept.length !== target.accounts.length) { target.accounts = kept; changed = true; }
+    }
+    if (target.pages && Array.isArray(target.pages.page3)) {
+        const kept = target.pages.page3.filter(row => !(Array.isArray(row) && loginUserKey(row[0]) === key));
+        if (kept.length !== target.pages.page3.length) {
+            target.pages.page3 = kept.length ? kept : [Array.from({length: 14}, () => '')];
+            changed = true;
+        }
+    }
+    if (target.permanentPersonnel && typeof target.permanentPersonnel === 'object') {
+        Object.keys(target.permanentPersonnel).forEach((n) => {
+            if (loginUserKey(n) === key) { delete target.permanentPersonnel[n]; changed = true; }
+        });
+    }
+    if (own && changed) saveBundle(target);
+    return changed;
+}
+
+// The choices the picker shows: the login's users (their stored PIN, colour
+// and theme) plus, for a login whose list is still empty, the names of the
+// personnel rows the server holds for it in any case - either the structured
+// `personnel` table rows ({label, data: [name, team, lead, ..., pin at 8]}) or
+// bare Personnel page rows. Anonymous first and marked as the default, then
+// every distinct person A-Z, then the Super Admin (offered, but never the
+// default). Removed users and rows that would duplicate those two are dropped.
+function buildLoginProfileChoices(personnelRows, loginUsers) {
     const reserved = new Set([ANONYMOUS_USER_NAME.toLowerCase(), 'super admin', 'super-admin']);
     const seen = new Set();
+    const removed = new Set();
     const people = [];
+    (Array.isArray(loginUsers) ? loginUsers : []).forEach((user) => {
+        const record = normalizeLoginUser(user);
+        if (!record) return;
+        const key = loginUserKey(record.username);
+        if (reserved.has(key) || seen.has(key)) return;
+        if (record.removed) { removed.add(key); return; }
+        seen.add(key);
+        people.push({user: loginUserAsAccount(record), isDefault: false, isSuperAdmin: false});
+    });
     (Array.isArray(personnelRows) ? personnelRows : []).forEach((row) => {
         const data = row && Array.isArray(row.data) ? row.data : (Array.isArray(row) ? row : null);
         const name = String((data && data[0]) || (row && !Array.isArray(row) && row.label) || '').trim();
         if (!name) return;
         const key = name.toLowerCase();
-        if (reserved.has(key) || seen.has(key)) return;
+        if (reserved.has(key) || seen.has(key) || removed.has(key)) return;
         seen.add(key);
         people.push({
             user: {
@@ -3432,36 +3818,32 @@ function buildLoginProfileChoices(personnelRows) {
     ];
 }
 
-// The personnel stored under the login, read from the server right after the
-// login is verified (the case itself is not in memory yet). The login's open
-// case is asked for first so the pins match that case's accounts; a login
-// without one - or a case whose rows are not mirrored yet - falls back to
-// every personnel row the login has in any case. [] when nothing is reachable.
+// Every personnel row the login has in ANY case, read from the server right
+// after the login is verified (the case itself is not in memory yet). Not
+// restricted to the open case - the users belong to the login, not to a
+// CASE # - and only there to fill the picker for a login whose user list is
+// still empty. [] when nothing is reachable.
 async function fetchLoginProfilePersonnel() {
     const serverUrl = normalizeSyncServerUrl(getSyncServerUrl());
     if (!serverUrl || !getUserCredentials()) return [];
-    const read = async (caseNumber) => {
-        const query = caseNumber ? `?case=${encodeURIComponent(caseNumber)}&_=${Date.now()}` : `?_=${Date.now()}`;
-        const resp = await apiFetch(`${serverUrl}/api/v1/tables/personnel${query}`, {headers: getAuthHeaders()});
+    try {
+        const resp = await apiFetch(`${serverUrl}/api/v1/tables/personnel?_=${Date.now()}`, {headers: getAuthHeaders()});
         if (!resp || !resp.ok) return [];
         const rows = await resp.json().catch(() => []);
         return Array.isArray(rows) ? rows : [];
-    };
-    try {
-        const caseNumber = getActiveCaseNumber();
-        if (caseNumber) {
-            const scoped = await read(caseNumber);
-            if (scoped.length) return scoped;
-        }
-        return await read('');
     } catch (e) {
         console.warn('[LOGIN] Could not read the team members for the profile picker:', e);
         return [];
     }
 }
 
+// The login's users from /api/auth/users - read afresh, the credentials were
+// just verified - together with the names of the login's personnel rows in
+// every case, so a person from a case that was not opened since the list
+// exists is offered too (and adopted into the list once that case is opened).
 async function fetchLoginProfileChoices() {
-    return buildLoginProfileChoices(await fetchLoginProfilePersonnel());
+    const [users, personnel] = await Promise.all([loadLoginUsers({force: true}), fetchLoginProfilePersonnel()]);
+    return buildLoginProfileChoices(personnel, users);
 }
 
 // The picker itself (opened by the login popup once the login is verified).
@@ -4280,6 +4662,9 @@ function clearInMemoryUserData() {
   [BUNDLE_STORAGE_KEY, BUNDLE_BUCKET_STORAGE_KEY, SYNC_OUTBOX_STORAGE_KEY, SERVER_SETTINGS_CACHE_KEY]
     .forEach((key) => removeStorageItem(key));
   _serverSettings = null;
+  _loginUsers = null;
+  _loginUsersLoaded = false;
+  _loginUsersApplied = false;
 }
 
 function checkAccess() {
@@ -4305,15 +4690,17 @@ function checkAccess() {
 
   // Refresh user data from bundle if exists locally (for permissions). A
   // person picked at login is matched by PIN, else by name (their row may
-  // not have carried a PIN yet); the Anonymous stand-in matches nobody.
+  // not have carried a PIN yet); the Anonymous stand-in matches nobody. The
+  // case's account - the login's record of that person, laid over the case
+  // at load - wins over the pick, so a PIN the login re-assigned, or a colour
+  // or theme changed in another case, is what this tab works with.
   const accounts = bundle.accounts || [];
   const actualUser = isAnonymousUser(user)
     ? null
     : (accounts.find(a => a.pin === user.pin)
         || accounts.find(a => (a.username || '').trim().toLowerCase() === (user.username || '').trim().toLowerCase()));
   if (actualUser) {
-      // Keep name from credentials but merge other props
-      const merged = { ...actualUser, ...user };
+      const merged = { ...user, ...actualUser };
       sessionStorage.setItem('sar-current-user', JSON.stringify(merged));
   }
 }
@@ -4455,6 +4842,7 @@ function escapeIcReportHtml(value) {
 const IC_REPORT_PRINT_STYLES = `
         .ic-report { border: 2px solid #000; padding: 12px 15px; margin-bottom: 20px; page-break-inside: avoid; }
         .ic-report-title { font-size: 16pt; border-bottom: 2px solid #000; margin: 0 0 4px 0; padding-bottom: 3px; }
+        .ic-report .print-title-row { margin: 0 0 4px 0; padding-bottom: 3px; }
         .ic-report-case { font-size: 11pt; font-weight: bold; color: #444; margin-bottom: 10px; }
         .ic-report-text { min-height: 1.5in; border: 1px solid #999; padding: 8px; font-size: 11pt; white-space: pre-wrap; word-wrap: break-word; margin-bottom: 10px; }
         .ic-report-empty { font-style: italic; color: #888; }
@@ -4462,10 +4850,15 @@ const IC_REPORT_PRINT_STYLES = `
         .ic-report-check { font-size: 14pt; line-height: 1; }
 `;
 
-// Static markup of the report for the printouts.
-function getIcReportPrintHTML(bundle) {
+// Static markup of the report for the printouts. `options.logo` puts the
+// login's logo in the title row (the stand-alone printout; the Case #
+// Printout already carries it in the top row of the page).
+function getIcReportPrintHTML(bundle, options = {}) {
   const report = sanitizeIcReport(bundle && bundle.icReport);
   const caseLabel = escapeIcReportHtml(getIcReportCaseLabel(bundle));
+  const title = options.logo === true
+    ? getPrintTitleRowHTML(bundle, 'IC Report', {tag: 'h2', className: 'ic-report-title'})
+    : '<h2 class="ic-report-title">IC Report</h2>';
   const text = report.text.trim()
     ? escapeIcReportHtml(report.text)
     : '<span class="ic-report-empty">No IC report has been written for this case.</span>';
@@ -4474,7 +4867,7 @@ function getIcReportPrintHTML(bundle) {
     : '<span class="ic-report-check">&#9744;</span> Form not yet completed';
   return `
             <div class="ic-report">
-                <h2 class="ic-report-title">IC Report</h2>
+                ${title}
                 <div class="ic-report-case">Case # ${caseLabel}</div>
                 <div class="ic-report-text">${text}</div>
                 <div class="ic-report-completion">${completion}</div>
@@ -4509,7 +4902,7 @@ function printIcReport() {
     </div>
     <div class="print-container">
         <div class="print-section">
-            ${getIcReportPrintHTML(bundle)}
+            ${getIcReportPrintHTML(bundle, {logo: true})}
         </div>
     </div>
     <script>
@@ -5869,10 +6262,15 @@ function didSearchActivityChange(previous, next) {
 // the segment goes back to its resting style and border thickness and its
 // description gets the task's summary. That refresh is debounced and silent,
 // and a no-op unless the assignment overlay is enabled.
+//
+// The users belong to the login: what this save says about the case's accounts
+// goes to the login's list too (syncLoginUsersFromBundle, on the sanitized copy
+// so a PIN the list has to re-link is what gets stored).
 function saveBundle(bundle, deferFlush = false) {
   const previous = getStorageItem(BUNDLE_STORAGE_KEY) ? loadBundle() : null;
   stampBundleForSave(bundle, previous);
   const sanitized = sanitizeBundle(bundle);
+  try { syncLoginUsersFromBundle(sanitized); } catch (e) { console.warn('[USERS]', e); }
   queueBundleChanges(previous, sanitized);
   setStorageItem(BUNDLE_STORAGE_KEY, JSON.stringify(sanitized));
   tagLocalBundleBucket();
@@ -6721,8 +7119,11 @@ function saveRegionsAndRefresh(data) {
 // log PSR before/after). Rendering a page calls this too, so it only saves -
 // and therefore only sends rows - when a value actually changed; a plain
 // re-render stays silent. Returns the save promise (resolved false when
-// nothing changed).
-function recalculateEverything() {
+// nothing changed). `colorSyncDelay` is handed to the CalTopo color push a
+// change asks for (0 = the soonest the cooldown allows; by default the push
+// waits a moment to fold a burst of edits into one).
+function recalculateEverything(options = {}) {
+  const {colorSyncDelay} = options;
   const bundle = loadBundle();
   const segmentsData = bundle.pages.page2 || [];
   const searchLogData = bundle.pages.page4 || [];
@@ -6848,7 +7249,7 @@ function recalculateEverything() {
   // Segment PSRc values (column 7) were just recomputed. If the CalTopo
   // assignment overlay is on, re-color and re-opacity the shapes on SARTopo so
   // the map always reflects the latest PSRc scale.
-  refreshCalTopoAssignmentOverlayIfEnabled();
+  refreshCalTopoAssignmentOverlayIfEnabled(Number.isFinite(colorSyncDelay) ? {delay: colorSyncDelay} : {});
   return savePromise;
 }
 
@@ -7281,6 +7682,22 @@ function describeLpbStatus(context) {
   }
 }
 
+// Store a change to the Lost Person Behavior section - a category, terrain,
+// distance or the IPP on the Incident / Maps page, the switch on the Segments
+// page. The section moves the PSRi / PSRc of every segment it reaches, and
+// with them the PSRc colors on the CalTopo map, so those are recomputed at
+// once instead of on the next visit to the Segments page: the section is
+// stored without sending, recalculateEverything saves - so the section, the
+// log entry and the recomputed rows travel in one batch - and asks for the
+// CalTopo color push straight away (it still runs no sooner than the cooldown
+// allows, see refreshCalTopoAssignmentOverlayIfEnabled). When no value moved
+// the deferred rows still go out. Returns the flush promise.
+function saveLostPersonBehaviorChange(bundle) {
+  saveBundle(bundle, true);
+  return recalculateEverything({colorSyncDelay: 0})
+    .then((flushed) => (flushed ? true : pushBundleDelta(loadBundle())));
+}
+
 // The Segments page switch. It only flips psrAdjustmentEnabled in the case;
 // the categories, terrains, distances and IPP entered on the Incident page are
 // kept, so the adjustment can be lifted and re-applied at will.
@@ -7291,7 +7708,7 @@ function setLpbPsrAdjustmentEnabled(enabled) {
   lpb.psrAdjustmentEnabled = !!enabled;
   bundle.lostPersonBehavior = lpb;
   addActivityLogEntry('System', `Lost Person Behavior PSR adjustment switched ${enabled ? 'on' : 'off'} on the Segments page`, bundle);
-  return saveBundle(bundle);
+  return saveLostPersonBehaviorChange(bundle);
 }
 
 function bindLpbSegmentsPanel(bundle, context) {
@@ -8263,6 +8680,10 @@ function buildPersonnelAllMembersTable() {
         logDeletion('Personnel', memberName);
         if (data.length === 0) data.push(Array.from({ length: 14 }, () => ''));
         saveCurrentPageData(data);
+        // The person is a user of the login, listed in every case: deleting
+        // their row here takes them off the login too, or the row would be
+        // back on the next page load (see removeLoginUser).
+        if (memberName && memberName !== 'unnamed person') removeLoginUser(memberName);
         buildPersonnelTable();
       });
     };
@@ -9960,8 +10381,12 @@ function showUserSelectionPopup() {
   
   const bundle = loadBundle();
   // Anonymous (the stand-in nobody has to "be") is always offered first; the
-  // case's accounts follow. When nobody is picked yet it is the highlighted default.
-  const accounts = [createAnonymousUser(), ...(bundle.accounts || []).filter(acc => !isAnonymousUser(acc))];
+  // login's users follow (the case's accounts when the login's list could not
+  // be read), then the Super Admin. When nobody is picked yet Anonymous is the
+  // highlighted default.
+  const accounts = [createAnonymousUser(), ...(_loginUsersLoaded
+      ? [...getLoginUsers().map(loginUserAsAccount), (bundle.accounts || []).find(acc => acc && acc.pin === '1976') || createSuperAdminAccount()]
+      : (bundle.accounts || []).filter(acc => !isAnonymousUser(acc)))];
   let selectedUser = getCurrentUser() || createAnonymousUser();
 
   const inputs = document.createElement('div');
@@ -10116,8 +10541,9 @@ function showAccountManager() {
   btnContainer.appendChild(logoutBtn);
 }
 
-function showEditAccountPopup(acc, index = -1) {
-    const popup = createPopup(acc ? 'Edit Account' : 'Create Account', null, () => showAccountManager());
+function showEditAccountPopup(acc, index = -1, onDone = null) {
+    const finish = typeof onDone === 'function' ? onDone : () => showAccountManager();
+    const popup = createPopup(acc ? 'Edit Account' : 'Create Account', null, () => finish());
     const content = popup.querySelector('.popup-content');
     const btnContainer = popup.querySelector('.popup-buttons');
 
@@ -10259,6 +10685,7 @@ function showEditAccountPopup(acc, index = -1) {
                 }
             }
 
+            if (acc) noteLoginUserRename(acc.username, newAcc.username);
             if (index >= 0) {
                 bundle.accounts[index] = newAcc;
             } else {
@@ -10266,7 +10693,7 @@ function showEditAccountPopup(acc, index = -1) {
             }
             saveBundle(bundle);
             closePopup(popup);
-            showAccountManager();
+            finish();
         });
     };
     btnContainer.appendChild(saveBtn);
@@ -10694,6 +11121,7 @@ function printCurrentReport(type) {
     .activity-log-entry { margin-bottom: 1px; }
     .activity-log-time { font-weight: bold; margin-right: 5px; }
     .no-print { text-align: center; margin-bottom: 20px; padding: 10px; background: #f0f2f5; }
+    ${PRINT_LOGO_STYLES}
     @media print { .no-print { display: none; } }
   `;
 
@@ -10709,7 +11137,7 @@ function printCurrentReport(type) {
         <button onclick="window.print()" style="padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 999px;">Print PDF</button>
       </div>
       <div class="print-container">
-        <h1>${title}</h1>
+        ${getPrintTitleRowHTML(bundle, title)}
         ${timecardsHtml}
         ${timecardsHtml ? '<h2 class="section-title">Activity Log</h2>' : ''}
         <div class="activity-log">
@@ -10757,6 +11185,7 @@ function printAllReports(type) {
       .activity-log-entry { margin-bottom: 1px; }
       .activity-log-time { font-weight: bold; margin-right: 5px; }
       .no-print { text-align: center; margin-bottom: 20px; padding: 10px; background: #f0f2f5; }
+      ${PRINT_LOGO_STYLES}
       @media print { .no-print { display: none; } }
     `;
 
@@ -10778,7 +11207,7 @@ function printAllReports(type) {
         const teams = Array.from(new Set(log.map(e => e.team).filter(Boolean))).sort();
         teams.forEach(team => {
             htmlContent += '<div class="print-section">';
-            htmlContent += `<h1>Team Activity Report: ${team}</h1>`;
+            htmlContent += getPrintTitleRowHTML(bundle, `Team Activity Report: ${team}`);
             htmlContent += '<div class="activity-log">';
             log.filter(e => e.team === team).forEach(entry => {
                 const tagPart = entry.tag || 'base';
@@ -10799,7 +11228,7 @@ function printAllReports(type) {
             });
             if (memberLogs.length > 0) {
                 htmlContent += '<div class="print-section">';
-                htmlContent += `<h1>Member Activity Report: ${member}</h1>`;
+                htmlContent += getPrintTitleRowHTML(bundle, `Member Activity Report: ${member}`);
                 htmlContent += '<div class="activity-log">';
                 memberLogs.forEach(entry => {
                     const tagPart = entry.tag || 'base';
@@ -12513,6 +12942,9 @@ function showCaseNumberPopup(originElement = null) {
         }
 
         newBundle.accounts = currentBundle.accounts;
+        // Every user of the login is on the new case from the start (with a
+        // Personnel row each), not only the people of the case that was open.
+        applyLoginUsersToBundle(newBundle);
 
         logCreation('New Case #', newBundle.fileName, newBundle);
 
@@ -12850,10 +13282,14 @@ function getBackgroundImageSource(bundle) {
   return bundle && typeof bundle.background === 'string' && bundle.background ? bundle.background : DEFAULT_BACKGROUND_IMAGE;
 }
 
+// The photo is painted by the fixed body::before layer in styles.css (so it
+// stays put while the content scrolls over it) and reads the image from the
+// --sar-background-image custom property on <html>; the dimming tint is a
+// separate fixed layer, so only the picture is set here.
 function applyBackground(bundle) {
   const src = getBackgroundImageSource(bundle);
   if (src) {
-    document.body.style.backgroundImage = `linear-gradient(var(--bg-dim-start), var(--bg-dim-end)), url('${src}')`;
+    document.documentElement.style.setProperty('--sar-background-image', `url('${src}')`);
   }
 }
 
@@ -12863,6 +13299,57 @@ function getLogoImageSource(bundle) {
   const own = getUserAsset('logo');
   if (own) return own.data;
   return bundle && typeof bundle.logo === 'string' ? bundle.logo : '';
+}
+
+// ---------------------------------------------------------------------------
+// The login's logo on printouts.
+//
+// Every printout (Task Assignment Forms, IC Report, Incident Times Report, the
+// team/member activity reports and the whole Case # Printout) opens with a
+// title row: the header logo of the logged-in username on the left, 150 px
+// wide, and the title beside it on the right. Without a logo the row holds
+// the title alone, as before. The image is the same one the site header
+// shows (getLogoImageSource), so the print window - an about:blank page -
+// gets it as a data: URL or as an absolute address, never as a path relative
+// to a page it does not have.
+// ---------------------------------------------------------------------------
+const PRINT_LOGO_WIDTH_PX = 150;
+
+const PRINT_LOGO_STYLES = `
+    .print-title-row { display: flex; align-items: center; gap: 15px; border-bottom: 2px solid #000; margin: 0 0 15px 0; padding-bottom: 5px; page-break-inside: avoid; }
+    .print-title-row h1, .print-title-row h2 { flex: 1; border-bottom: none; margin: 0; padding-bottom: 0; }
+    .print-logo { flex: 0 0 ${PRINT_LOGO_WIDTH_PX}px; width: ${PRINT_LOGO_WIDTH_PX}px; max-width: ${PRINT_LOGO_WIDTH_PX}px; height: auto; object-fit: contain; display: block; }
+    .form-header { align-items: center; gap: 15px; }
+    .form-header .form-header-title { flex: 1; }
+`;
+
+// The logo address for a print window, or '' when the login has none.
+function getPrintLogoSource(bundle) {
+  const src = String(getLogoImageSource(bundle) || '').trim();
+  if (!src) return '';
+  if (/^(data:|blob:|https?:)/i.test(src)) return src;
+  try {
+    const base = (typeof document !== 'undefined' && document.baseURI) || (typeof location !== 'undefined' ? location.href : '');
+    return base ? new URL(src, base).href : src;
+  } catch (e) {
+    return src;
+  }
+}
+
+// `<img class="print-logo">` for the printouts, or '' without a logo.
+function getPrintLogoHTML(bundle) {
+  const src = getPrintLogoSource(bundle);
+  if (!src) return '';
+  return `<img class="print-logo" src="${escapeIcReportHtml(src)}" alt="" width="${PRINT_LOGO_WIDTH_PX}">`;
+}
+
+// The top row of a printout: logo (left) and title (right) in one row.
+// `titleHtml` is already-escaped markup; `options.tag` is the heading level
+// ('h1' by default) and `options.className` an extra class for the heading.
+function getPrintTitleRowHTML(bundle, titleHtml, options = {}) {
+  const level = options.tag === 'h2' ? 'h2' : 'h1';
+  const classAttr = options.className ? ` class="${escapeIcReportHtml(options.className)}"` : '';
+  return `<div class="print-title-row">${getPrintLogoHTML(bundle)}<${level}${classAttr}>${titleHtml}</${level}></div>`;
 }
 
 function applyLogo(bundle) {
@@ -13544,13 +14031,16 @@ function lpbCategoryLogName(category, entry) {
 
 // Change the section in the open case and save it; `mutate` receives the
 // canonical section and returns the activity-log text (or nothing to log).
+// The PSRi / PSRc of the segments and the CalTopo colors follow at once
+// (saveLostPersonBehaviorChange) - whether the change was made on the
+// Incident page or in the copy of the section on the Maps page.
 function updateLostPersonBehavior(mutate) {
     const bundle = loadBundle();
     const lpb = normalizeLostPersonBehavior(bundle.lostPersonBehavior);
     const message = mutate(lpb, bundle);
     bundle.lostPersonBehavior = normalizeLostPersonBehavior(lpb);
     if (message) addActivityLogEntry('System', message, bundle);
-    saveBundle(bundle);
+    saveLostPersonBehaviorChange(bundle).catch(() => {});
     return bundle.lostPersonBehavior;
 }
 
@@ -13682,6 +14172,10 @@ function showLpbIppMarkerPopup(originElement = null, onDone = null) {
     btnContainer.appendChild(cancelBtn);
 }
 
+// The section as a whole, appended to `container`: below the profile form on
+// the Incident page, in the column beside the map on the Maps page
+// (buildMapsPage). One page shows one copy, found by its id, so the
+// handlers' renderLostPersonBehaviorSection() redraws it wherever it is.
 function buildLostPersonBehaviorSection(container) {
     if (!container) return;
     const section = document.createElement('div');
@@ -14168,7 +14662,7 @@ function printIncidentTimesReport() {
         <button onclick="window.print()" style="padding: 10px 20px; font-size: 16px; cursor: pointer; background: #007bff; color: white; border: none; border-radius: 999px;">Print PDF</button>
     </div>
     <div class="print-container">
-        <h1>Incident Times Report</h1>
+        ${getPrintTitleRowHTML(bundle, 'Incident Times Report')}
         <p><strong>File:</strong> ${escapeIcReportHtml(fileName)}</p>
         <div class="report-content">
             ${reportHTML}
@@ -15745,6 +16239,7 @@ const TASK_FORM_PRINT_STYLES = `
     .par-check-item { border-bottom: 1px dotted #ccc; padding: 4px 0; display: flex; align-items: baseline; }
     .par-check-time { font-weight: bold; width: 60px; font-size: 9pt; color: #444; }
     .par-check-action { flex: 1; font-size: 10pt; }
+    ${PRINT_LOGO_STYLES}
     
     @media screen {
         body { background: #f0f2f5; padding: 40px 0; }
@@ -15756,7 +16251,8 @@ const TASK_FORM_PRINT_STYLES = `
     }
 `;
 
-function getTaskFormPrintHTML(num, f) {
+// `bundle` supplies the login's logo for the form header (see getPrintLogoHTML).
+function getTaskFormPrintHTML(num, f, bundle) {
     const members = (f.teamMembers || []).map(m => {
         const details = [];
         if (m.leader) details.push('L');
@@ -15781,7 +16277,7 @@ function getTaskFormPrintHTML(num, f) {
     return `
                 <div class="task-form">
                     <div class="form-header">
-                        <span style="font-weight: bold; font-size: 16pt;">Task Assignment Form</span>
+                        ${getPrintLogoHTML(bundle)}<span class="form-header-title" style="font-weight: bold; font-size: 16pt;">Task Assignment Form</span>
                         <span style="font-weight: bold; font-size: 16pt;">Task # ${num}</span>
                     </div>
                     
@@ -15887,7 +16383,7 @@ function printSingleTaskForm(taskNum) {
     </div>
     <div class="print-container">
         <div class="print-section">
-            ${getTaskFormPrintHTML(taskNum, f)}
+            ${getTaskFormPrintHTML(taskNum, f, bundle)}
         </div>
     </div>
     <script>
@@ -15917,7 +16413,7 @@ function downloadAllForms() {
 
   let formsHTML = '';
   taskNums.forEach(num => {
-    formsHTML += `<div class="print-section">${getTaskFormPrintHTML(num, forms[num])}</div>`;
+    formsHTML += `<div class="print-section">${getTaskFormPrintHTML(num, forms[num], bundle)}</div>`;
   });
 
   printWindow.document.write(`
@@ -15962,7 +16458,7 @@ function printSearchFile() {
     const forms = bundle.forms || {};
     const taskFormsHTML = Object.keys(forms)
         .sort((a, b) => parseInt(a) - parseInt(b))
-        .map(num => `<div class="print-section">${getTaskFormPrintHTML(num, forms[num])}</div>`)
+        .map(num => `<div class="print-section">${getTaskFormPrintHTML(num, forms[num], bundle)}</div>`)
         .join('');
     const icReportHTML = getIcReportPrintHTML(bundle);
     // The Incident Times Report, compactly (only members/days with times).
@@ -16015,6 +16511,7 @@ function printSearchFile() {
         .par-check-item { border-bottom: 1px dotted #ccc; padding: 4px 0; display: flex; align-items: baseline; }
         .par-check-time { font-weight: bold; width: 60px; font-size: 9pt; color: #444; }
         .par-check-action { flex: 1; font-size: 10pt; }
+        ${PRINT_LOGO_STYLES}
         
         @media screen {
             body { background: #f0f2f5; padding: 40px 0; }
@@ -16035,7 +16532,7 @@ function printSearchFile() {
     <div class="print-container">
         <!-- Search Log & Charts -->
         <div class="print-section">
-            <h1>Search Log: ${fileName}</h1>
+            ${getPrintTitleRowHTML(bundle, `Search Log: ${escapeIcReportHtml(fileName)}`)}
             
             <div class="charts-container">
                 <div class="chart-item">
@@ -16067,7 +16564,7 @@ function printSearchFile() {
 
         <!-- Activity Log -->
         <div class="print-section">
-            <h1>Activity Log</h1>
+            ${getPrintTitleRowHTML(bundle, 'Activity Log')}
             <div id="al-body" class="activity-log"></div>
         </div>
 
@@ -17100,6 +17597,9 @@ document.addEventListener('DOMContentLoaded', async () => {
     // The login's own images (logo, background photo) only need the credentials,
     // so they are read alongside the case and awaited just before drawing.
     const userAssetsReady = withTimeout(loadUserAssets(), 10000);
+    // So are the login's users (the team every case of the login shares); they
+    // are laid over the case below, before it is drawn.
+    const loginUsersReady = withTimeout(loadLoginUsers(), 10000);
 
     if (!getSyncBucket() && !isHomePage()) {
         // No case number is set yet. Instead of silently bouncing the user back
@@ -17129,8 +17629,19 @@ document.addEventListener('DOMContentLoaded', async () => {
     // The login's stored preferences win over whatever the case last held, so a
     // login sees its own settings in every case and on every device. The case
     // is saved when that changed it, so it mirrors the login from now on.
+    // The same goes for the login's users: every case lists them all, with a
+    // Personnel row each (only what they do in the case is the case's own) -
+    // but only onto a case that really is in memory for the open CASE #,
+    // never onto the empty stand-in a failed read leaves behind.
+    await loginUsersReady;
     let bundle = loadBundle();
-    if (getUserCredentials() && applyLoginPreferencesToBundle(bundle) && getSyncBucket()) {
+    let bundleChanged = getUserCredentials() && applyLoginPreferencesToBundle(bundle);
+    const caseInMemory = !!getSyncBucket() && !!getStorageItem(BUNDLE_STORAGE_KEY)
+        && getStorageItem(BUNDLE_BUCKET_STORAGE_KEY) === getSyncBucket();
+    if (getUserCredentials() && caseInMemory && applyLoginUsersToBundle(bundle)) {
+        bundleChanged = true;
+    }
+    if (bundleChanged && getSyncBucket()) {
         saveBundle(bundle);
         bundle = loadBundle();
     }
@@ -19243,6 +19754,8 @@ function buildUserAccountPage() {
 
         const idx = (bundle.accounts || []).findIndex(a => a.pin === oldPin);
 
+        // A renamed user is a new name on the login's list; the old one is retired.
+        noteLoginUserRename(oldFullName, newUsername);
         userToEdit.username = newUsername;
         userToEdit.pin = newPin;
         userToEdit.handle = newHandle;
@@ -19297,7 +19810,7 @@ function renderUserManagement(container, bundle) {
     container.innerHTML = `
         <div class="table-card" style="max-width: 1200px; margin: 0 auto; background: rgba(0,0,0,0.2); border-radius: 15px; border: 1px solid rgba(255,255,255,0.1); overflow-x: auto;">
             <div style="padding: 20px; background: rgba(0,0,0,0.2); border-bottom: 1px solid rgba(255,255,255,0.1); color: var(--muted); font-size: 0.9rem; text-align: center;">
-                User accounts are automatically synchronized with the Personnel list. To add or remove users, please use the Personnel page.
+                These users belong to the login "${(getUserCredentials() || {}).name || ''}" and are the same in every Case #: their name, PIN, highlight color and theme travel with the login, while their team and status are kept per case on the Personnel page. A name typed on the Personnel page becomes a user; "Remove" takes a user off the login (out of every case).
             </div>
             <table class="grid-table" style="width: 100%; border-collapse: collapse; min-width: 600px;">
                 <thead>
@@ -19311,7 +19824,8 @@ function renderUserManagement(container, bundle) {
                 <tbody id="user-management-body"></tbody>
             </table>
         </div>
-        <div style="text-align: center; margin-top: 30px;">
+        <div style="text-align: center; margin-top: 30px; display: flex; gap: 10px; justify-content: center; flex-wrap: wrap;">
+            <button id="add-user-btn-mgmt" class="mini-pill" style="padding: 12px 20px; font-size: 1rem;">+ Add User</button>
             <button id="switch-user-btn-mgmt" class="mini-pill" style="padding: 12px 20px; font-size: 1rem; background: rgba(235, 87, 87, 0.1); border-color: rgba(235, 87, 87, 0.4);">Switch User</button>
         </div>
     `;
@@ -19319,6 +19833,12 @@ function renderUserManagement(container, bundle) {
     const switchBtnMgmt = document.getElementById('switch-user-btn-mgmt');
     if (switchBtnMgmt) {
         switchBtnMgmt.onclick = () => requestUserSwitch();
+    }
+    // A new user gets a name (and a Personnel row in this case); the save hook
+    // then puts them on the login's list for every case.
+    const addBtnMgmt = document.getElementById('add-user-btn-mgmt');
+    if (addBtnMgmt) {
+        addBtnMgmt.onclick = () => showEditAccountPopup(null, -1, () => buildUserAccountPage());
     }
 
     const tbody = document.getElementById('user-management-body');
@@ -19387,13 +19907,35 @@ function renderUserManagement(container, bundle) {
         tdActions.style.padding = '12px 15px';
         tdActions.style.textAlign = 'center';
         
-        const span = document.createElement('span');
-        span.textContent = 'Managed via Personnel';
-        span.style.color = 'var(--muted)';
-        span.style.fontSize = '0.8rem';
-        span.style.display = 'block';
-        span.style.lineHeight = '1.2';
-        tdActions.appendChild(span);
+        if (isLoginUserCandidate(acc)) {
+            // Off the login: flagged as removed in the login's list, dropped
+            // from this case now and from every other case when it is opened.
+            const removeBtn = document.createElement('button');
+            removeBtn.className = 'mini-pill';
+            removeBtn.style.color = 'var(--accent)';
+            removeBtn.textContent = 'Remove';
+            removeBtn.title = 'Remove this user from the login (every Case #)';
+            removeBtn.onclick = () => {
+                const b = loadBundle();
+                const doRemove = () => {
+                    removeLoginUser(acc.username);
+                    logDeletion('User', acc.username);
+                    buildUserAccountPage();
+                };
+                if (b.deleteMode || confirm(`Remove ${acc.username || 'this user'} from the login? They disappear from every Case #.`)) {
+                    doRemove();
+                }
+            };
+            tdActions.appendChild(removeBtn);
+        } else {
+            const span = document.createElement('span');
+            span.textContent = 'Built-in';
+            span.style.color = 'var(--muted)';
+            span.style.fontSize = '0.8rem';
+            span.style.display = 'block';
+            span.style.lineHeight = '1.2';
+            tdActions.appendChild(span);
+        }
 
         tr.appendChild(tdActions);
         
@@ -19404,6 +19946,34 @@ function renderUserManagement(container, bundle) {
 function buildUserManagementPage() {
     navigateToPage('page8.html?tab=manage');
 }
+
+// The Maps page's map + Lost Person Behavior row (.map-lpb-row) spans the
+// whole screen, not just <main>'s 1200px. The stylesheet sizes it from
+// --sar-viewport-width on <html>: the document's width without the vertical
+// scrollbar (documentElement.clientWidth). Its fallback, plain 100vw, counts
+// the scrollbar on Windows and would leave a horizontal scrollbar behind.
+// Kept current by a ResizeObserver on <html> (it also fires when the
+// scrollbar appears or goes, which a window resize event does not), else on
+// resize; bound once per page load.
+let _viewportWidthVariableBound = false;
+function syncViewportWidthVariable() {
+    const root = document.documentElement;
+    if (!root || !root.style || typeof root.style.setProperty !== 'function') return;
+    const width = Number(root.clientWidth);
+    if (Number.isFinite(width) && width > 0) root.style.setProperty('--sar-viewport-width', `${width}px`);
+    if (_viewportWidthVariableBound) return;
+    _viewportWidthVariableBound = true;
+    try {
+        if (typeof ResizeObserver === 'function') {
+            new ResizeObserver(() => syncViewportWidthVariable()).observe(root);
+        } else {
+            window.addEventListener('resize', () => syncViewportWidthVariable());
+        }
+    } catch (e) {
+        // Without either the stylesheet's 100vw fallback still applies.
+    }
+}
+
 function buildMapsPage() {
   const container = document.querySelector('main');
   if (!container) return;
@@ -19438,25 +20008,36 @@ function buildMapsPage() {
     </section>
 
     <div id="map-view-container" style="display: ${activeTab === 'map' ? 'block' : 'none'};">
-      <section id="map-view-section" class="table-card" style="display: none; padding: 0; overflow: hidden; height: 75vh; position: relative; margin-top: 20px; border-radius: 16px;">
-        <div class="table-tools" style="padding: 15px; background: var(--header-bg); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center;">
-          <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
-            <h2 id="current-map-title" style="margin: 0; font-size: 1.2rem;">Map View</h2>
-            <span id="caltopo-color-sync-countdown" class="mini-pill" style="display: none; padding: 3px 10px; font-size: 0.75rem;" title="Time until the PSRc segment colors are next pushed to CalTopo (at most once per cooldown, at least once per heartbeat - see Settings)."></span>
+      <!-- The Lost Person Behavior section (left half) and the map (right
+           half) side by side in a row the width of the whole screen (it breaks
+           out of <main>, see .map-lpb-row). The section is the Incident
+           page's, rendered into #map-lpb-scroll by buildLostPersonBehaviorSection
+           below; its column is as tall as the map and scrolls inside itself.
+           Shown with the map. -->
+      <div id="map-lpb-row" class="map-lpb-row" style="display: none;">
+        <section id="map-lpb-panel" class="table-card map-lpb-panel" aria-label="Lost Person Behavior">
+          <div id="map-lpb-scroll" class="map-lpb-scroll"></div>
+        </section>
+        <section id="map-view-section" class="table-card map-lpb-map" style="padding: 0; overflow: hidden; position: relative; border-radius: 16px;">
+          <div class="table-tools" style="padding: 15px; background: var(--header-bg); border-bottom: 1px solid var(--line); display: flex; justify-content: space-between; align-items: center;">
+            <div style="display: flex; align-items: center; gap: 10px; flex-wrap: wrap;">
+              <h2 id="current-map-title" style="margin: 0; font-size: 1.2rem;">Map View</h2>
+              <span id="caltopo-color-sync-countdown" class="mini-pill" style="display: none; padding: 3px 10px; font-size: 0.75rem;" title="Time until the PSRc segment colors are next pushed to CalTopo (at most once per cooldown, at least once per heartbeat - see Settings)."></span>
+            </div>
+            <div class="tool-actions" style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
+              <label style="display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; cursor: pointer;" title="Colors the CalTopo assignment shapes by PSRc, draws segments being searched in the active-search style, and appends a summary of each finished task (date/time, team and members, tracks, sweep width) to the shape's description.">
+                <span>PSRc Assignment Colors</span>
+                <span class="toggle-switch" style="transform: scale(0.9);">
+                  <input type="checkbox" id="caltopo-assignment-overlay-toggle" ${isCalTopoAssignmentOverlayEnabled() ? 'checked' : ''}>
+                  <span class="slider"></span>
+                </span>
+              </label>
+              <button id="fetch-shapes-btn" class="clear-btn">Fetch Shapes</button>
+            </div>
           </div>
-          <div class="tool-actions" style="display: flex; align-items: center; gap: 16px; flex-wrap: wrap;">
-            <label style="display: inline-flex; align-items: center; gap: 10px; color: var(--muted); font-size: 0.92rem; cursor: pointer;" title="Colors the CalTopo assignment shapes by PSRc, draws segments being searched in the active-search style, and appends a summary of each finished task (date/time, team and members, tracks, sweep width) to the shape's description.">
-              <span>PSRc Assignment Colors</span>
-              <span class="toggle-switch" style="transform: scale(0.9);">
-                <input type="checkbox" id="caltopo-assignment-overlay-toggle" ${isCalTopoAssignmentOverlayEnabled() ? 'checked' : ''}>
-                <span class="slider"></span>
-              </span>
-            </label>
-            <button id="fetch-shapes-btn" class="clear-btn">Fetch Shapes</button>
-          </div>
-        </div>
-        <iframe id="map-iframe" style="width: 100%; height: calc(100% - 62px); border: none;" allow="geolocation" referrerpolicy="strict-origin-when-cross-origin"></iframe>
-      </section>
+          <iframe id="map-iframe" style="width: 100%; height: calc(100% - 62px); border: none;" allow="geolocation" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+        </section>
+      </div>
 
       <section id="unaccounted-features-section" class="table-card" style="display: none; margin-top: 20px;">
         <div class="table-tools" style="display: flex; justify-content: space-between; align-items: flex-start; gap: 16px; flex-wrap: wrap;">
@@ -19561,6 +20142,7 @@ function buildMapsPage() {
   `;
   const addMapBtn = document.getElementById('add-map-btn');
   const mapsList = document.getElementById('maps-list');
+  const mapLpbRow = document.getElementById('map-lpb-row');
   const mapViewSection = document.getElementById('map-view-section');
   const mapIframe = document.getElementById('map-iframe');
   const currentMapTitle = document.getElementById('current-map-title');
@@ -19570,6 +20152,13 @@ function buildMapsPage() {
   const tabMap = document.getElementById('tab-map');
   const tabArcGIS = document.getElementById('tab-arcgis');
   const tabFeatures = document.getElementById('tab-features');
+
+  // The Lost Person Behavior section beside the map: the Incident page's
+  // section (same id, same handlers - a switch flipped here is the case's
+  // one section), so every change redraws it in place. The row it shares
+  // with the map is sized from the measured screen width.
+  buildLostPersonBehaviorSection(document.getElementById('map-lpb-scroll'));
+  syncViewportWidthVariable();
 
   tabMap.onclick = () => {
     const newUrl = window.location.pathname + '?tab=map';
@@ -19633,7 +20222,8 @@ function buildMapsPage() {
     if (!bundle.maps || bundle.maps.length === 0) {
       mapsList.innerHTML = '<p style="grid-column: 1/-1; text-align: center; color: var(--muted); padding: 40px;">No map added yet. Enter a Map ID above.</p>';
       mapsList.style.display = 'grid';
-      mapViewSection.style.display = 'none';
+      // No map: neither the map card nor the Lost Person Behavior column.
+      if (mapLpbRow) mapLpbRow.style.display = 'none';
       if (unaccountedSection) unaccountedSection.style.display = 'none';
       mapIframe.src = '';
       activeMapId = null;
@@ -19658,7 +20248,8 @@ function buildMapsPage() {
     currentMapTitle.textContent = name || id;
     const suffix = isFullMode ? '' : '/embed';
     mapIframe.src = `https://${activeMapDomain}/m/${id}${suffix}`;
-    mapViewSection.style.display = 'block';
+    // Lets the stylesheet's display: grid take over from the inline "none".
+    if (mapLpbRow) mapLpbRow.style.display = '';
     if (!skipScroll && activeTab === 'map') {
       setTimeout(() => mapViewSection.scrollIntoView({ behavior: 'smooth', block: 'start' }), 100);
     }
