@@ -21453,6 +21453,8 @@ function buildMapsPage() {
                 </span>
               </label>
               <button id="fetch-shapes-btn" class="clear-btn">Fetch Shapes</button>
+              <button id="auto-draw-segments-btn" class="clear-btn" title="Pick a CalTopo polygon and cut it into equal slices of 10-15 acres (vertical, horizontal or at an angle), drawn on the map as new assignments.">Auto Draw Segments</button>
+              <button id="trim-tracks-btn" class="clear-btn" title="Pick the routes / tracks on the map and the parts to cut off them (by segment, or the miles outside every segment); a track cut in several pieces becomes ... p1, ... p2 and so on.">Trim Tracks</button>
             </div>
           </div>
           <iframe id="map-iframe" style="width: 100%; height: calc(100% - 62px); border: none;" allow="geolocation" referrerpolicy="strict-origin-when-cross-origin"></iframe>
@@ -21759,6 +21761,12 @@ function buildMapsPage() {
 
   fetchShapesBtn.onclick = () => caltopo_request(fetchShapesBtn);
   if (refreshFeaturesBtn) refreshFeaturesBtn.onclick = () => caltopo_request(refreshFeaturesBtn);
+  // The two map tools (see "Maps page tools" below): both fetch the shapes
+  // quietly first when the case has none yet.
+  const autoDrawBtn = document.getElementById('auto-draw-segments-btn');
+  if (autoDrawBtn) autoDrawBtn.onclick = () => openAutoDrawSegmentsTool(autoDrawBtn);
+  const trimTracksBtn = document.getElementById('trim-tracks-btn');
+  if (trimTracksBtn) trimTracksBtn.onclick = () => openTrimTracksTool(trimTracksBtn);
 
   const checkUnaccountedBtn = document.getElementById('check-unaccounted-btn');
   if (checkUnaccountedBtn) {
@@ -21784,6 +21792,896 @@ function buildMapsPage() {
   });
 
   renderMaps(true);
+}
+
+// ---------------------------------------------------------------------------
+// Maps page tools: "Auto Draw Segments" and "Trim Tracks".
+//
+// Both work on the case's copy of the CalTopo map (fetched quietly first when
+// the case has no shapes yet), write to CalTopo through the sync server's
+// signed proxy (caltopo_api_call) and then bring the case's copy of the map
+// up to date at once - the new slices appended, a trimmed track's line
+// replaced, a split track replaced by its parts - before a quiet re-fetch
+// makes it exactly what CalTopo has (ids, properties). The maths are pure and
+// live in map-segment-utils.js (planAutoDrawSegments, summarizeTrackPortions,
+// trimTrackPaths); the wrappers below only fall back to "nothing" should the
+// module fail to load.
+// ---------------------------------------------------------------------------
+
+function planAutoDrawSegments(feature, options = {}) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.planAutoDrawSegments === 'function') return utils.planAutoDrawSegments(feature, options);
+    return {ok: false, reason: 'no-area', totalAcres: 0, count: 0, acresEach: 0, undersized: false, angleDegrees: 0, pieces: []};
+}
+
+function computeAutoDrawSliceCount(totalAcres) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.computeAutoDrawSliceCount === 'function') return utils.computeAutoDrawSliceCount(totalAcres);
+    return {count: 0, acresEach: 0, undersized: false, minAcres: 10, maxAcres: 15};
+}
+
+function getAutoDrawAcreBounds() {
+    const utils = getMapSegmentUtils();
+    return {
+        min: Number.isFinite(utils.AUTO_DRAW_MIN_ACRES) ? utils.AUTO_DRAW_MIN_ACRES : 10,
+        max: Number.isFinite(utils.AUTO_DRAW_MAX_ACRES) ? utils.AUTO_DRAW_MAX_ACRES : 15
+    };
+}
+
+function buildAutoDrawSegmentName(baseName, index) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.buildAutoDrawSegmentName === 'function') return utils.buildAutoDrawSegmentName(baseName, index);
+    return `${String(baseName || '').trim() || 'Segment'}-${index}`;
+}
+
+function getFeatureAreaPolygons(feature) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.collectAreaPolygons === 'function' ? utils.collectAreaPolygons(feature && feature.geometry) : [];
+}
+
+function getLineStringPaths(geometry) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.getLineStringPaths === 'function' ? utils.getLineStringPaths(geometry) : [];
+}
+
+function summarizeTrackPortions(paths, segments) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.summarizeTrackPortions === 'function' ? utils.summarizeTrackPortions(paths, segments) : [];
+}
+
+function trimTrackPaths(paths, segments, removal) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.trimTrackPaths === 'function') return utils.trimTrackPaths(paths, segments, removal);
+    return {parts: [], removedMiles: 0, keptMiles: 0};
+}
+
+function buildTrimmedTrackPartName(baseName, index) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.buildTrimmedTrackPartName === 'function') return utils.buildTrimmedTrackPartName(baseName, index);
+    return `${String(baseName || '').trim() || 'Track'} p${index}`;
+}
+
+// The slice directions offered: the bearing of the cut lines (degrees
+// clockwise from north); `angle` null = typed in by the planner.
+const AUTO_DRAW_DIRECTIONS = [
+    {key: 'vertical', label: 'Vertical', angle: 0, hint: 'North-south cut lines; the slices are numbered west to east.'},
+    {key: 'horizontal', label: 'Horizontal', angle: 90, hint: 'East-west cut lines; the slices are numbered north to south.'},
+    {key: 'custom', label: 'Custom angle', angle: null, hint: 'Cut lines at the angle typed in, in degrees clockwise from north (0 = vertical, 90 = horizontal).'}
+];
+// The CalTopo classes a slice is created under, in order: an Assignment
+// (importable as a segment below the map), else a plain Shape.
+const AUTO_DRAW_OBJECT_TYPES = ['Assignment', 'Shape'];
+
+// "vertical slices" / "horizontal slices" / "slices at 30° from north".
+function describeAutoDrawDirection(angleDegrees) {
+    const angle = Number(angleDegrees) || 0;
+    if (angle === 0 || angle === 180) return 'vertical slices';
+    if (angle === 90 || angle === 270) return 'horizontal slices';
+    return `slices at ${Math.round(angle * 10) / 10}\u00b0 from north`;
+}
+
+// --- CalTopo writes ----------------------------------------------------------
+
+// The id CalTopo gave a created object. The Team API answers {status: 'ok',
+// result: <the feature>}; a bare feature is read too.
+function extractCalTopoCreatedId(result) {
+    if (!result || typeof result !== 'object') return '';
+    const candidates = [
+        result.result && result.result.id,
+        result.result && result.result.properties && result.result.properties.id,
+        result.id,
+        result.properties && result.properties.id
+    ];
+    for (const candidate of candidates) {
+        const id = candidate === undefined || candidate === null ? '' : String(candidate).trim();
+        if (id && id !== '[object Object]') return id;
+    }
+    return '';
+}
+
+// An answer of caltopo_api_call that means CalTopo took the request: not the
+// null a refused call resolves to, and not a body that says "error" itself.
+// (A DELETE may come back as an empty string, which counts as taken.)
+function isCalTopoCallAccepted(result) {
+    if (result === null || result === undefined) return false;
+    return !(typeof result === 'object' && String(result.status || '').toLowerCase() === 'error');
+}
+
+function getCalTopoMapEndpointBase(map) {
+    return `/api/v1/map/${encodeURIComponent(map.id)}`;
+}
+
+// Create one object on the case's map: POST /api/v1/map/<map>/<class> (no
+// object id) with a GeoJSON Feature, trying the classes in order. Resolves
+// {id, objectType} - `id` '' when CalTopo took the object but its answer
+// carried none - or null when every class was refused.
+async function createCalTopoMapFeature(map, objectTypes, geometry, properties) {
+    const payload = {type: 'Feature', id: null, geometry, properties};
+    for (const objectType of objectTypes) {
+        const endpoint = `${getCalTopoMapEndpointBase(map)}/${encodeURIComponent(objectType)}`;
+        const result = await caltopo_api_call('POST', endpoint, payload, map.domain || 'caltopo.com', {silent: true});
+        if (isCalTopoCallAccepted(result)) return {id: extractCalTopoCreatedId(result), objectType};
+    }
+    return null;
+}
+
+// Replace the line of a track on CalTopo: the fetched feature (title, style
+// and all, so nothing else about it changes) with `geometry` in place of its
+// own, POSTed to its id under the class CalTopo reported, then Shape (as the
+// rename does). Resolves the class that took it, or ''.
+async function updateCalTopoMapFeatureGeometry(map, feature, geometry) {
+    const featureId = getCalTopoWritableFeatureId(feature);
+    if (!featureId) return '';
+    const payload = buildCalTopoFeatureUpdatePayload(feature);
+    payload.id = featureId;
+    payload.geometry = geometry;
+    // A parallel list of timestamps no longer matches the trimmed points.
+    if (Array.isArray(payload.properties.timestamps)) delete payload.properties.timestamps;
+    for (const objectType of getSearcherTrackApiObjectTypeCandidates(feature)) {
+        const endpoint = `${getCalTopoMapEndpointBase(map)}/${encodeURIComponent(objectType)}/${encodeURIComponent(featureId)}`;
+        const result = await caltopo_api_call('POST', endpoint, payload, map.domain || 'caltopo.com', {silent: true});
+        if (isCalTopoCallAccepted(result)) return objectType;
+    }
+    return '';
+}
+
+// Remove a line from the case's map: DELETE under the class CalTopo
+// reported, then Shape. Resolves true when CalTopo took it.
+async function deleteCalTopoMapFeature(map, feature) {
+    const featureId = getCalTopoWritableFeatureId(feature);
+    if (!featureId) return false;
+    for (const objectType of getSearcherTrackApiObjectTypeCandidates(feature)) {
+        const endpoint = `${getCalTopoMapEndpointBase(map)}/${encodeURIComponent(objectType)}/${encodeURIComponent(featureId)}`;
+        const result = await caltopo_api_call('DELETE', endpoint, null, map.domain || 'caltopo.com', {silent: true});
+        if (isCalTopoCallAccepted(result)) return true;
+    }
+    return false;
+}
+
+// Reload the map card's iframe so a write shows on the map.
+function reloadMapsPageIframe() {
+    if (typeof document === 'undefined') return;
+    const iframe = document.getElementById('map-iframe');
+    if (!iframe || !iframe.src) return;
+    try {
+        const url = new URL(iframe.src);
+        url.searchParams.set('_overlayRefresh', String(Date.now()));
+        iframe.src = url.toString();
+    } catch (error) { /* an unusable src is left alone */ }
+}
+
+// The case's map, or null (after telling the planner) when none is linked.
+function getCalTopoMapForTools(bundle) {
+    const map = bundle && Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    if (!map || !map.id) {
+        alert('No CalTopo map is linked to this case. Add the map on this page first.');
+        return null;
+    }
+    return map;
+}
+
+// The case's copy of the shapes, fetched quietly first when there is none.
+async function ensureMapFeaturesForTools(btn = null) {
+    let features = getMapFeatures(loadBundle());
+    if (!features.length) {
+        await caltopo_request(btn, {quiet: true});
+        features = getMapFeatures(loadBundle());
+    }
+    return features;
+}
+
+// After a write: the panel below the map, the Features tab and the iframe
+// follow the case's copy at once, then - quietly, best effort - the copy is
+// fetched again so it is exactly what CalTopo has.
+function finishCalTopoMapWrite() {
+    if (isMapsPage()) {
+        renderUnaccountedFeaturesPanel();
+        if (typeof renderFeaturesList === 'function') renderFeaturesList();
+        reloadMapsPageIframe();
+    }
+    refreshUnaccountedMapFeatureNotifications();
+    return Promise.resolve()
+        .then(() => caltopo_request(null, {quiet: true}))
+        .catch(error => {
+            console.warn('[MAPS] re-fetch after a CalTopo write failed:', error && error.message ? error.message : error);
+            return null;
+        });
+}
+
+// A copy of a fetched feature carrying another geometry (and attribute
+// overrides), as the case's copy of the map stores it.
+function cloneMapFeatureWith(feature, geometry, overrides = {}) {
+    const attributes = {...(feature.attributes || feature.properties || {}), ...overrides};
+    if (Array.isArray(attributes.timestamps)) delete attributes.timestamps;
+    return {geometry: JSON.parse(JSON.stringify(geometry)), attributes};
+}
+
+// The case's copy of a feature CalTopo created for us: the properties we
+// sent plus the class, the id (a synthetic "gfx-N" one when CalTopo's answer
+// carried none, so it is never written back) and the display name.
+function buildCreatedMapFeature(geometry, properties, objectType, id, name, objectId) {
+    return {
+        geometry: JSON.parse(JSON.stringify(geometry)),
+        attributes: {...properties, class: objectType, ObjectID: objectId, name, id: id || `gfx-${objectId}`}
+    };
+}
+
+// --- Auto Draw Segments -------------------------------------------------------
+
+// The fetched shapes a polygon can be cut from: every area with an outline,
+// whatever its class, A-Z.
+function getAutoDrawCandidateFeatures(features) {
+    return sortMapFeaturesByName((Array.isArray(features) ? features : []).filter(feature =>
+        getFeatureAreaPolygons(feature).length > 0 && calculateGeometry(feature).area > 0));
+}
+
+// "Auto Draw Segments": the button. Fetches the shapes when the case has none
+// yet, then opens the popup on the polygons among them.
+async function openAutoDrawSegmentsTool(btn = null) {
+    if (!getCalTopoMapForTools(loadBundle())) return null;
+    const features = await ensureMapFeaturesForTools(btn);
+    const areas = getAutoDrawCandidateFeatures(features);
+    if (!areas.length) {
+        alert('No polygon was found on the CalTopo map. Draw the area to cut (an assignment or a shape) on the map, click Fetch Shapes, then try again.');
+        return null;
+    }
+    return showAutoDrawSegmentsPopup(areas);
+}
+
+// The popup: the polygon (one radio per shape), the slice direction (three
+// pills, the angle pill live for "Custom angle"), a preview of the plan and
+// the confirm button. Resolves the popup element.
+function showAutoDrawSegmentsPopup(areas) {
+    const bounds = getAutoDrawAcreBounds();
+    const popup = createPopup('Auto Draw Segments', null);
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+    content.style.width = '90vw';
+    content.style.maxWidth = '860px';
+    content.style.maxHeight = '90vh';
+    content.style.display = 'flex';
+    content.style.flexDirection = 'column';
+
+    const state = {feature: null, direction: 'vertical', angle: '', plan: null, busy: false};
+
+    const body = document.createElement('div');
+    body.className = 'map-tool-body auto-draw-body';
+    const intro = document.createElement('p');
+    intro.className = 'track-import-intro';
+    intro.textContent = `Pick the CalTopo polygon to cut, choose the slice direction and confirm. The shape is cut into equal slices of at most ${bounds.max} acres - and at least ${bounds.min} acres wherever the shape allows it - as many as it takes to fill it, and the slices are drawn on the map as new assignments named after the shape (Alpha-1, Alpha-2, ...), ready to be imported as segments below the map. The original shape stays on the map.`;
+    body.appendChild(intro);
+
+    const listWrap = document.createElement('div');
+    listWrap.className = 'track-import-table-wrap auto-draw-feature-list';
+    const table = document.createElement('table');
+    table.className = 'grid-table';
+    const thead = document.createElement('thead');
+    thead.innerHTML = '<tr><th style="width: 40px;"></th><th>Shape</th><th>Type</th><th>Area (acres)</th><th>Slices</th></tr>';
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    const radios = [];
+    areas.forEach((feature, index) => {
+        const tr = document.createElement('tr');
+        tr.className = 'auto-draw-feature-row';
+        const radioTd = document.createElement('td');
+        const radio = document.createElement('input');
+        radio.type = 'radio';
+        radio.name = 'auto-draw-feature';
+        radio.className = 'auto-draw-feature-radio';
+        radio.value = String(index);
+        radio.onchange = () => {
+            if (!radio.checked) return;
+            state.feature = feature;
+            update();
+        };
+        radios.push(radio);
+        radioTd.appendChild(radio);
+        tr.appendChild(radioTd);
+        const acres = calculateGeometry(feature).area;
+        const sizing = computeAutoDrawSliceCount(acres);
+        const cells = [
+            getMapFeatureDisplayName(feature),
+            getMapFeatureCategoryLabel(feature),
+            acres.toFixed(2),
+            sizing.count > 1 ? `${sizing.count} x ~${sizing.acresEach.toFixed(1)} ac` : `already \u2264 ${bounds.max} ac`
+        ];
+        cells.forEach(text => {
+            const td = document.createElement('td');
+            const pill = document.createElement('div');
+            pill.className = 'pill-cell readonly-pill';
+            pill.textContent = text;
+            td.appendChild(pill);
+            tr.appendChild(td);
+        });
+        // The whole row picks the shape.
+        tr.onclick = (event) => {
+            if (event && event.target === radio) return;
+            radios.forEach(other => { other.checked = other === radio; });
+            state.feature = feature;
+            update();
+        };
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    listWrap.appendChild(table);
+    body.appendChild(listWrap);
+
+    const directionRow = document.createElement('div');
+    directionRow.className = 'auto-draw-direction-row';
+    const directionLabel = document.createElement('span');
+    directionLabel.className = 'custom-track-label';
+    directionLabel.textContent = 'Slice direction';
+    directionRow.appendChild(directionLabel);
+    const pills = new Map();
+    const angleInput = document.createElement('input');
+    AUTO_DRAW_DIRECTIONS.forEach(direction => {
+        const pill = document.createElement('button');
+        pill.type = 'button';
+        pill.className = `mini-pill auto-draw-direction-btn${direction.key === state.direction ? ' active' : ''}`;
+        pill.dataset.direction = direction.key;
+        pill.textContent = direction.label;
+        pill.title = direction.hint;
+        pill.onclick = () => {
+            state.direction = direction.key;
+            pills.forEach((el, key) => el.classList.toggle('active', key === direction.key));
+            angleInput.disabled = direction.key !== 'custom';
+            if (direction.key === 'custom' && typeof angleInput.focus === 'function') angleInput.focus();
+            update();
+        };
+        pills.set(direction.key, pill);
+        directionRow.appendChild(pill);
+    });
+    const angleWrap = document.createElement('label');
+    angleWrap.className = 'auto-draw-angle-wrap';
+    angleWrap.title = 'The angle of the cut lines in degrees clockwise from north: 0 = vertical, 90 = horizontal. Enter it before confirming.';
+    angleInput.type = 'number';
+    angleInput.className = 'pill-input auto-draw-angle';
+    angleInput.placeholder = 'Angle';
+    angleInput.min = '0';
+    angleInput.max = '359';
+    angleInput.step = '1';
+    angleInput.inputMode = 'numeric';
+    angleInput.disabled = true;
+    angleInput.oninput = () => {
+        state.angle = angleInput.value;
+        update();
+    };
+    angleWrap.appendChild(angleInput);
+    const angleUnit = document.createElement('span');
+    angleUnit.className = 'auto-draw-angle-unit';
+    angleUnit.textContent = '\u00b0 from north';
+    angleWrap.appendChild(angleUnit);
+    directionRow.appendChild(angleWrap);
+    body.appendChild(directionRow);
+
+    const preview = document.createElement('div');
+    preview.className = 'auto-draw-preview';
+    body.appendChild(preview);
+    const status = document.createElement('div');
+    status.className = 'custom-track-error auto-draw-status';
+    status.style.display = 'none';
+    body.appendChild(status);
+    content.insertBefore(body, btnContainer);
+
+    btnContainer.innerHTML = '';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => closePopup(popup);
+    btnContainer.appendChild(cancelBtn);
+    const confirmBtn = document.createElement('button');
+    confirmBtn.className = 'popup-btn primary auto-draw-confirm';
+    btnContainer.appendChild(confirmBtn);
+
+    const currentAngle = () => {
+        const direction = AUTO_DRAW_DIRECTIONS.find(d => d.key === state.direction) || AUTO_DRAW_DIRECTIONS[0];
+        if (direction.angle !== null) return direction.angle;
+        const value = parseFloat(state.angle);
+        return Number.isFinite(value) ? value : null;
+    };
+
+    const update = () => {
+        const angle = currentAngle();
+        state.plan = null;
+        if (!state.feature) {
+            preview.textContent = 'Pick the shape to cut above.';
+        } else if (angle === null) {
+            preview.textContent = 'Type the slice angle in degrees clockwise from north (0 = vertical, 90 = horizontal).';
+        } else {
+            const plan = planAutoDrawSegments(state.feature, {angleDegrees: angle});
+            const name = getMapFeatureDisplayName(state.feature);
+            if (!plan.ok) {
+                preview.textContent = `"${name}" has no area to cut.`;
+            } else if (plan.count <= 1) {
+                preview.textContent = `"${name}" is ${plan.totalAcres.toFixed(1)} acres - already at or under ${bounds.max} acres, so there is nothing to cut.`;
+            } else {
+                state.plan = plan;
+                const parts = [`"${name}": ${plan.totalAcres.toFixed(1)} acres \u2192 ${plan.count} slices of ~${plan.acresEach.toFixed(1)} acres (${describeAutoDrawDirection(plan.angleDegrees)})`];
+                if (plan.pieces.length !== plan.count) parts.push(`the outline leaves ${plan.pieces.length} pieces`);
+                if (plan.undersized) parts.push(`under the ${bounds.min}-acre minimum: a shape of ${bounds.max}-${bounds.min * 2} acres cannot be cut into ${bounds.min}-${bounds.max} acre slices`);
+                preview.textContent = `${parts.join('; ')}. Names: ${buildAutoDrawSegmentName(name, 1)} to ${buildAutoDrawSegmentName(name, plan.pieces.length)}.`;
+            }
+        }
+        preview.classList.toggle('is-warning', !!(state.plan && state.plan.undersized));
+        confirmBtn.disabled = state.busy || !state.plan || !state.plan.pieces.length;
+        confirmBtn.textContent = state.plan
+            ? `Draw ${state.plan.pieces.length} Segment${state.plan.pieces.length === 1 ? '' : 's'}`
+            : 'Draw Segments';
+    };
+
+    confirmBtn.onclick = async () => {
+        if (!state.plan || state.busy) return;
+        state.busy = true;
+        status.style.display = 'none';
+        update();
+        const outcome = await drawAutoDrawSegments(state.feature, state.plan, {
+            onProgress: (done, total) => { confirmBtn.textContent = `Drawing ${done} / ${total}\u2026`; }
+        });
+        state.busy = false;
+        if (outcome.created.length) {
+            closePopup(popup);
+            return;
+        }
+        status.textContent = outcome.errors.length
+            ? `CalTopo did not take the new shapes (${outcome.errors.join(', ')}). Check the proxy status and the service account\u2019s write access, then try again.`
+            : 'Nothing was drawn.';
+        status.style.display = 'block';
+        update();
+    };
+
+    update();
+    return popup;
+}
+
+// Draw the slices of `plan` on the case's map: one POST per piece (an
+// Assignment, else a Shape) carrying the source shape's style and folder,
+// named "<source>-<n>". The pieces CalTopo took are appended to the case's
+// copy of the map and logged; refused ones are reported. `options.onProgress
+// (done, total)` follows the POSTs. Resolves {created, errors}.
+async function drawAutoDrawSegments(feature, plan, options = {}) {
+    const bundle = loadBundle();
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    const pieces = plan && Array.isArray(plan.pieces) ? plan.pieces : [];
+    if (!map || !map.id || !pieces.length) return {created: [], errors: []};
+    const baseName = getMapFeatureDisplayName(feature);
+    const sourceAttrs = feature.attributes || feature.properties || {};
+    const style = captureCalTopoFeatureStyle(sourceAttrs);
+    const direction = describeAutoDrawDirection(plan.angleDegrees);
+    const created = [];
+    const errors = [];
+    for (const piece of pieces) {
+        const name = buildAutoDrawSegmentName(baseName, piece.index);
+        if (typeof options.onProgress === 'function') options.onProgress(piece.index, pieces.length);
+        const properties = {
+            title: name,
+            description: `Auto-drawn from "${baseName}" (${direction}): segment ${piece.index} of ${pieces.length}, ${piece.acres} acres.`
+        };
+        if (sourceAttrs.folderId) properties.folderId = sourceAttrs.folderId;
+        applyCapturedCalTopoFeatureStyle(properties, style);
+        const geometry = {type: 'Polygon', coordinates: [piece.ring.map(point => point.slice())]};
+        let result = null;
+        try {
+            result = await createCalTopoMapFeature(map, AUTO_DRAW_OBJECT_TYPES, geometry, properties);
+        } catch (error) {
+            console.warn(`[MAPS] auto draw of "${name}" failed: ${error && error.message ? error.message : error}`);
+        }
+        if (!result) {
+            errors.push(name);
+            continue;
+        }
+        created.push({name, acres: piece.acres, geometry, properties, objectType: result.objectType, id: result.id});
+    }
+
+    if (created.length) {
+        // The case may have been saved meanwhile: append to the latest copy.
+        const latest = loadBundle();
+        const latestMap = Array.isArray(latest.maps) && latest.maps[0] ? latest.maps[0] : null;
+        if (latestMap) {
+            const list = Array.isArray(latestMap.features) ? latestMap.features : [];
+            created.forEach(entry => {
+                list.push(buildCreatedMapFeature(entry.geometry, entry.properties, entry.objectType, entry.id, entry.name, list.length + 1));
+            });
+            latestMap.features = list;
+        }
+        addActivityLogEntry('System', `Auto-drew ${created.length} segment${created.length === 1 ? '' : 's'} from "${baseName}" on the CalTopo map (${direction}, ~${Number(plan.acresEach).toFixed(1)} acres each): ${created.map(entry => entry.name).join(', ')}`, latest);
+        saveBundle(latest);
+        showToast(`${created.length} segment${created.length === 1 ? '' : 's'} drawn on the map from "${baseName}". Import them below the map when ready.`, 'Auto Draw Segments');
+        finishCalTopoMapWrite();
+    }
+    if (errors.length && created.length) {
+        alert(`CalTopo did not take ${errors.length} of the ${pieces.length} slices: ${errors.join(', ')}.`);
+    }
+    return {created, errors};
+}
+
+// --- Trim Tracks ----------------------------------------------------------------
+
+// The segments a track can be trimmed by: every Segments row with a CalTopo
+// area shape (findFeatureForSegmentRow), as [{key, region, segment, geometry}].
+function getTrimTrackSegments(bundle) {
+    const features = getMapFeatures(bundle);
+    const utils = getMapSegmentUtils();
+    const seen = new Set();
+    return ensureSegmentsPageRows(bundle).map(row => {
+        if (!Array.isArray(row) || !String(row[1] || '').trim()) return null;
+        const shape = typeof utils.findFeatureForSegmentRow === 'function' ? utils.findFeatureForSegmentRow(features, row) : null;
+        if (!shape || !getFeatureAreaPolygons(shape).length) return null;
+        const region = String(row[0] || '').trim();
+        const segment = String(row[1] || '').trim();
+        const key = `${normalizeSegmentNameForMatch(region)}|${normalizeSegmentNameForMatch(segment)}`;
+        if (seen.has(key)) return null;
+        seen.add(key);
+        return {key, region, segment, geometry: shape.geometry};
+    }).filter(Boolean);
+}
+
+// The routes / tracks the tool can trim: the lines with a real CalTopo id (a
+// shape without one cannot be written back), A-Z.
+function getTrimTrackCandidateFeatures(features) {
+    return sortMapFeaturesByName((Array.isArray(features) ? features : []).filter(feature =>
+        isTrackLikeMapFeature(feature) && !!getCalTopoWritableFeatureId(feature)));
+}
+
+// "Trim Tracks": the button. Fetches the shapes when the case has none yet,
+// then opens the popup on the lines among them.
+async function openTrimTracksTool(btn = null) {
+    if (!getCalTopoMapForTools(loadBundle())) return null;
+    const features = await ensureMapFeaturesForTools(btn);
+    const tracks = getTrimTrackCandidateFeatures(features);
+    if (!tracks.length) {
+        alert('No route or track was found on the CalTopo map. Record or draw the line on the map, click Fetch Shapes, then try again.');
+        return null;
+    }
+    return showTrimTracksPopup(tracks);
+}
+
+// The popup: one row per line with a pill per segment it crosses (the miles
+// inside it) and one for the miles outside every segment; a pill clicked is
+// a part to cut off (struck through), the row's result cell says what would
+// be left. Confirm trims every track with a part selected.
+function showTrimTracksPopup(tracks) {
+    const bundle = loadBundle();
+    const segments = getTrimTrackSegments(bundle);
+    const utils = getMapSegmentUtils();
+    const pathMiles = typeof utils.pathLengthMiles === 'function' ? utils.pathLengthMiles : () => 0;
+    const items = (Array.isArray(tracks) ? tracks : []).map(feature => {
+        const paths = getLineStringPaths(feature.geometry);
+        return {
+            feature,
+            paths,
+            totalMiles: paths.reduce((sum, path) => sum + pathMiles(path), 0),
+            portions: summarizeTrackPortions(paths, segments),
+            removeKeys: new Set(),
+            removeOutside: false,
+            valid: false
+        };
+    });
+
+    const popup = createPopup('Trim Tracks', null);
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+    content.style.width = '90vw';
+    content.style.maxWidth = '1000px';
+    content.style.maxHeight = '90vh';
+    content.style.display = 'flex';
+    content.style.flexDirection = 'column';
+
+    let busy = false;
+    const body = document.createElement('div');
+    body.className = 'map-tool-body trim-tracks-body';
+    const intro = document.createElement('p');
+    intro.className = 'track-import-intro';
+    intro.textContent = segments.length
+        ? 'Every route and track on the map, with how its miles fall: a pill for each segment it crosses and one for the miles outside every segment. Click the pills of the parts to cut off - on as many tracks as you like - then confirm. A track that loses a stretch in its middle becomes several tracks named <name> p1, <name> p2, ... on CalTopo.'
+        : 'No segment has a CalTopo shape yet, so every track is one part (outside every segment). Import the assignments as segments first to cut tracks by segment.';
+    body.appendChild(intro);
+
+    const tableWrap = document.createElement('div');
+    tableWrap.className = 'track-import-table-wrap trim-tracks-table-wrap';
+    const table = document.createElement('table');
+    table.className = 'grid-table';
+    const thead = document.createElement('thead');
+    thead.innerHTML = '<tr><th>Track</th><th>Type</th><th>Length</th><th>Parts (click to cut off)</th><th>Result</th></tr>';
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+
+    const cancelBtn = document.createElement('button');
+    const confirmBtn = document.createElement('button');
+
+    const evaluate = (item) => {
+        const selected = item.removeKeys.size > 0 || item.removeOutside;
+        if (!selected) return {text: 'Unchanged', valid: false, invalid: false};
+        const outcome = trimTrackPaths(item.paths, segments, {segmentKeys: Array.from(item.removeKeys), outside: item.removeOutside});
+        if (!outcome.parts.length) return {text: 'Nothing would be left - unselect a part', valid: false, invalid: true};
+        const shape = outcome.parts.length === 1 ? 'one track' : `${outcome.parts.length} parts (p1-p${outcome.parts.length})`;
+        return {text: `${formatTrackMiles(outcome.removedMiles)} cut off \u2192 ${shape}, ${formatTrackMiles(outcome.keptMiles)} kept`, valid: true, invalid: false};
+    };
+    const updateConfirm = () => {
+        const count = items.filter(item => item.valid).length;
+        confirmBtn.textContent = count ? `Trim ${count} Track${count === 1 ? '' : 's'}` : 'Trim Tracks';
+        confirmBtn.disabled = busy || count === 0;
+    };
+    const refresh = (item) => {
+        const evaluation = evaluate(item);
+        item.valid = evaluation.valid;
+        item.resultEl.textContent = evaluation.text;
+        item.resultEl.classList.toggle('is-invalid', evaluation.invalid);
+        item.row.classList.toggle('is-selected', evaluation.valid);
+        updateConfirm();
+    };
+
+    items.forEach(item => {
+        const tr = document.createElement('tr');
+        tr.className = 'trim-track-row';
+        [getMapFeatureDisplayName(item.feature), getSearcherTrackTypeLabel(item.feature), formatTrackMiles(item.totalMiles)].forEach(text => {
+            const td = document.createElement('td');
+            const pill = document.createElement('div');
+            pill.className = 'pill-cell readonly-pill';
+            pill.textContent = text;
+            td.appendChild(pill);
+            tr.appendChild(td);
+        });
+        const portionsTd = document.createElement('td');
+        const portionsWrap = document.createElement('div');
+        portionsWrap.className = 'track-portions trim-portions';
+        item.portions.forEach(portion => {
+            const segment = portion.key ? segments.find(s => s.key === portion.key) : null;
+            const label = portion.key ? (segment ? segment.segment : portion.key) : 'Outside segments';
+            const pill = document.createElement('button');
+            pill.type = 'button';
+            pill.className = `mini-pill track-portion-pill trim-portion-pill ${portion.key ? 'home' : 'outside'}`;
+            pill.dataset.key = portion.key;
+            pill.textContent = `${label} ${formatTrackMiles(portion.miles)}`;
+            pill.title = portion.key
+                ? `${formatTrackMiles(portion.miles)} inside segment ${label}${segment && segment.region ? ` (${segment.region})` : ''}. Click to cut this part off the track.`
+                : `${formatTrackMiles(portion.miles)} outside every segment with a CalTopo shape. Click to cut this part off the track.`;
+            pill.onclick = () => {
+                if (busy) return;
+                if (portion.key) {
+                    if (item.removeKeys.has(portion.key)) item.removeKeys.delete(portion.key);
+                    else item.removeKeys.add(portion.key);
+                } else {
+                    item.removeOutside = !item.removeOutside;
+                }
+                pill.classList.toggle('is-removed', portion.key ? item.removeKeys.has(portion.key) : item.removeOutside);
+                refresh(item);
+            };
+            portionsWrap.appendChild(pill);
+        });
+        if (!item.portions.length) {
+            const none = document.createElement('span');
+            none.className = 'mini-pill track-portion-pill outside';
+            none.textContent = 'No length';
+            portionsWrap.appendChild(none);
+        }
+        portionsTd.appendChild(portionsWrap);
+        tr.appendChild(portionsTd);
+        const resultTd = document.createElement('td');
+        const result = document.createElement('div');
+        result.className = 'pill-cell readonly-pill trim-track-result';
+        result.textContent = 'Unchanged';
+        resultTd.appendChild(result);
+        tr.appendChild(resultTd);
+        item.row = tr;
+        item.resultEl = result;
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    tableWrap.appendChild(table);
+    body.appendChild(tableWrap);
+
+    const status = document.createElement('div');
+    status.className = 'custom-track-error trim-tracks-status';
+    status.style.display = 'none';
+    body.appendChild(status);
+    content.insertBefore(body, btnContainer);
+
+    btnContainer.innerHTML = '';
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => closePopup(popup);
+    btnContainer.appendChild(cancelBtn);
+    confirmBtn.className = 'popup-btn primary trim-tracks-confirm';
+    confirmBtn.onclick = async () => {
+        const selections = items.filter(item => item.valid).map(item => ({
+            feature: item.feature,
+            removal: {segmentKeys: Array.from(item.removeKeys), outside: item.removeOutside}
+        }));
+        if (!selections.length || busy) return;
+        busy = true;
+        status.style.display = 'none';
+        updateConfirm();
+        confirmBtn.textContent = 'Trimming\u2026';
+        const outcome = await trimCalTopoTracks(selections, {
+            onProgress: (done, total) => { confirmBtn.textContent = `Trimming ${done} / ${total}\u2026`; }
+        });
+        busy = false;
+        if (outcome.trimmed.length) {
+            closePopup(popup);
+            return;
+        }
+        status.textContent = outcome.errors.length ? outcome.errors.join(' ') : 'Nothing was trimmed.';
+        status.style.display = 'block';
+        updateConfirm();
+    };
+    btnContainer.appendChild(confirmBtn);
+    updateConfirm();
+    return popup;
+}
+
+// The properties of a part created from a track: the track's own properties
+// (minus what identifies the original) under the part's title, in the
+// track's own style - not the dark red the color push may have given it.
+function buildTrimmedTrackPartProperties(feature, partName, ownStyle) {
+    const properties = {...(feature.attributes || feature.properties || {})};
+    ['ObjectID', 'id', 'class', 'name', 'timestamps'].forEach(key => { delete properties[key]; });
+    properties.title = partName;
+    applyCapturedCalTopoFeatureStyle(properties, ownStyle || {});
+    return properties;
+}
+
+// Trim the selected tracks on CalTopo. `selections` = [{feature, removal}]
+// (removal as trimTrackPaths takes it). One part left: the line is replaced
+// in place (same id, same name). Several: Shape lines "<name> p1..pN" are
+// created - `name` without the "#task-segment " code the Search Log may have
+// put on it, which the rename sync adds back per part - then the original is
+// deleted (parts already created are removed again when one is refused, so
+// the map is left as it was). The case's copy of the map and the Searchers
+// Tracks records follow (applyTrackTrimsToCase). `options.onProgress(done,
+// total)` follows the tracks. Resolves {trimmed: [{name, partNames,
+// removedMiles, split}], errors, warnings}.
+async function trimCalTopoTracks(selections, options = {}) {
+    const bundle = loadBundle();
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    const list = Array.isArray(selections) ? selections : [];
+    if (!map || !map.id || !list.length) return {trimmed: [], errors: [], warnings: []};
+    const segments = getTrimTrackSegments(bundle);
+    const segmentNames = ensureSegmentsPageRows(bundle).map(row => (Array.isArray(row) ? row[1] : ''));
+    const state = map.caltopoAssignmentOverlayState;
+    const originals = state && state.originals && typeof state.originals === 'object' ? state.originals : {};
+    const trimmed = [];
+    const errors = [];
+    const warnings = [];
+    const replacements = [];
+    let done = 0;
+    for (const selection of list) {
+        done++;
+        if (typeof options.onProgress === 'function') options.onProgress(done, list.length);
+        const feature = selection && selection.feature;
+        if (!feature) continue;
+        const name = getMapFeatureDisplayName(feature);
+        const outcome = trimTrackPaths(getLineStringPaths(feature.geometry), segments, selection.removal || {});
+        if (!outcome.parts.length) {
+            errors.push(`"${name}": nothing would be left of the track, so it was not touched.`);
+            continue;
+        }
+        try {
+            if (outcome.parts.length === 1) {
+                const geometry = {type: 'LineString', coordinates: outcome.parts[0].map(point => point.slice())};
+                const objectType = await updateCalTopoMapFeatureGeometry(map, feature, geometry);
+                if (!objectType) {
+                    errors.push(`CalTopo did not take the trimmed line of "${name}".`);
+                    continue;
+                }
+                replacements.push({original: feature, features: [cloneMapFeatureWith(feature, geometry, {class: objectType})], split: false});
+                trimmed.push({name, partNames: [name], removedMiles: outcome.removedMiles, split: false});
+                continue;
+            }
+            const styleKey = getCalTopoOverlayOriginalStyleKey(feature);
+            const ownStyle = originals[styleKey] || captureCalTopoFeatureStyle(feature.attributes || feature.properties || {});
+            const baseName = parseSearcherTrackName(name, segmentNames).baseName || name;
+            const parts = [];
+            for (let i = 0; i < outcome.parts.length; i++) {
+                const partName = buildTrimmedTrackPartName(baseName, i + 1);
+                const geometry = {type: 'LineString', coordinates: outcome.parts[i].map(point => point.slice())};
+                const properties = buildTrimmedTrackPartProperties(feature, partName, ownStyle);
+                const result = await createCalTopoMapFeature(map, ['Shape'], geometry, properties);
+                if (!result) {
+                    errors.push(`CalTopo did not take part ${i + 1} of "${name}" (${partName}); the track was left as it was.`);
+                    break;
+                }
+                parts.push({name: partName, geometry, properties, objectType: result.objectType, id: result.id});
+            }
+            if (parts.length !== outcome.parts.length) {
+                for (const part of parts) {
+                    try {
+                        await deleteCalTopoMapFeature(map, {attributes: {id: part.id, class: part.objectType}});
+                    } catch (error) { /* best effort */ }
+                }
+                continue;
+            }
+            const deleted = await deleteCalTopoMapFeature(map, feature);
+            if (!deleted) {
+                warnings.push(`"${name}" was split into ${parts.length} parts, but the original line could not be removed from CalTopo - delete it there by hand.`);
+            }
+            replacements.push({original: feature, parts, split: true, ownStyle, styleKey});
+            trimmed.push({name, partNames: parts.map(part => part.name), removedMiles: outcome.removedMiles, split: true});
+        } catch (error) {
+            errors.push(`"${name}": ${error && error.message ? error.message : error}`);
+        }
+    }
+
+    if (replacements.length) applyTrackTrimsToCase(replacements, trimmed);
+    if (trimmed.length) {
+        const splitCount = trimmed.filter(entry => entry.split).length;
+        showToast(`${trimmed.length} track${trimmed.length === 1 ? '' : 's'} trimmed on the map${splitCount ? ` (${splitCount} split into parts)` : ''}.`, 'Trim Tracks');
+    }
+    if (warnings.length) showToast(warnings.join(' '), 'Trim Tracks');
+    if (errors.length && trimmed.length) alert(errors.join('\n'));
+    return {trimmed, errors, warnings};
+}
+
+// The case's side of a trim: the case's copy of the map (the original line
+// replaced by its trimmed line or its parts), the Searchers Tracks record of
+// an imported track (re-measured; a split track becomes one record per part,
+// each keeping the planner's task pick and the import stamp) and the color
+// push's record of the track's own style (handed to the parts). Saved through
+// saveSearcherTracksChange when a record changed, so the PSR maths follow.
+function applyTrackTrimsToCase(replacements, trimmed = []) {
+    const bundle = loadBundle();
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    if (!map) return;
+    const features = Array.isArray(map.features) ? map.features : [];
+    const tracks = getSearcherTracks(bundle);
+    const state = map.caltopoAssignmentOverlayState;
+    const originals = state && state.originals && typeof state.originals === 'object' ? state.originals : null;
+    let tracksChanged = false;
+
+    replacements.forEach(replacement => {
+        const originalKey = getMapFeatureIdentityKey(replacement.original);
+        const index = features.findIndex(feature => getMapFeatureIdentityKey(feature) === originalKey);
+        const newFeatures = replacement.split
+            ? replacement.parts.map((part, k) => buildCreatedMapFeature(part.geometry, part.properties, part.objectType, part.id, part.name, features.length + k + 1))
+            : replacement.features;
+        if (index >= 0) features.splice(index, 1, ...newFeatures);
+        else features.push(...newFeatures);
+
+        const current = findSearcherTrackForFeature(replacement.original, tracks);
+        if (current) {
+            const at = tracks.indexOf(current);
+            const records = replacement.split
+                ? newFeatures.map(feature => buildSearcherTrackRecord(feature, bundle, {assignedTask: current.assignedTask, importedAt: current.importedAt, importedBy: current.importedBy}))
+                : [buildSearcherTrackRecord(newFeatures[0], bundle, current)];
+            tracks.splice(at, 1, ...records.filter(Boolean));
+            tracksChanged = true;
+        }
+
+        if (replacement.split && originals && replacement.styleKey && Object.prototype.hasOwnProperty.call(originals, replacement.styleKey)) {
+            newFeatures.forEach(feature => {
+                const key = getCalTopoOverlayOriginalStyleKey(feature);
+                if (key && getCalTopoWritableFeatureId(feature)) originals[key] = JSON.parse(JSON.stringify(originals[replacement.styleKey]));
+            });
+            delete originals[replacement.styleKey];
+        }
+    });
+    map.features = features;
+    if (tracksChanged) bundle.searcherTracks = tracks;
+
+    const summary = (Array.isArray(trimmed) ? trimmed : []).map(entry => `"${entry.name}" (${formatTrackMiles(entry.removedMiles)} cut off${entry.split ? ` \u2192 ${entry.partNames.join(', ')}` : ''})`).join('; ');
+    addActivityLogEntry('System', `Trimmed ${replacements.length} track${replacements.length === 1 ? '' : 's'} on the CalTopo map${summary ? `: ${summary}` : ''}`, bundle);
+    if (tracksChanged) saveSearcherTracksChange(bundle);
+    else saveBundle(bundle);
+    finishCalTopoMapWrite();
 }
 
 // ---------------------------------------------------------------------------

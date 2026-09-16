@@ -205,6 +205,29 @@ bundle = {
   importable (the unaccounted panel is three tables). Every change goes through
   `saveSearcherTracksChange` (deferred save → `recalculateEverything({colorSyncDelay: 0})`). Plan:
   `.junie/plans/search-log-map-tracking.md`; test: `test_search_log_map_tracking.js`.
+- **Maps page tools — "Auto Draw Segments" / "Trim Tracks"** (two buttons beside *Fetch Shapes*; `app.js`
+  section "Maps page tools", maths in `map-segment-utils.js`). Neither adds a bundle key: both write to the
+  CalTopo map through `caltopo_api_call` and then update the case's copy of the map (`maps[0].features`) at
+  once before a quiet re-fetch. *Auto Draw* (`openAutoDrawSegmentsTool` → `showAutoDrawSegmentsPopup` →
+  `drawAutoDrawSegments`): the planner picks one polygon and a direction — vertical (north–south cuts,
+  numbered west→east), horizontal (numbered north→south) or a typed angle (degrees clockwise from north) —
+  and `planAutoDrawSegments` cuts it into `ceil(acres / 15)` **equal-area** strips (`computeAutoDrawSliceCount`:
+  fewest slices ≤ `AUTO_DRAW_MAX_ACRES` 15; `undersized` flags slices under `AUTO_DRAW_MIN_ACRES` 10, i.e. a
+  15–20 acre or < 10 acre shape, shown as a warning). Cuts are found by bisection on the area left of a
+  vertical line in a rotated local plane (`splitRingsByVerticalLine`, the classic split walk; a concave
+  outline can leave a strip in two pieces, each numbered). Slices are POSTed as `Assignment` (else `Shape`)
+  named `<source>-<n>` with the source's style/folder (`createCalTopoMapFeature`: `POST /api/v1/map/<id>/<class>`,
+  no object id, `id: null`); the source stays. *Trim Tracks* (`openTrimTracksTool` → `showTrimTracksPopup` →
+  `trimCalTopoTracks`): every line with a real CalTopo id, a pill per segment it crosses + one "Outside
+  segments" (`summarizeTrackPortions`, segments = Segments rows with a shape via `getTrimTrackSegments`);
+  clicked pills are the parts to cut (`trimTrackPaths`: legs cut at polygon edges, midpoint membership).
+  One part left → `updateCalTopoMapFeatureGeometry` (POST to the id, class then Shape, same name); several →
+  `Shape` lines `<name> p1…pN` (name = `parseSearcherTrackName(...).baseName`, i.e. without the `#task-seg `
+  code) then `deleteCalTopoMapFeature` of the original (a refused delete is toasted: delete by hand); nothing
+  left is refused. `applyTrackTrimsToCase` replaces the feature(s), re-measures / splits the Searchers Tracks
+  record (pick + import stamp kept) and moves the color push's `originals` style to the parts, then saves via
+  `saveSearcherTracksChange`. Plan: `.junie/plans/maps-auto-draw-segments-and-trim-tracks.md`; test:
+  `test_maps_auto_draw_trim_tracks.js`.
 - **Geek Mode** is *not* a bundle key. It lives in the login's `user_settings` preference record
   (`sar-user-preferences-v1`) **per user account**: `geekModeByUser[<getAccountName>] = {enabled,
   paddingPercent}`, with the login-level `geekMode` / `geekPaddingPercent` as the fallback for an
@@ -300,7 +323,7 @@ to use, read from `process.env` per request), `/api/health` (also carries it), `
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260922`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260923`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
 - **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
@@ -327,6 +350,15 @@ to use, read from `process.env` per request), `/api/health` (also carries it), `
   when a shape's local style/description/class actually changed** (`changedLocally`): the heartbeat
   re-POSTs identical colors every minute and must not churn the heavy `maps` section on every device.
   Automatic pushes stay silent (`console.warn`); only the Maps page toggle may `alert`.
+- **Writing to CalTopo** goes through the three helpers in the "Maps page tools" section — `createCalTopoMapFeature`
+  (create: `POST /api/v1/map/<map>/<class>`, GeoJSON Feature with `id: null`, classes tried in order),
+  `updateCalTopoMapFeatureGeometry` / the rename path (`POST …/<class>/<objectId>` with the *whole* fetched
+  feature, class then `Shape`) and `deleteCalTopoMapFeature` (`DELETE …/<class>/<objectId>`) — all via
+  `caltopo_api_call(..., {silent: true})`, never a raw `fetch`. Judge an answer with `isCalTopoCallAccepted`
+  (a refused call resolves to `null`; an empty `''` DELETE body counts as taken) and read a created id with
+  `extractCalTopoCreatedId` (`{status, result: {id}}`). After any write: update `maps[0].features` yourself,
+  then `finishCalTopoMapWrite()` (panel + Features tab + iframe reload + quiet re-fetch). A shape whose id is
+  synthetic (`gfx-N`, `getCalTopoWritableFeatureId` → `''`) is never written back.
 - **New server table?** Create it in `initDatabaseSchema` (MySQL DDL, `ENGINE=InnoDB … utf8mb4`),
   add to `COLLECTION_TABLES`/`SINGLE_TABLES` so `/api/v1/tables` exposes it, include it in the
   whole-case delete, and extend `test_structured_tables.js`.
@@ -594,6 +626,29 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   is the single source behind every "log sweeps" indication (nav badge, Segments row/button,
   notification), so gating it once switches them all off. (7) The Maps page test DOM has no `firstChild`
   — have cell helpers return the element they created. (plan: `search-log-map-tracking.md`)
+- **2026-09-15 — Maps page "Auto Draw Segments" / "Trim Tracks".** Lessons from the geometry and the
+  sandbox. (1) Equal-area slicing is *one* primitive — split rings along a vertical line in a plane rotated
+  by the cut bearing — plus bisection on the left-hand area; do not write separate vertical/horizontal
+  code paths. A vertex exactly on the cut line breaks the crossing walk: nudge the line by `1e-7` mi steps
+  (`splitRingsByVerticalLine` returns the `x` it used). (2) Areas of the *pieces* measured on their own
+  (`polygonAreaAcres` takes the piece's first vertex as its `cos(lat)` reference) differ from the plan's
+  plane (the source's first vertex) by ~`tan(lat) × Δlat` — 0.06 % over 3 miles, 0.16 acres on 1280 — so
+  tests must compare on one footing (the stored `piece.acres` against `totalAcres`), or use a relative
+  tolerance; a `0.1`-acre absolute tolerance is wrong, not the code. (3) Track trimming reuses the
+  Searchers Tracks clipping (`legCrossingParameter` at every polygon edge, membership by leg midpoint); a
+  kept stretch that spans two segments legitimately keeps the vertex at their shared edge, and a path
+  nothing is cut from must come back *untouched* (`trimTrackPaths` short-circuits) or the update would
+  re-POST a line with extra collinear points. (4) The Search Log's `#task-segment ` code is an app
+  annotation, not the track's name: split parts are named from `parseSearcherTrackName(...).baseName`
+  so the rename sync can code each part for its own home segment. (5) `caltopo_api_call` resolves `null`
+  on any refusal *and* throws→`null` on a 200 that is not JSON, but the server's `/api/call` does
+  `res.json(response.data)`, so an empty CalTopo DELETE body arrives as `""` — treat `''` as accepted.
+  (6) vm-sandbox arrays returned by `app.js` functions (`outcome.errors`, `trimmed`) fail
+  `deepStrictEqual([])` on prototype alone — `plain()` them, as §7 2026-09-09 already says; it bit again.
+  (7) `caltopo_request(null, {quiet: true})` after a write replaces `maps[0].features` with CalTopo's copy
+  and re-renders the unaccounted panel, so newly drawn Assignments appear there as importable at once —
+  but it also saves the heavy `maps` section a second time; acceptable for a deliberate click, never for
+  a timer. (plan: `maps-auto-draw-segments-and-trim-tracks.md`)
 
 ---
 
@@ -704,6 +759,33 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   line in the tracks table but its generic columns (Max Dim / Area / W x H) were left as they are; only
   the unaccounted panel got the Searchers Tracks columns. (9) The "…not imported as segments" wording of
   the unaccounted notification is pinned by two suites and was left, although a route now reads oddly there.
+- Auto Draw Segments follow-ups: (1) slices are **equal-area strips**, not shape-aware (a long thin or very
+  concave outline can leave narrow or many-pieced slices; a strip cut in two by a concave outline becomes
+  two numbered shapes — no minimum-width or merge rule). (2) Holes in the source polygon are ignored (outer
+  rings only), so a shape with a lake in it is over-counted and the slices cover the hole. (3) The 10 / 15
+  acre bounds are constants (`AUTO_DRAW_MIN_ACRES` / `AUTO_DRAW_MAX_ACRES`); a 15–20 acre (or < 10 acre)
+  shape is drawn anyway after the popup's warning — the request's minimum cannot be met there. (4) The
+  drawn slices are *not* imported as segments automatically (they show up in the unaccounted panel as new
+  Assignments); the source shape stays on the map and is not marked unwanted. (5) Slice names are
+  `<source>-<n>`; nothing checks for a clash with an existing shape or segment name. (6) The class fallback
+  order is `Assignment` then `Shape` — if CalTopo takes Assignments but strips unknown properties, the
+  copied style may not show until the color push. (7) The CalTopo answer to a create is read for an id by
+  `extractCalTopoCreatedId`; when none is found the slice is kept under a synthetic `gfx-N` id until the
+  quiet re-fetch replaces the case's copy — if that re-fetch fails (offline), the slice cannot be written
+  back until the next Fetch Shapes.
+- Trim Tracks follow-ups: (1) parts are decided by segment membership only — there is no free-hand "cut
+  here" and no time-based selection; a track that crosses the same segment twice loses/keeps both
+  stretches together. (2) A track is trimmed as CalTopo last reported it (the case's copy); a live track
+  that grew since the fetch loses the new points on the in-place update — Fetch Shapes first. (3) The
+  in-place update drops a parallel `timestamps` property (it would no longer match the points); per-point
+  extras (altitude/time in the coordinate) are kept and interpolated at the cut. (4) Split parts are
+  created as plain `Shape` lines even when the original was an `AppTrack`/`LiveTrack` (CalTopo does not
+  let the API create those); the original is deleted afterwards, and if the delete is refused the parts
+  and the original coexist until deleted by hand (toast says so). (5) A split track's Searchers Tracks
+  records all inherit the planner's task pick — re-pick if a part now lies in another task's segment.
+  (6) The popup lists only lines with a real CalTopo id (`getCalTopoWritableFeatureId`); a shape with a
+  synthetic id must be fetched again first. (7) The result cell's miles come from `trimTrackPaths` (2
+  decimals) and can differ by rounding from the Searchers Tracks table's measurement of the same line.
 
 ---
 

@@ -1476,7 +1476,431 @@
         return entry && Number.isFinite(entry.miles) ? entry.miles : 0;
     }
 
+    // ------------------------------------------------------------------
+    // Auto Draw Segments (Maps page).
+    //
+    // The planner picks one CalTopo polygon and the app cuts it into equal
+    // slices of at most AUTO_DRAW_MAX_ACRES and - whenever the shape allows
+    // it - at least AUTO_DRAW_MIN_ACRES, as many as it takes to fill the
+    // shape, then draws the slices on the map. The slices are strips between
+    // parallel cut lines: vertical (north-south lines, numbered west to
+    // east), horizontal (east-west lines, numbered north to south) or at an
+    // angle the planner types in (degrees clockwise from north; 0 =
+    // vertical, 90 = horizontal). Everything is worked out on the local
+    // plane polygonAreaAcres uses (miles east / north of the first vertex),
+    // rotated so the cut lines are vertical; each cut position is found by
+    // bisection on the area to its left, so every slice has the same area
+    // whatever the outline. A concave outline can leave a strip in two
+    // pieces - each becomes its own numbered shape. Everything here is pure
+    // so the website and the tests share one implementation.
+    // ------------------------------------------------------------------
+
+    const AUTO_DRAW_MIN_ACRES = 10;
+    const AUTO_DRAW_MAX_ACRES = 15;
+    // Slivers below this are numerical noise from a cut running along an
+    // edge, not segments anybody should search.
+    const AUTO_DRAW_MIN_PIECE_ACRES = 0.01;
+    const MILES_PER_DEGREE = 69.172;
+
+    // The number of equal slices for a shape: the fewest that keep every
+    // slice at or under the maximum. `undersized` says the slices come out
+    // under the minimum (a shape under 10 acres, or one between 15 and 20
+    // acres, cannot be cut into 10-15 acre pieces); 0 slices for no area.
+    function computeAutoDrawSliceCount(totalAcres, options = {}) {
+        const min = toFiniteNumber(options.minAcres) > 0 ? toFiniteNumber(options.minAcres) : AUTO_DRAW_MIN_ACRES;
+        const max = Math.max(min, toFiniteNumber(options.maxAcres) > 0 ? toFiniteNumber(options.maxAcres) : AUTO_DRAW_MAX_ACRES);
+        const total = toFiniteNumber(totalAcres);
+        if (total === null || total <= 0) return {count: 0, acresEach: 0, undersized: false, minAcres: min, maxAcres: max};
+        const count = total <= max ? 1 : Math.ceil(total / max);
+        const acresEach = total / count;
+        return {count, acresEach, undersized: acresEach < min, minAcres: min, maxAcres: max};
+    }
+
+    // The local plane around `ref` ([lng, lat]): x miles east, y miles north.
+    function makeLocalPlane(ref) {
+        const k = Math.cos(ref[1] * Math.PI / 180) * MILES_PER_DEGREE;
+        return {
+            toPlane: (p) => [(p[0] - ref[0]) * k, (p[1] - ref[1]) * MILES_PER_DEGREE],
+            fromPlane: (q) => [q[0] / k + ref[0], q[1] / MILES_PER_DEGREE + ref[1]]
+        };
+    }
+
+    function rotatePoint(p, radians) {
+        const c = Math.cos(radians);
+        const s = Math.sin(radians);
+        return [p[0] * c - p[1] * s, p[0] * s + p[1] * c];
+    }
+
+    // A ring as a plain list of distinct [x, y] vertices: unusable points,
+    // the closing repeat of the first vertex and consecutive duplicates go.
+    function cleanRing(ring) {
+        const out = [];
+        (Array.isArray(ring) ? ring : []).forEach(p => {
+            if (!Array.isArray(p) || !Number.isFinite(p[0]) || !Number.isFinite(p[1])) return;
+            const last = out[out.length - 1];
+            if (last && last[0] === p[0] && last[1] === p[1]) return;
+            out.push([p[0], p[1]]);
+        });
+        while (out.length > 1 && out[0][0] === out[out.length - 1][0] && out[0][1] === out[out.length - 1][1]) out.pop();
+        return out.length >= 3 ? out : [];
+    }
+
+    // Shoelace area of a planar ring (open), in square plane units.
+    function planarRingArea(ring) {
+        const pts = Array.isArray(ring) ? ring : [];
+        let area = 0;
+        for (let i = 0; i < pts.length; i++) {
+            const p = pts[i];
+            const q = pts[(i + 1) % pts.length];
+            area += p[0] * q[1] - q[0] * p[1];
+        }
+        return Math.abs(area) / 2;
+    }
+
+    function planarRingCentroidY(ring) {
+        const pts = Array.isArray(ring) ? ring : [];
+        if (!pts.length) return 0;
+        return pts.reduce((sum, p) => sum + p[1], 0) / pts.length;
+    }
+
+    // Cuts one planar ring along the vertical line x = `x` (no vertex may lie
+    // on the line - splitRingsByVerticalLine sees to that): {left, right},
+    // each a list of simple rings. The classic walk: the crossings are
+    // paired along the line (consecutive crossings bound a stretch inside
+    // the polygon), the outline is walked on the kept side from a crossing
+    // to the next, then the cut face is followed to that crossing's partner
+    // and the walk goes on until it is back at the start.
+    function splitRingByVerticalLine(ring, x) {
+        const pts = cleanRing(ring);
+        if (!pts.length) return {left: [], right: []};
+        const sideOf = p => (p[0] < x ? -1 : 1);
+        if (pts.every(p => sideOf(p) < 0)) return {left: [pts], right: []};
+        if (pts.every(p => sideOf(p) > 0)) return {left: [], right: [pts]};
+        const verts = [];
+        for (let i = 0; i < pts.length; i++) {
+            const a = pts[i];
+            const b = pts[(i + 1) % pts.length];
+            verts.push({p: a, cross: false});
+            if (sideOf(a) !== sideOf(b)) {
+                const t = (x - a[0]) / (b[0] - a[0]);
+                verts.push({p: [x, a[1] + (b[1] - a[1]) * t], cross: true});
+            }
+        }
+        const n = verts.length;
+        const crossings = verts.map((v, i) => (v.cross ? i : -1)).filter(i => i >= 0);
+        const sorted = crossings.slice().sort((i, j) => verts[i].p[1] - verts[j].p[1]);
+        const partner = new Map();
+        for (let k = 0; k + 1 < sorted.length; k += 2) {
+            partner.set(sorted[k], sorted[k + 1]);
+            partner.set(sorted[k + 1], sorted[k]);
+        }
+        const collect = (wantSide) => {
+            const pieces = [];
+            const used = new Set();
+            crossings.forEach(start => {
+                if (used.has(start) || sideOf(verts[(start + 1) % n].p) !== wantSide) return;
+                const piece = [];
+                let cur = start;
+                let guard = 0;
+                while (guard++ <= n + crossings.length) {
+                    used.add(cur);
+                    piece.push(verts[cur].p);
+                    let i = (cur + 1) % n;
+                    while (!verts[i].cross) {
+                        piece.push(verts[i].p);
+                        i = (i + 1) % n;
+                    }
+                    piece.push(verts[i].p);
+                    const jump = partner.get(i);
+                    if (jump === undefined || jump === start || used.has(jump)) break;
+                    cur = jump;
+                }
+                if (piece.length >= 3 && planarRingArea(piece) > 0) pieces.push(piece);
+            });
+            return pieces;
+        };
+        return {left: collect(-1), right: collect(1)};
+    }
+
+    // Cuts planar rings along x = `x`: {left, right, x} - `x` is the cut
+    // actually used, nudged by a hair (a ten-millionth of a mile a step) when
+    // a vertex sat exactly on the line.
+    function splitRingsByVerticalLine(rings, x) {
+        const list = (Array.isArray(rings) ? rings : []).map(cleanRing).filter(r => r.length);
+        const onLine = value => list.some(ring => ring.some(p => Math.abs(p[0] - value) < 1e-9));
+        let cut = x;
+        for (let step = 1; onLine(cut) && step <= 60; step++) {
+            cut = x + (step % 2 ? 1 : -1) * Math.ceil(step / 2) * 1e-7;
+        }
+        const left = [];
+        const right = [];
+        list.forEach(ring => {
+            const parts = splitRingByVerticalLine(ring, cut);
+            left.push(...parts.left);
+            right.push(...parts.right);
+        });
+        return {left, right, x: cut};
+    }
+
+    // Cuts planar rings into `count` strips of equal area between vertical
+    // lines, west to east: a list of `count` ring lists.
+    function sliceRingsIntoEqualAreaStrips(rings, count) {
+        const list = (Array.isArray(rings) ? rings : []).map(cleanRing).filter(r => r.length);
+        if (!list.length) return [];
+        if (count <= 1) return [list];
+        const total = list.reduce((sum, ring) => sum + planarRingArea(ring), 0);
+        let minX = Infinity;
+        let maxX = -Infinity;
+        list.forEach(ring => ring.forEach(p => {
+            minX = Math.min(minX, p[0]);
+            maxX = Math.max(maxX, p[0]);
+        }));
+        const areaLeftOf = x => splitRingsByVerticalLine(list, x).left.reduce((sum, ring) => sum + planarRingArea(ring), 0);
+        const strips = [];
+        let remaining = list;
+        for (let k = 1; k < count; k++) {
+            const target = total * k / count;
+            let lo = minX;
+            let hi = maxX;
+            for (let iter = 0; iter < 60; iter++) {
+                const mid = (lo + hi) / 2;
+                if (areaLeftOf(mid) < target) lo = mid;
+                else hi = mid;
+            }
+            const split = splitRingsByVerticalLine(remaining, (lo + hi) / 2);
+            strips.push(split.left);
+            remaining = split.right;
+        }
+        strips.push(remaining);
+        return strips;
+    }
+
+    // An angle in degrees brought into [0, 360); 0 for anything unusable.
+    function normalizeAutoDrawAngle(value) {
+        const num = toFiniteNumber(value);
+        if (num === null) return 0;
+        return ((num % 360) + 360) % 360;
+    }
+
+    const roundCoordinate = value => Math.round(value * 1e7) / 1e7;
+
+    // The slices of a CalTopo area feature:
+    //   ok / reason      false with 'no-area' when the feature has no polygon
+    //   totalAcres       the area cut (outer rings; holes are not taken out)
+    //   count, acresEach, undersized   see computeAutoDrawSliceCount
+    //   angleDegrees     the cut lines' bearing actually used
+    //   pieces           [{ring, acres, strip, index}] - `ring` a closed
+    //                    lng/lat ring (7 decimals), `strip` the slice (1-based,
+    //                    in sweep order), `index` the running number the
+    //                    shape is named with (a strip in two pieces gives two
+    //                    numbers, north-most first)
+    // options.angleDegrees is the bearing of the cut lines (0 vertical, 90
+    // horizontal); options.minAcres / maxAcres override the bounds.
+    function planAutoDrawSegments(feature, options = {}) {
+        const outerRings = collectAreaPolygons(feature && feature.geometry)
+            .map(rings => cleanRing(rings[0]))
+            .filter(ring => ring.length);
+        const empty = {ok: false, reason: 'no-area', totalAcres: 0, count: 0, acresEach: 0, undersized: false, angleDegrees: normalizeAutoDrawAngle(options.angleDegrees), pieces: []};
+        if (!outerRings.length) return empty;
+        const angleDegrees = normalizeAutoDrawAngle(options.angleDegrees);
+        const radians = angleDegrees * Math.PI / 180;
+        const plane = makeLocalPlane(outerRings[0][0]);
+        const planar = outerRings.map(ring => cleanRing(ring.map(p => rotatePoint(plane.toPlane(p), radians)))).filter(ring => ring.length);
+        const totalAcres = planar.reduce((sum, ring) => sum + planarRingArea(ring), 0) * 640;
+        const sizing = computeAutoDrawSliceCount(totalAcres, options);
+        if (!sizing.count) return empty;
+        const strips = sliceRingsIntoEqualAreaStrips(planar, sizing.count);
+        const pieces = [];
+        strips.forEach((stripRings, stripIndex) => {
+            stripRings
+                .map(ring => ({ring, acres: planarRingArea(ring) * 640, y: planarRingCentroidY(ring)}))
+                .filter(entry => entry.acres >= AUTO_DRAW_MIN_PIECE_ACRES)
+                .sort((a, b) => b.y - a.y)
+                .forEach(entry => {
+                    const lngLat = entry.ring.map(p => plane.fromPlane(rotatePoint(p, -radians)).map(roundCoordinate));
+                    lngLat.push(lngLat[0].slice());
+                    pieces.push({ring: lngLat, acres: Math.round(entry.acres * 100) / 100, strip: stripIndex + 1, index: pieces.length + 1});
+                });
+        });
+        return {ok: true, reason: '', totalAcres, count: sizing.count, acresEach: sizing.acresEach, undersized: sizing.undersized, angleDegrees, pieces};
+    }
+
+    // "Alpha-3": the source shape's name and the running number.
+    function buildAutoDrawSegmentName(baseName, index) {
+        const base = String(baseName || '').trim() || 'Segment';
+        return `${base}-${index}`;
+    }
+
+    // ------------------------------------------------------------------
+    // Trim Tracks (Maps page).
+    //
+    // A track on the CalTopo map is cut where it crosses the edge of a
+    // segment shape (the same clipping the Searchers Tracks miles use) into
+    // pieces that each lie in one set of segments - or outside every
+    // segment. The planner picks the pieces to remove by segment ("the part
+    // in 4D", "the part outside every segment"); what is left becomes the
+    // trimmed track, in as many parts as the removed pieces cut it into.
+    // Pieces are measured by the midpoint of every cut leg, so a piece
+    // inside two overlapping segments belongs to both. Cut points keep the
+    // extras a point may carry (altitude, time) by linear interpolation.
+    // ------------------------------------------------------------------
+
+    function interpolateTrackPoint(a, b, t) {
+        const out = [a[0] + (b[0] - a[0]) * t, a[1] + (b[1] - a[1]) * t];
+        for (let i = 2; i < Math.min(a.length, b.length); i++) {
+            if (Number.isFinite(a[i]) && Number.isFinite(b[i])) out.push(a[i] + (b[i] - a[i]) * t);
+            else break;
+        }
+        return out;
+    }
+
+    // The segment shapes as trimming needs them: [{key, polygons, edges}] for
+    // every entry with an area geometry.
+    function prepareTrimSegments(segments) {
+        return (Array.isArray(segments) ? segments : []).map(segment => {
+            const polygons = collectAreaPolygons(segment && segment.geometry);
+            if (!polygons.length) return null;
+            const edges = [];
+            polygons.forEach(rings => rings.forEach(ring => {
+                const vertices = (Array.isArray(ring) ? ring : []).filter(isFiniteLngLat);
+                for (let i = 0; i < vertices.length; i++) {
+                    const p = vertices[i];
+                    const q = vertices[(i + 1) % vertices.length];
+                    if (p[0] === q[0] && p[1] === q[1]) continue;
+                    edges.push({p, q, minX: Math.min(p[0], q[0]), maxX: Math.max(p[0], q[0]), minY: Math.min(p[1], q[1]), maxY: Math.max(p[1], q[1])});
+                }
+            }));
+            return {key: String(segment.key === undefined || segment.key === null ? '' : segment.key), polygons, edges};
+        }).filter(Boolean);
+    }
+
+    // The pieces of a path: [{points, keys, miles}] in order along the path,
+    // `keys` the segments (sorted) whose shape holds the piece, [] outside
+    // every segment. Consecutive legs in the same segments form one piece.
+    function slicePathBySegments(path, segments) {
+        const pts = (Array.isArray(path) ? path : []).filter(isFiniteLngLat);
+        const prepared = prepareTrimSegments(segments);
+        if (pts.length < 2) return [];
+        const membershipAt = point => prepared
+            .filter(segment => segment.polygons.some(rings => pointInPolygonRings(point, rings)))
+            .map(segment => segment.key)
+            .sort();
+        const pieces = [];
+        let current = null;
+        const addLeg = (from, to, keys) => {
+            const signature = keys.join('\u0000');
+            if (current && current.signature === signature) {
+                current.points.push(to);
+            } else {
+                current = {signature, keys, points: [from, to]};
+                pieces.push(current);
+            }
+        };
+        for (let i = 1; i < pts.length; i++) {
+            const a = pts[i - 1];
+            const b = pts[i];
+            const legMinX = Math.min(a[0], b[0]);
+            const legMaxX = Math.max(a[0], b[0]);
+            const legMinY = Math.min(a[1], b[1]);
+            const legMaxY = Math.max(a[1], b[1]);
+            const cuts = [0, 1];
+            prepared.forEach(segment => segment.edges.forEach(edge => {
+                if (edge.maxX < legMinX || edge.minX > legMaxX || edge.maxY < legMinY || edge.minY > legMaxY) return;
+                const t = legCrossingParameter(a, b, edge.p, edge.q);
+                if (t !== null) cuts.push(t);
+            }));
+            cuts.sort((x, y) => x - y);
+            let previous = 0;
+            for (let k = 1; k < cuts.length; k++) {
+                const t1 = cuts[k];
+                if (t1 - previous <= 1e-12) continue;
+                const from = previous === 0 ? a : interpolateTrackPoint(a, b, previous);
+                const to = t1 === 1 ? b : interpolateTrackPoint(a, b, t1);
+                addLeg(from, to, membershipAt([a[0] + (b[0] - a[0]) * (previous + t1) / 2, a[1] + (b[1] - a[1]) * (previous + t1) / 2]));
+                previous = t1;
+            }
+        }
+        return pieces.map(piece => ({points: piece.points, keys: piece.keys, miles: pathLengthMiles(piece.points)}));
+    }
+
+    // How the miles of a track (one or more paths) fall: [{key, miles}] for
+    // every segment entered plus {key: '', miles} for the miles outside every
+    // segment; a stretch in two overlapping segments counts for both.
+    function summarizeTrackPortions(paths, segments) {
+        const totals = new Map();
+        const add = (key, miles) => totals.set(key, (totals.get(key) || 0) + miles);
+        (Array.isArray(paths) ? paths : []).forEach(path => slicePathBySegments(path, segments).forEach(piece => {
+            if (!piece.keys.length) add('', piece.miles);
+            else piece.keys.forEach(key => add(key, piece.miles));
+        }));
+        return Array.from(totals.entries())
+            .map(([key, miles]) => ({key, miles: roundMiles(miles)}))
+            .filter(portion => portion.miles > 0);
+    }
+
+    // The track with the chosen pieces taken out. `removal.segmentKeys` lists
+    // the segments whose pieces go (a piece in any of them goes),
+    // `removal.outside` removes the pieces outside every segment. Returns
+    // {parts, removedMiles, keptMiles}: `parts` the paths left, in order -
+    // one when the removed pieces were at the ends only, several when a
+    // removed piece sat between kept ones, none when nothing is left. A path
+    // nothing is cut from comes back as it was (no cut points added).
+    function trimTrackPaths(paths, segments, removal = {}) {
+        const removeKeys = new Set((Array.isArray(removal.segmentKeys) ? removal.segmentKeys : []).map(key => String(key)));
+        const removeOutside = removal.outside === true;
+        const parts = [];
+        let removedMiles = 0;
+        let keptMiles = 0;
+        (Array.isArray(paths) ? paths : []).forEach(path => {
+            const pieces = slicePathBySegments(path, segments);
+            const isRemoved = piece => (piece.keys.length ? piece.keys.some(key => removeKeys.has(key)) : removeOutside);
+            if (pieces.length && !pieces.some(isRemoved)) {
+                const original = (Array.isArray(path) ? path : []).filter(isFiniteLngLat);
+                keptMiles += pathLengthMiles(original);
+                parts.push(original);
+                return;
+            }
+            let run = null;
+            pieces.forEach(piece => {
+                if (isRemoved(piece)) {
+                    removedMiles += piece.miles;
+                    run = null;
+                    return;
+                }
+                keptMiles += piece.miles;
+                if (run) {
+                    run.push(...piece.points.slice(1));
+                } else {
+                    run = piece.points.slice();
+                    parts.push(run);
+                }
+            });
+        });
+        return {
+            parts: parts.filter(part => part.length >= 2 && pathLengthMiles(part) > 0),
+            removedMiles: roundMiles(removedMiles),
+            keptMiles: roundMiles(keptMiles)
+        };
+    }
+
+    // "Team 1 p2": the original name and the part number.
+    function buildTrimmedTrackPartName(baseName, index) {
+        const base = String(baseName || '').trim() || 'Track';
+        return `${base} p${index}`;
+    }
+
     return {
+        AUTO_DRAW_MIN_ACRES,
+        AUTO_DRAW_MAX_ACRES,
+        computeAutoDrawSliceCount,
+        splitRingsByVerticalLine,
+        sliceRingsIntoEqualAreaStrips,
+        planAutoDrawSegments,
+        buildAutoDrawSegmentName,
+        slicePathBySegments,
+        summarizeTrackPortions,
+        trimTrackPaths,
+        buildTrimmedTrackPartName,
         LPB_CATEGORY_GROUPS,
         LPB_CATEGORIES,
         LPB_TERRAINS,
