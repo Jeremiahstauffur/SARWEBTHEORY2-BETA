@@ -496,9 +496,11 @@
     }
 
     // Accounted for = imported somewhere: as a Segments row or (a line) as a
-    // searcher track. `tracks` is the case's searcherTracks list.
+    // searcher track - or drawn by the app itself (a Lost Person Behavior
+    // ring, see isLpbRingFeature), which is nothing to import. `tracks` is the
+    // case's searcherTracks list.
     function isFeatureAccountedFor(feature, segmentRows, tracks = []) {
-        return isFeatureImportedAsSegment(feature, segmentRows) || isFeatureImportedAsTrack(feature, tracks);
+        return isFeatureImportedAsSegment(feature, segmentRows) || isFeatureImportedAsTrack(feature, tracks) || isLpbRingFeature(feature);
     }
 
     // Where a fetched feature can be imported: a CalTopo Assignment becomes a
@@ -578,18 +580,23 @@
     // previous bracket's distance and this one's: 25 % / d25 for the first
     // bracket, (50 - 25) % / (d50 - d25) for the second, and so on
     // (computeLpbBracketRates; with 25 % at 1.9 mi and 50 % at 11.8 mi the
-    // rates are 13.16 %/mi and 25 % / 9.9 mi = 2.53 %/mi). A segment whose
-    // centre lies within one of the distances falls into the smallest bracket
-    // that still contains it, and that bracket's rate, taken as a share of the
-    // segment's PSRi, is what the category ADDS to it: a segment in the 13.16
-    // %/mi bracket gets PSRi + 0.1316 x PSRi. With several categories on,
-    // every category works out its own addition from the unadjusted PSRi and
-    // the additions are summed once at the end (factor = 1 + sum of the rates
-    // / 100), so the order of the categories never matters. Segments farther
-    // out than a category's 95 % distance, and segments without a shape on the
-    // map, get nothing from it. Everything here is pure so the website, the
-    // server (seeding and validating the distance tables) and the tests share
-    // one implementation.
+    // rates are 13.16 %/mi and 25 % / 9.9 mi = 2.53 %/mi). A bracket's rate,
+    // taken as a share of the segment's PSRi, is what the category ADDS for
+    // the ground in that bracket - and a segment is placed by its AREA, not
+    // its centre: the share of the segment's shape inside each ring of
+    // distances around the IPP (measureAreaWithinRadii, exact circle-polygon
+    // clipping on a local plane) weighs that bracket's rate, so a segment half
+    // in the 13.16 %/mi bracket and half in the 2.53 %/mi one gets PSRi +
+    // (0.5 x 13.16 + 0.5 x 2.53) % of itself, and the part beyond the 95 %
+    // distance adds nothing (computeLpbCategoryShares). A shape without area
+    // (a line) counts as a whole in its centre's bracket. With several
+    // categories on, every category works out its own addition from the
+    // unadjusted PSRi and the additions are summed once at the end (factor =
+    // 1 + sum / 100), so the order of the categories never matters. Segments
+    // wholly beyond a category's 95 % distance, and segments without a shape
+    // on the map, get nothing from it. Everything here is pure so the website,
+    // the server (seeding and validating the distance tables) and the tests
+    // share one implementation.
     // ------------------------------------------------------------------
 
     // The categories as they are listed on the Incident page: a title per
@@ -787,12 +794,34 @@
         return out;
     }
 
+    // A category's radius rings on the CalTopo map (the "Rings on map" switch
+    // of its row): whether the planner switched them on, the CalTopo ids of
+    // the discs drawn, and the IPP position and distances they were drawn
+    // for - so a moved IPP or a changed distance is noticed and the discs are
+    // redrawn. Canonical form: {shown, featureIds, ipp, distances}.
+    function normalizeLpbRings(value) {
+        const src = (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
+        const featureIds = [];
+        (Array.isArray(src.featureIds) ? src.featureIds : []).forEach(id => {
+            const text = String(id === undefined || id === null ? '' : id).trim();
+            if (text && !featureIds.includes(text)) featureIds.push(text);
+        });
+        const ipp = (src.ipp && typeof src.ipp === 'object') ? normalizeLatLng(src.ipp.lat, src.ipp.lng) : null;
+        return {
+            shown: src.shown === true,
+            featureIds,
+            ipp,
+            distances: normalizeLpbDistances(src.distances)
+        };
+    }
+
     // The Lost Person Behavior section of a search file in canonical form:
     // every known category is present (off unless switched on), the PSR
     // adjustment is applied unless the Segments page switched it off, and the
     // distances of a category are the four values the case actually uses (a
     // copy of the login's values at the time the category / terrain was
-    // chosen, so every device computes the same PSR).
+    // chosen, so every device computes the same PSR). Each category also
+    // carries the state of its rings on the CalTopo map (normalizeLpbRings).
     function normalizeLostPersonBehavior(value) {
         const src = (value && typeof value === 'object' && !Array.isArray(value)) ? value : {};
         const rawCategories = (src.categories && typeof src.categories === 'object' && !Array.isArray(src.categories)) ? src.categories : {};
@@ -802,7 +831,8 @@
             categories[cat.key] = {
                 enabled: raw.enabled === true,
                 terrain: normalizeLpbTerrain(raw.terrain),
-                distances: normalizeLpbDistances(raw.distances)
+                distances: normalizeLpbDistances(raw.distances),
+                rings: normalizeLpbRings(raw.rings)
             };
         });
         return {
@@ -1025,14 +1055,174 @@
         return context;
     }
 
+    // Miles per degree of latitude on the sphere haversineMiles measures on,
+    // so a disc of radius r on the local plane below holds the ground within
+    // r miles of the IPP (to within the flat-earth error, negligible at the
+    // tens of miles the distance tables reach).
+    const LPB_MILES_PER_DEGREE = EARTH_RADIUS_MILES * Math.PI / 180;
+
+    // The local plane around the IPP for the area maths: x miles east and y
+    // miles north of the IPP. Longitude is scaled at the latitude midway
+    // between the IPP and the shape (`latHint`), which keeps the east-west
+    // miles honest for a shape that lies a way north or south of the IPP.
+    function makeLpbPlane(ipp, latHint) {
+        const lat = Number.isFinite(latHint) ? (ipp.lat + latHint) / 2 : ipp.lat;
+        const k = Math.cos(lat * Math.PI / 180) * LPB_MILES_PER_DEGREE;
+        return (p) => [(p[0] - ipp.lng) * k, (p[1] - ipp.lat) * LPB_MILES_PER_DEGREE];
+    }
+
+    // Signed area of the part of the triangle (origin, a, b) that lies inside
+    // the disc of radius r about the origin. Summed over the edges of a ring
+    // this is the ring's area inside the disc, signed by the ring's
+    // orientation like a shoelace sum: an edge with both ends inside the disc
+    // contributes its whole triangle, an edge that misses the disc the
+    // circular sector between its ends, and an edge that crosses the circle
+    // the pieces of both, cut at the crossing point(s).
+    function discTriangleArea(a, b, r) {
+        const r2 = r * r;
+        const cross = (p, q) => p[0] * q[1] - p[1] * q[0];
+        const dot = (p, q) => p[0] * q[0] + p[1] * q[1];
+        const sector = (p, q) => r2 * Math.atan2(cross(p, q), dot(p, q)) / 2;
+        const insideA = dot(a, a) <= r2;
+        const insideB = dot(b, b) <= r2;
+        if (insideA && insideB) return cross(a, b) / 2;
+        const d = [b[0] - a[0], b[1] - a[1]];
+        const dd = dot(d, d);
+        if (dd <= 0) return 0;
+        // Where the line a -> b meets the circle: a + t d with
+        // dd t^2 + 2 (a.d) t + (a.a - r^2) = 0.
+        const half = dot(a, d);
+        const c = dot(a, a) - r2;
+        const disc = half * half - dd * c;
+        const at = (t) => [a[0] + d[0] * t, a[1] + d[1] * t];
+        const clamp = (t) => Math.min(1, Math.max(0, t));
+        if (insideA) {
+            const p = at(clamp((-half + Math.sqrt(Math.max(0, disc))) / dd));
+            return cross(a, p) / 2 + sector(p, b);
+        }
+        if (insideB) {
+            const p = at(clamp((-half - Math.sqrt(Math.max(0, disc))) / dd));
+            return sector(a, p) + cross(p, b) / 2;
+        }
+        if (disc <= 0) return sector(a, b);
+        const root = Math.sqrt(disc);
+        const t1 = (-half - root) / dd;
+        const t2 = (-half + root) / dd;
+        if (t1 >= 1 || t2 <= 0) return sector(a, b);
+        const p1 = at(clamp(t1));
+        const p2 = at(clamp(t2));
+        return sector(a, p1) + cross(p1, p2) / 2 + sector(p2, b);
+    }
+
+    // The area of a planar ring (open or closed, either orientation) inside
+    // the disc of radius r about the origin, in square plane units.
+    function planarRingAreaInsideDisc(ring, r) {
+        const pts = cleanRing(ring);
+        if (!pts.length || !(r > 0)) return 0;
+        let sum = 0;
+        for (let i = 0; i < pts.length; i++) sum += discTriangleArea(pts[i], pts[(i + 1) % pts.length], r);
+        return Math.abs(sum);
+    }
+
+    // How much of an area geometry lies within each of `radiiMiles` of
+    // `center` ({lat, lng}): {areaAcres, fractions} - one fraction (0..1 of
+    // the whole area) per radius - or null when the geometry has no area.
+    // Holes come out of both the whole and the parts.
+    function measureAreaWithinRadii(geometry, center, radiiMiles) {
+        const polygons = collectAreaPolygons(geometry);
+        const ipp = center ? normalizeLatLng(center.lat, center.lng) : null;
+        const radii = (Array.isArray(radiiMiles) ? radiiMiles : []).map(toFiniteNumber);
+        if (!polygons.length || !ipp) return null;
+        const centroid = geometryCenterLngLat(geometry);
+        const toPlane = makeLpbPlane(ipp, centroid ? centroid[1] : NaN);
+        let total = 0;
+        const inside = radii.map(() => 0);
+        polygons.forEach(rings => {
+            rings.forEach((ring, index) => {
+                const planar = cleanRing((Array.isArray(ring) ? ring : []).filter(isFiniteLngLat).map(toPlane));
+                if (!planar.length) return;
+                const sign = index === 0 ? 1 : -1;
+                total += sign * planarRingArea(planar);
+                radii.forEach((r, i) => {
+                    if (r !== null && r > 0) inside[i] += sign * planarRingAreaInsideDisc(planar, r);
+                });
+            });
+        });
+        if (!(total > 0)) return null;
+        // A ring wholly outside a disc sums its sectors to a hair above zero
+        // and one wholly inside to a hair off its own area; snap both.
+        const snap = (value) => (value < 1e-9 ? 0 : (value > 1 - 1e-9 ? 1 : value));
+        return {
+            areaAcres: total * 640,
+            fractions: inside.map(value => snap(value / total))
+        };
+    }
+
+    // How a segment's ground falls into the brackets of one category:
+    //   shares          one per bracket (LPB_BRACKETS order): the bracket's
+    //                   rate entry (computeLpbBracketRates) plus `fraction`,
+    //                   the share of the segment's area between the previous
+    //                   distance and this one (0..1), and `addedPercent` =
+    //                   fraction x rate (0 for a bracket without a rate)
+    //   beyondFraction  the share beyond the 95 % distance (adds nothing)
+    //   addedPercent    the sum of the shares' additions: what the category
+    //                   adds to the segment, as a percentage of its PSRi
+    //   bracket         the bracket holding the largest share (null when more
+    //                   of the segment lies beyond the 95 % distance than in
+    //                   any bracket) - for the lines that name one bracket
+    //   byArea          false for a shape without area (a line, a marker):
+    //                   the whole segment then counts in its centre's bracket
+    // A segment half in the 25 % bracket and half in the 50 % one therefore
+    // gains half of each bracket's rate. The inner edge of every bracket is
+    // the largest distance before it, so a table whose distances do not
+    // increase never counts the same ground twice.
+    function computeLpbCategoryShares(geometry, centerDistanceMiles, ipp, rates) {
+        const list = Array.isArray(rates) ? rates : [];
+        let running = 0;
+        const edges = list.map(entry => {
+            if (typeof entry.distance === 'number' && entry.distance > running) running = entry.distance;
+            return running;
+        });
+        const measured = measureAreaWithinRadii(geometry, ipp, edges);
+        let cumulative;
+        if (measured) {
+            cumulative = measured.fractions;
+        } else {
+            const d = toFiniteNumber(centerDistanceMiles);
+            cumulative = edges.map(edge => (d !== null && d >= 0 && d <= edge ? 1 : 0));
+        }
+        let addedPercent = 0;
+        let previous = 0;
+        const shares = list.map((entry, i) => {
+            const within = cumulative[i];
+            const fraction = Math.max(0, within - previous);
+            previous = Math.max(previous, within);
+            const rate = typeof entry.ratePercentPerMile === 'number' ? entry.ratePercentPerMile : 0;
+            const added = fraction * rate;
+            addedPercent += added;
+            return Object.assign({}, entry, {fraction, addedPercent: added});
+        });
+        const beyondFraction = Math.max(0, 1 - previous);
+        let bracket = null;
+        shares.forEach(share => {
+            if (share.fraction > 0 && (!bracket || share.fraction > bracket.fraction)) bracket = share;
+        });
+        if (bracket && beyondFraction > bracket.fraction) bracket = null;
+        return {shares, beyondFraction, addedPercent, bracket, byArea: !!measured, areaAcres: measured ? measured.areaAcres : 0};
+    }
+
     // How the Lost Person Behavior settings change one Segments row:
     //   null                                   - the adjustment is not active
     //   {matched: false, factor: 1, ...}       - no shape on the map for this row
-    //   {matched: true, distanceMiles, contributions, addedPercent, factor}
-    //     contributions  one per applied category: {category, terrain, bracket,
-    //                    addedPercent} - bracket (see resolveLpbBracket) is
-    //                    null beyond that category's 95 % distance, and
-    //                    addedPercent is the bracket's rate (0 without one)
+    //   {matched: true, distanceMiles, byArea, areaAcres, contributions,
+    //    addedPercent, factor}
+    //     distanceMiles  the shape's centre to the IPP (for the tooltips)
+    //     byArea         the shape has an area, so every category was worked
+    //                    out from the share of that area in each bracket
+    //                    (computeLpbCategoryShares); false when only the
+    //                    centre could be placed
+    //     contributions  one per applied category: {category, terrain,
+    //                    bracket, shares, beyondFraction, byArea, addedPercent}
     //     addedPercent   the sum over the categories: the percentage of its
     //                    PSRi the segment gains
     //     factor         1 + addedPercent / 100, what the initial share is
@@ -1041,16 +1231,116 @@
         if (!context || !context.active) return null;
         const feature = findFeatureForSegmentRow(context.features, row);
         const center = feature ? getFeatureCenter(feature) : null;
-        if (!center) return {matched: false, distanceMiles: null, contributions: [], addedPercent: 0, factor: 1};
+        if (!center) return {matched: false, distanceMiles: null, byArea: false, areaAcres: 0, contributions: [], addedPercent: 0, factor: 1};
         const distanceMiles = haversineMiles(center, context.ipp);
         let addedPercent = 0;
+        let byArea = false;
+        let areaAcres = 0;
         const contributions = (context.categories || []).map(applied => {
-            const bracket = resolveLpbBracket(distanceMiles, applied.distances);
-            const rate = bracket && typeof bracket.ratePercentPerMile === 'number' ? bracket.ratePercentPerMile : 0;
-            addedPercent += rate;
-            return {category: applied.category, terrain: applied.terrain, bracket, addedPercent: rate};
+            const split = computeLpbCategoryShares(feature.geometry, distanceMiles, context.ipp, applied.rates);
+            addedPercent += split.addedPercent;
+            byArea = byArea || split.byArea;
+            if (split.areaAcres > 0) areaAcres = split.areaAcres;
+            return {
+                category: applied.category,
+                terrain: applied.terrain,
+                bracket: split.bracket,
+                shares: split.shares,
+                beyondFraction: split.beyondFraction,
+                byArea: split.byArea,
+                addedPercent: split.addedPercent
+            };
         });
-        return {matched: true, distanceMiles, contributions, addedPercent, factor: 1 + addedPercent / 100};
+        return {matched: true, distanceMiles, byArea, areaAcres, contributions, addedPercent, factor: 1 + addedPercent / 100};
+    }
+
+    // ------------------------------------------------------------------
+    // Lost Person Behavior rings on the CalTopo map.
+    //
+    // Each category row has a "Rings on map" switch: on, the category's four
+    // distances are drawn around the IPP as filled discs - purple at 10 %
+    // opacity, no outline of their own - so the ground shades darker the
+    // closer it lies to the IPP and every bracket edge shows as a step; off,
+    // the discs are deleted again. The discs are plain CalTopo Shapes named
+    // "LPB ring: <category> <percent>% (<miles>)"; the case remembers their
+    // ids (normalizeLpbRings) and app.js keeps the map in step.
+    // ------------------------------------------------------------------
+
+    const LPB_RING_COLOR = '#800080';
+    const LPB_RING_FILL_OPACITY = 0.1;
+    const LPB_RING_STROKE_WIDTH = 1;
+    const LPB_RING_TITLE_PREFIX = 'LPB ring:';
+    // Points on each circle (every 5 degrees).
+    const LPB_RING_POINTS = 72;
+
+    // The circle `radiusMiles` around `ipp` as a closed GeoJSON ring of
+    // [lng, lat] points (north first, counter-clockwise), worked out on the
+    // sphere so it is round on the map wherever the IPP lies. null without a
+    // usable centre or radius.
+    function buildLpbRingCoordinates(ipp, radiusMiles, steps = LPB_RING_POINTS) {
+        const center = ipp ? normalizeLatLng(ipp.lat, ipp.lng) : null;
+        const radius = toFiniteNumber(radiusMiles);
+        const count = Math.max(8, Math.floor(toFiniteNumber(steps) || LPB_RING_POINTS));
+        if (!center || radius === null || radius <= 0) return null;
+        const toRad = deg => deg * Math.PI / 180;
+        const toDeg = rad => rad * 180 / Math.PI;
+        const lat1 = toRad(center.lat);
+        const lng1 = toRad(center.lng);
+        const delta = radius / EARTH_RADIUS_MILES;
+        const ring = [];
+        for (let i = 0; i < count; i++) {
+            const bearing = toRad(-i * 360 / count);
+            const lat2 = Math.asin(Math.sin(lat1) * Math.cos(delta) + Math.cos(lat1) * Math.sin(delta) * Math.cos(bearing));
+            const lng2 = lng1 + Math.atan2(Math.sin(bearing) * Math.sin(delta) * Math.cos(lat1), Math.cos(delta) - Math.sin(lat1) * Math.sin(lat2));
+            const lng = ((toDeg(lng2) + 540) % 360) - 180;
+            ring.push([Math.round(lng * 1e7) / 1e7, Math.round(toDeg(lat2) * 1e7) / 1e7]);
+        }
+        ring.push(ring[0].slice());
+        return ring;
+    }
+
+    // "LPB ring: Mental Illness 25% (0.5 mi)" - the title of one disc.
+    function buildLpbRingTitle(categoryLabel, percent, miles) {
+        return `${LPB_RING_TITLE_PREFIX} ${String(categoryLabel || '').trim()} ${percent}% (${formatLpbMiles(miles)})`;
+    }
+
+    // A fetched shape that is one of the discs the app drew (by its title).
+    function isLpbRingFeature(feature) {
+        return getFeatureDisplayName(feature).startsWith(LPB_RING_TITLE_PREFIX);
+    }
+
+    // The CalTopo properties of one disc: its title, a description saying
+    // what it stands for, and the purple 10 % fill with a matching faint edge.
+    function buildLpbRingProperties(categoryLabel, terrain, percent, miles, ipp) {
+        const ippName = ipp && ipp.featureName ? ` "${ipp.featureName}"` : '';
+        return {
+            title: buildLpbRingTitle(categoryLabel, percent, miles),
+            description: `Lost Person Behavior: ${percent}% of ${categoryLabel} (${terrain}) subjects are found within ${formatLpbMiles(miles)} of the IPP${ippName}. Drawn by SAR Web Theory - switch the category's rings off there to remove it.`,
+            stroke: LPB_RING_COLOR,
+            'stroke-width': LPB_RING_STROKE_WIDTH,
+            'stroke-opacity': LPB_RING_FILL_OPACITY,
+            fill: LPB_RING_COLOR,
+            'fill-opacity': LPB_RING_FILL_OPACITY
+        };
+    }
+
+    // The discs of one category: one per bracket with a distance, in bracket
+    // order, each {key, percent, miles, geometry, properties}. Empty without
+    // an IPP.
+    function planLpbRingFeatures(categoryLabel, terrain, distances, ipp) {
+        const table = normalizeLpbDistances(distances) || {};
+        const center = ipp ? normalizeLatLng(ipp.lat, ipp.lng) : null;
+        if (!center) return [];
+        return LPB_BRACKETS.filter(bracket => typeof table[bracket.key] === 'number').map(bracket => {
+            const miles = table[bracket.key];
+            return {
+                key: bracket.key,
+                percent: bracket.percent,
+                miles,
+                geometry: {type: 'Polygon', coordinates: [buildLpbRingCoordinates(center, miles)]},
+                properties: buildLpbRingProperties(categoryLabel, terrain, bracket.percent, miles, ipp)
+            };
+        });
     }
 
     // ------------------------------------------------------------------
@@ -1469,11 +1759,67 @@
         return {byTask, tracks: allocated, ambiguousTasks};
     }
 
-    // The track miles a task gets from an allocation (0 without any).
-    function getTaskTrackMiles(allocation, taskTag) {
+    // The track miles a task gets from an allocation (0 without any). With a
+    // segment named, only the miles inside that segment: a task that owns
+    // several segments (one Search Log row each) is searched off row by row.
+    function getTaskTrackMiles(allocation, taskTag, region, segment) {
         const tag = normalizeTaskTag(taskTag);
         const entry = allocation && allocation.byTask && tag ? allocation.byTask[tag] : null;
-        return entry && Number.isFinite(entry.miles) ? entry.miles : 0;
+        if (!entry) return 0;
+        if (segment !== undefined && segment !== null && String(segment).trim()) {
+            const key = segmentKey(region, segment);
+            return (entry.portions || []).reduce((sum, portion) => (segmentKey(portion.region, portion.segment) === key ? sum + portion.miles : sum), 0);
+        }
+        return Number.isFinite(entry.miles) ? entry.miles : 0;
+    }
+
+    // ------------------------------------------------------------------
+    // Several segments in one task #.
+    //
+    // A task may own several Search Log rows - one per segment, with the
+    // task number, date, time and team repeated on each. The team's current
+    // assignment is the label "#3 R1 - 4D, 4C; R2 - 7A": the task tag, then
+    // the segments grouped by region (", " between segments, "; " between
+    // regions; a segment without a region stands alone). The Search Log rows
+    // are the source of truth; the parser is the fallback for a label whose
+    // rows are gone.
+    // ------------------------------------------------------------------
+
+    // The label for a task and its [{region, segment}] pairs (duplicates and
+    // blank segments dropped, order kept).
+    function buildTaskAssignmentLabel(taskNumber, pairs) {
+        const tag = normalizeTaskTag(taskNumber);
+        const groups = [];
+        (Array.isArray(pairs) ? pairs : []).forEach(pair => {
+            const region = String(pair && pair.region || '').trim();
+            const segment = String(pair && pair.segment || '').trim();
+            if (!segment) return;
+            let group = groups.find(entry => entry.region === region);
+            if (!group) {
+                group = {region, segments: []};
+                groups.push(group);
+            }
+            if (!group.segments.includes(segment)) group.segments.push(segment);
+        });
+        const text = groups.map(group => formatSegmentAssignmentLabel(group.region, group.segments.join(', '))).join('; ');
+        return [tag, text].filter(Boolean).join(' ');
+    }
+
+    // {taskTag, pairs: [{region, segment}]} of a label built above (or the
+    // old "#3 R1 - 4D" form); {taskTag: '', pairs: []} for anything else.
+    function parseTaskAssignmentLabel(label) {
+        const match = String(label || '').trim().match(/^(#\d+)\s*(.*)$/);
+        if (!match) return {taskTag: '', pairs: []};
+        const pairs = [];
+        match[2].split(';').map(part => part.trim()).filter(Boolean).forEach(group => {
+            const dash = group.indexOf(' - ');
+            const region = dash >= 0 ? group.slice(0, dash).trim() : '';
+            const rest = dash >= 0 ? group.slice(dash + 3) : group;
+            rest.split(',').map(part => part.trim()).filter(Boolean).forEach(segment => {
+                if (!pairs.some(pair => pair.region === region && pair.segment === segment)) pairs.push({region, segment});
+            });
+        });
+        return {taskTag: match[1], pairs};
     }
 
     // ------------------------------------------------------------------
@@ -1506,14 +1852,25 @@
     // slice at or under the maximum. `undersized` says the slices come out
     // under the minimum (a shape under 10 acres, or one between 15 and 20
     // acres, cannot be cut into 10-15 acre pieces); 0 slices for no area.
+    // With options.targetAcres (the acreage the planner typed in) the count
+    // is instead the division - floor or ceiling of total / target, at least
+    // one - whose slices come closest to the target; the bounds are not
+    // applied then (`targetAcres` carries the target, null otherwise).
     function computeAutoDrawSliceCount(totalAcres, options = {}) {
         const min = toFiniteNumber(options.minAcres) > 0 ? toFiniteNumber(options.minAcres) : AUTO_DRAW_MIN_ACRES;
         const max = Math.max(min, toFiniteNumber(options.maxAcres) > 0 ? toFiniteNumber(options.maxAcres) : AUTO_DRAW_MAX_ACRES);
+        const target = toFiniteNumber(options.targetAcres) > 0 ? toFiniteNumber(options.targetAcres) : null;
         const total = toFiniteNumber(totalAcres);
-        if (total === null || total <= 0) return {count: 0, acresEach: 0, undersized: false, minAcres: min, maxAcres: max};
+        if (total === null || total <= 0) return {count: 0, acresEach: 0, undersized: false, minAcres: min, maxAcres: max, targetAcres: target};
+        if (target !== null) {
+            const lower = Math.max(1, Math.floor(total / target));
+            const upper = Math.max(1, Math.ceil(total / target));
+            const count = Math.abs(total / lower - target) <= Math.abs(total / upper - target) ? lower : upper;
+            return {count, acresEach: total / count, undersized: false, minAcres: min, maxAcres: max, targetAcres: target};
+        }
         const count = total <= max ? 1 : Math.ceil(total / max);
         const acresEach = total / count;
-        return {count, acresEach, undersized: acresEach < min, minAcres: min, maxAcres: max};
+        return {count, acresEach, undersized: acresEach < min, minAcres: min, maxAcres: max, targetAcres: null};
     }
 
     // The local plane around `ref` ([lng, lat]): x miles east, y miles north.
@@ -1695,12 +2052,14 @@
     //                    shape is named with (a strip in two pieces gives two
     //                    numbers, north-most first)
     // options.angleDegrees is the bearing of the cut lines (0 vertical, 90
-    // horizontal); options.minAcres / maxAcres override the bounds.
+    // horizontal); options.minAcres / maxAcres override the bounds and
+    // options.targetAcres asks for the division closest to that acreage
+    // (see computeAutoDrawSliceCount; `targetAcres` is echoed).
     function planAutoDrawSegments(feature, options = {}) {
         const outerRings = collectAreaPolygons(feature && feature.geometry)
             .map(rings => cleanRing(rings[0]))
             .filter(ring => ring.length);
-        const empty = {ok: false, reason: 'no-area', totalAcres: 0, count: 0, acresEach: 0, undersized: false, angleDegrees: normalizeAutoDrawAngle(options.angleDegrees), pieces: []};
+        const empty = {ok: false, reason: 'no-area', totalAcres: 0, count: 0, acresEach: 0, undersized: false, targetAcres: null, angleDegrees: normalizeAutoDrawAngle(options.angleDegrees), pieces: []};
         if (!outerRings.length) return empty;
         const angleDegrees = normalizeAutoDrawAngle(options.angleDegrees);
         const radians = angleDegrees * Math.PI / 180;
@@ -1722,13 +2081,289 @@
                     pieces.push({ring: lngLat, acres: Math.round(entry.acres * 100) / 100, strip: stripIndex + 1, index: pieces.length + 1});
                 });
         });
-        return {ok: true, reason: '', totalAcres, count: sizing.count, acresEach: sizing.acresEach, undersized: sizing.undersized, angleDegrees, pieces};
+        return {ok: true, reason: '', totalAcres, count: sizing.count, acresEach: sizing.acresEach, undersized: sizing.undersized, targetAcres: sizing.targetAcres, angleDegrees, pieces};
     }
 
     // "Alpha-3": the source shape's name and the running number.
     function buildAutoDrawSegmentName(baseName, index) {
         const base = String(baseName || '').trim() || 'Segment';
         return `${base}-${index}`;
+    }
+
+    // ------------------------------------------------------------------
+    // Merge Segments (Maps page).
+    //
+    // Neighboring segments become one: the outline that travels the
+    // exterior border of their shapes. Everything is worked out on the local
+    // plane (miles) of the first vertex. The union is edge-based: the outer
+    // rings are welded (vertices within the tolerance of each other become
+    // one point; a vertex within the tolerance of another ring's edge is put
+    // onto that edge, which is split there), every proper crossing of two
+    // edges is inserted into both, then an edge goes when two rings share it
+    // (the border between two neighbors) or its midpoint lies inside another
+    // polygon; what is left is chained into rings and the largest one is the
+    // outline. A hole the union would enclose is not kept.
+    // ------------------------------------------------------------------
+
+    // Boundaries this close (miles; about 32 ft) count as touching:
+    // hand-drawn neighbors on CalTopo rarely share their vertices exactly.
+    const MERGE_NEIGHBOR_TOLERANCE_MILES = 0.006;
+
+    function planarDistance(a, b) {
+        return Math.hypot(a[0] - b[0], a[1] - b[1]);
+    }
+
+    // The point of segment a-b nearest to p: {t (0 at a, 1 at b), point, distance}.
+    function nearestPointOnSegment(p, a, b) {
+        const dx = b[0] - a[0];
+        const dy = b[1] - a[1];
+        const len2 = dx * dx + dy * dy;
+        const t = len2 > 0 ? Math.min(1, Math.max(0, ((p[0] - a[0]) * dx + (p[1] - a[1]) * dy) / len2)) : 0;
+        const point = [a[0] + dx * t, a[1] + dy * t];
+        return {t, point, distance: planarDistance(p, point)};
+    }
+
+    // Where segments a-b and c-d cross strictly inside both: {point, t, u};
+    // null when they do not (parallel, or touching at an end).
+    function properSegmentCrossing(a, b, c, d) {
+        const rx = b[0] - a[0];
+        const ry = b[1] - a[1];
+        const sx = d[0] - c[0];
+        const sy = d[1] - c[1];
+        const denom = rx * sy - ry * sx;
+        if (Math.abs(denom) < 1e-15) return null;
+        const t = ((c[0] - a[0]) * sy - (c[1] - a[1]) * sx) / denom;
+        const u = ((c[0] - a[0]) * ry - (c[1] - a[1]) * rx) / denom;
+        const eps = 1e-9;
+        if (t <= eps || t >= 1 - eps || u <= eps || u >= 1 - eps) return null;
+        return {point: [a[0] + rx * t, a[1] + ry * t], t, u};
+    }
+
+    // The shortest distance between segments a-b and c-d (0 when they cross).
+    function segmentDistance(a, b, c, d) {
+        if (properSegmentCrossing(a, b, c, d)) return 0;
+        return Math.min(
+            nearestPointOnSegment(a, c, d).distance, nearestPointOnSegment(b, c, d).distance,
+            nearestPointOnSegment(c, a, b).distance, nearestPointOnSegment(d, a, b).distance
+        );
+    }
+
+    // Even-odd test of a planar point against an open planar ring.
+    function planarPointInRing(point, ring) {
+        let inside = false;
+        for (let i = 0, j = ring.length - 1; i < ring.length; j = i++) {
+            const pi = ring[i];
+            const pj = ring[j];
+            if ((pi[1] > point[1]) !== (pj[1] > point[1])) {
+                const x = pj[0] + (point[1] - pj[1]) * (pi[0] - pj[0]) / (pi[1] - pj[1]);
+                if (point[0] < x) inside = !inside;
+            }
+        }
+        return inside;
+    }
+
+    function planarDistanceToRing(point, ring) {
+        let best = Infinity;
+        for (let i = 0; i < ring.length; i++) {
+            best = Math.min(best, nearestPointOnSegment(point, ring[i], ring[(i + 1) % ring.length]).distance);
+        }
+        return best;
+    }
+
+    // The outer rings (lng/lat, at least three usable points) of the area
+    // polygons of a geometry - or of a feature carrying one.
+    function collectOuterRings(source) {
+        const geometry = source && source.geometry ? source.geometry : source;
+        return collectAreaPolygons(geometry)
+            .map(rings => (Array.isArray(rings) && Array.isArray(rings[0]) ? rings[0].filter(isFiniteLngLat) : []))
+            .filter(ring => ring.length >= 3);
+    }
+
+    function resolveMergeTolerance(value) {
+        const tol = toFiniteNumber(value);
+        return tol !== null && tol >= 0 ? tol : MERGE_NEIGHBOR_TOLERANCE_MILES;
+    }
+
+    // Whether two area geometries (or features) are neighbors: an edge of
+    // one within the tolerance of an edge of the other (touching, sharing a
+    // border, crossing) or a vertex of one inside the other.
+    function polygonsAreNeighbors(a, b, toleranceMiles) {
+        const ringsA = collectOuterRings(a);
+        const ringsB = collectOuterRings(b);
+        if (!ringsA.length || !ringsB.length) return false;
+        const tol = resolveMergeTolerance(toleranceMiles);
+        const plane = makeLocalPlane(ringsA[0][0]);
+        const planarA = ringsA.map(ring => cleanRing(ring.map(plane.toPlane))).filter(ring => ring.length);
+        const planarB = ringsB.map(ring => cleanRing(ring.map(plane.toPlane))).filter(ring => ring.length);
+        for (const ringA of planarA) {
+            for (const ringB of planarB) {
+                if (ringA.some(p => planarPointInRing(p, ringB)) || ringB.some(p => planarPointInRing(p, ringA))) return true;
+                for (let i = 0; i < ringA.length; i++) {
+                    const a1 = ringA[i];
+                    const a2 = ringA[(i + 1) % ringA.length];
+                    for (let j = 0; j < ringB.length; j++) {
+                        if (segmentDistance(a1, a2, ringB[j], ringB[(j + 1) % ringB.length]) <= tol) return true;
+                    }
+                }
+            }
+        }
+        return false;
+    }
+
+    // Welds the planar rings: vertices within `tol` of each other become one
+    // point (the first seen wins), a vertex within `tol` of another ring's
+    // edge - away from its ends - is put onto that edge, splitting it, and
+    // every proper crossing of two edges of different rings is inserted into
+    // both. Returns the rebuilt rings (exact duplicates dropped).
+    function weldAndSplitRings(rings, tol) {
+        const canonical = [];
+        const snap = p => {
+            const hit = canonical.find(c => planarDistance(c, p) <= tol);
+            if (hit) return hit;
+            const own = [p[0], p[1]];
+            canonical.push(own);
+            return own;
+        };
+        const welded = rings.map(ring => cleanRing(ring.map(snap))).filter(ring => ring.length);
+        const insertions = welded.map(ring => ring.map(() => []));
+        welded.forEach((ring, i) => {
+            ring.forEach(v => {
+                welded.forEach((other, j) => {
+                    if (j === i) return;
+                    for (let k = 0; k < other.length; k++) {
+                        const a = other[k];
+                        const b = other[(k + 1) % other.length];
+                        if (planarDistance(v, a) <= tol || planarDistance(v, b) <= tol) continue;
+                        const near = nearestPointOnSegment(v, a, b);
+                        if (near.distance <= tol && near.t > 0 && near.t < 1) insertions[j][k].push({t: near.t, point: v});
+                    }
+                });
+            });
+        });
+        welded.forEach((ring, i) => {
+            for (let k = 0; k < ring.length; k++) {
+                const a = ring[k];
+                const b = ring[(k + 1) % ring.length];
+                welded.forEach((other, j) => {
+                    if (j <= i) return;
+                    for (let m = 0; m < other.length; m++) {
+                        const crossing = properSegmentCrossing(a, b, other[m], other[(m + 1) % other.length]);
+                        if (!crossing) continue;
+                        const point = snap(crossing.point);
+                        insertions[i][k].push({t: crossing.t, point});
+                        insertions[j][m].push({t: crossing.u, point});
+                    }
+                });
+            }
+        });
+        return welded.map((ring, i) => {
+            const out = [];
+            ring.forEach((vertex, k) => {
+                out.push(vertex);
+                insertions[i][k].slice().sort((x, y) => x.t - y.t).forEach(entry => out.push(snap(entry.point)));
+            });
+            return cleanRing(out);
+        }).filter(ring => ring.length);
+    }
+
+    // Drops a vertex that lies on the straight line between its neighbors.
+    function dropCollinearVertices(ring) {
+        const out = ring.slice();
+        let changed = true;
+        while (changed && out.length > 3) {
+            changed = false;
+            for (let i = 0; i < out.length; i++) {
+                const prev = out[(i - 1 + out.length) % out.length];
+                const cur = out[i];
+                const next = out[(i + 1) % out.length];
+                const v1 = [cur[0] - prev[0], cur[1] - prev[1]];
+                const v2 = [next[0] - cur[0], next[1] - cur[1]];
+                const cross = v1[0] * v2[1] - v1[1] * v2[0];
+                const dot = v1[0] * v2[0] + v1[1] * v2[1];
+                if (Math.abs(cross) <= 1e-9 * Math.max(1e-12, Math.hypot(v1[0], v1[1]) * Math.hypot(v2[0], v2[1])) && dot > 0) {
+                    out.splice(i, 1);
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        return out;
+    }
+
+    // The union outline(s) of planar rings: {rings, areas}, largest first.
+    function unionPlanarRings(rings, tol) {
+        const prepared = weldAndSplitRings(rings, tol);
+        const keyOf = p => `${p[0]},${p[1]}`;
+        const edgeKey = (a, b) => {
+            const ka = keyOf(a);
+            const kb = keyOf(b);
+            return ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+        };
+        const owners = new Map();
+        prepared.forEach((ring, i) => ring.forEach((a, k) => {
+            const key = edgeKey(a, ring[(k + 1) % ring.length]);
+            if (!owners.has(key)) owners.set(key, new Set());
+            owners.get(key).add(i);
+        }));
+        const kept = [];
+        prepared.forEach((ring, i) => ring.forEach((a, k) => {
+            const b = ring[(k + 1) % ring.length];
+            if (owners.get(edgeKey(a, b)).size > 1) return;
+            const mid = [(a[0] + b[0]) / 2, (a[1] + b[1]) / 2];
+            const insideOther = prepared.some((other, j) => j !== i && planarPointInRing(mid, other) && planarDistanceToRing(mid, other) > tol / 10);
+            if (!insideOther) kept.push([a, b]);
+        }));
+        const byVertex = new Map();
+        kept.forEach((edge, idx) => edge.forEach(p => {
+            const key = keyOf(p);
+            if (!byVertex.has(key)) byVertex.set(key, []);
+            byVertex.get(key).push(idx);
+        }));
+        const used = kept.map(() => false);
+        const loops = [];
+        kept.forEach((edge, idx) => {
+            if (used[idx]) return;
+            used[idx] = true;
+            const loop = [edge[0]];
+            let current = edge[1];
+            let guard = 0;
+            while (keyOf(current) !== keyOf(loop[0]) && guard++ <= kept.length) {
+                loop.push(current);
+                const candidates = (byVertex.get(keyOf(current)) || []).filter(n => !used[n]);
+                if (!candidates.length) break;
+                used[candidates[0]] = true;
+                const next = kept[candidates[0]];
+                current = keyOf(next[0]) === keyOf(current) ? next[1] : next[0];
+            }
+            if (loop.length >= 3) loops.push(loop);
+        });
+        const ranked = loops
+            .map(loop => ({ring: dropCollinearVertices(loop), area: planarRingArea(loop)}))
+            .filter(entry => entry.ring.length >= 3 && entry.area > 0)
+            .sort((a, b) => b.area - a.area);
+        return {rings: ranked.map(entry => entry.ring), areas: ranked.map(entry => entry.area)};
+    }
+
+    // The exterior outline of the union of area geometries (or features):
+    //   ok / reason   false with 'no-area' (nothing to merge) or 'no-outline'
+    //   ring          the outline as a closed lng/lat ring (7 decimals)
+    //   acres         its area
+    //   ringCount     how many closed outlines the union left (more than one
+    //                 = the shapes do not all touch, or a hole was dropped)
+    // options.toleranceMiles is how close boundaries may be to count as one
+    // (MERGE_NEIGHBOR_TOLERANCE_MILES by default).
+    function unionPolygonOutline(sources, options = {}) {
+        const outer = [];
+        (Array.isArray(sources) ? sources : []).forEach(source => collectOuterRings(source).forEach(ring => outer.push(ring)));
+        if (!outer.length) return {ok: false, reason: 'no-area', ring: [], acres: 0, ringCount: 0};
+        const tol = resolveMergeTolerance(options.toleranceMiles);
+        const plane = makeLocalPlane(outer[0][0]);
+        const planar = outer.map(ring => cleanRing(ring.map(plane.toPlane))).filter(ring => ring.length);
+        const result = unionPlanarRings(planar, tol);
+        if (!result.rings.length) return {ok: false, reason: 'no-outline', ring: [], acres: 0, ringCount: 0};
+        const ring = result.rings[0].map(p => plane.fromPlane(p).map(roundCoordinate));
+        ring.push(ring[0].slice());
+        return {ok: true, reason: '', ring, acres: result.areas[0] * 640, ringCount: result.rings.length};
     }
 
     // ------------------------------------------------------------------
@@ -1897,6 +2532,11 @@
         sliceRingsIntoEqualAreaStrips,
         planAutoDrawSegments,
         buildAutoDrawSegmentName,
+        MERGE_NEIGHBOR_TOLERANCE_MILES,
+        polygonsAreNeighbors,
+        unionPolygonOutline,
+        buildTaskAssignmentLabel,
+        parseTaskAssignmentLabel,
         slicePathBySegments,
         summarizeTrackPortions,
         trimTrackPaths,
@@ -1917,6 +2557,7 @@
         formatLpbPercent,
         computeLpbBracketRates,
         normalizeLpbIpp,
+        normalizeLpbRings,
         normalizeLostPersonBehavior,
         geometryCenterLngLat,
         getFeatureCenter,
@@ -1924,7 +2565,17 @@
         findFeatureForSegmentRow,
         resolveLpbBracket,
         buildLpbContext,
+        measureAreaWithinRadii,
+        computeLpbCategoryShares,
         getLpbSegmentAdjustment,
+        LPB_RING_COLOR,
+        LPB_RING_FILL_OPACITY,
+        LPB_RING_TITLE_PREFIX,
+        buildLpbRingCoordinates,
+        buildLpbRingTitle,
+        isLpbRingFeature,
+        buildLpbRingProperties,
+        planLpbRingFeatures,
         SEARCHER_TRACK_NAME_CODE,
         SEARCHER_TRACK_TYPES,
         normalizeTaskTag,

@@ -99,3 +99,124 @@ Notes from the build: a split's part names are the track's name **without** the 
 (`parseSearcherTrackName(...).baseName`), so the rename sync can put each part's own code on it; a path nothing is
 cut from comes back untouched from `trimTrackPaths` (no cut points added); a kept stretch that spans two segments
 keeps the vertex at their shared edge (a legitimate point on the line).
+
+---
+
+# Round 2 — multi-select Auto Draw with a target acreage and auto-import, Merge Segments, several segments per task
+
+## Requirements (as requested / decided)
+
+**Auto Draw Segments (extended)**
+- Several source polygons can be checked at once (checkboxes instead of the radio); each is cut and drawn in turn.
+- A small **"Target acres per segment"** box: empty → the 10–15 acre rule as before; a number → the division
+  (floor or ceil of `total / target`, at least 1) whose slices come **closest to the target** is used; the 10-acre
+  warning is replaced by a note of the resulting slice size.
+- After the slices are drawn they are **imported as segments at once**, into the **region of the Segments row the
+  source shape belongs to** (the row carrying the shape's CalTopo id in column 9, else the row named like the
+  shape); that source row is **removed** from the Segments page. A source without a Segments row is imported with
+  no region (the planner picks one on the Segments page).
+- The source shape on CalTopo is **moved into a folder named `Regions`** — created on the map when missing with
+  "visible on map open" and labels **off**, so it is hidden by default — and marked unwanted in the case so the
+  unaccounted panel and the New Assignment notifications stay quiet about it.
+- Tasks on the source segment: every Search Log row of the source becomes **one row per new segment** (same
+  task #, date, time, team, sweep width and sweep count); the team's assignment label is rebuilt from the rows.
+  Imported searcher tracks are re-measured against the new segments.
+
+**Merge Segments (new button beside Auto Draw / Trim Tracks)**
+- The popup lists the Segments rows that have a CalTopo area shape. Checking one grays out every segment that is
+  not a **neighbor** (shares an edge / touches / overlaps within ~30 ft) of *some* checked segment, and every
+  segment of **another region** (merging across regions is refused — decided with the planner); more segments can
+  be checked while neighbors remain. A **name box**, prefilled with the checked names joined by `+`, is editable.
+- Confirm: the **exterior outline of the union** is created on CalTopo as an Assignment (else Shape) named as
+  typed, in the first checked segment's style and folder; the old shapes go to the hidden `Regions` folder and are
+  marked unwanted (decided with the planner). In the case: one Segments row replaces the merged rows (region kept,
+  area / length from the outline, sweep width of the first row, CalTopo id of the new shape); the Search Log rows
+  of the merged segments collapse to **one row per task #** for the new segment (the first row's date / time /
+  team / sweep width / sweep count); assignment labels are rebuilt; tracks are re-measured.
+
+**Several segments in one task #**
+- A task # may own several Search Log rows — one per segment; Task #, Date, Time and Team identical on all of
+  them. Creating one: the Personnel page's *Assign New Task* dropdown becomes a **multi-select checklist**; the
+  Segments page's *search* button → after the team is picked a popup offers **the other segments** to add to the
+  same task (Skip = just the one).
+- Search Log table: the rows of a task are kept together; the **first row's Task #, Date, Time and Team cells span
+  the group** (`rowspan`), each as one rounded rectangle stretching over the rows; Region … Num of Sweeps and
+  Delete stay per row. A Date / Time edit applies to every row of the task; Delete removes that segment's row (the
+  task's last row also ends the team's assignment, as before).
+- PSR maths stay per row; with Map Tracking on, a row's miles are the miles allocated to its task **inside that
+  row's segment**.
+- Task Assignment form: a read-only **"Assigned Segments"** field listing the task's segments (from the log rows);
+  the printout's Region/Segment field lists them too; Manage Forms lists every segment of a task.
+- *Log sweeps* asks per row (the segment is shown); the "Fill Form" notification is one per task.
+
+**Out of scope / decided**
+- A sticky footer with the hovered segment's info: **not possible** — the CalTopo map is a cross-origin iframe
+  and its embed has no hover API — skipped per the planner.
+- Union holes: the outline keeps the **outer ring only**; the neighbor tolerance is a constant.
+- The Search Log's mobile card layout shows a task's later rows without the spanning cells (follow-up).
+
+## Technical Design
+
+### `map-segment-utils.js`
+- `computeAutoDrawSliceCount(total, {targetAcres})`: with a target, `count` = whichever of `floor` / `ceil`
+  (`total / target`) brings `total / count` closer to the target (≥ 1); the result carries `targetAcres`.
+  `planAutoDrawSegments(feature, {angleDegrees, targetAcres})` passes it through.
+- Union (planar, miles, the `polygonAreaAcres` plane of the first vertex): `unionPolygonOutline(polygons,
+  {toleranceMiles})` → `{ok, ring (closed lng/lat), acres, ringCount}` — weld vertices within the tolerance
+  (vertex ↔ vertex, then vertex ↔ edge by splitting the edge), split edges at proper crossings, drop edges whose
+  midpoint lies strictly inside another polygon and edges shared by two polygons, chain what is left into rings,
+  keep the largest ring, drop collinear vertices. `polygonsAreNeighbors(a, b, toleranceMiles)` (edges cross, a
+  vertex inside the other, or boundaries within the tolerance), `MERGE_NEIGHBOR_TOLERANCE_MILES = 0.006`.
+- `getTaskTrackMiles(allocation, tag, region, segment)`: portions filtered to the segment when one is given.
+- Labels: `buildTaskAssignmentLabel(taskNumber, pairs)` → `#N Region - A, B` (grouped by region, `; ` between
+  regions), `parseTaskAssignmentLabel(label)` → `{taskTag, pairs}`.
+
+### `app.js`
+- Search Log helpers: `getTaskSearchLogRows(bundle, tag)`, `getTaskSegmentPairs(bundle, tag)`,
+  `rebuildTeamAssignmentLabels(bundle)` (every `currentAssignments[team]` carrying a `#N` is rebuilt from the
+  rows), `describeTaskSegments(bundle, tag)`.
+- Assignment: `assignSearchTaskToTeamSegments(teamName, pairs, stamp)` (the old `assignSearchTaskToTeam` wraps
+  it); `addAutoSearchLogEntry(teamName, pairs)` pushes one row per pair. `buildSegmentChecklist(segments,
+  options)` is the shared checklist dropdown (Personnel popup, Segments page `showAdditionalSegmentsPopup`).
+- Search Log table: `groupSearchLogRowsByTask(sortedData)`; the first row of a group gets `td.task-span-cell`
+  cells with `rowSpan` for columns 0, 1, 2, 7; date / time edits fan out to the group; Delete per row.
+- `recalculateEverything`: the "map back" loop goes (rows are mutated in place; it copied the first row's PSR onto
+  every row of a task); per-row track miles. `calculatePSRAfter`, `appendTrackMilesTag` likewise.
+- Auto Draw: checkboxes, `#auto-draw-target-acres`, per-shape preview lines; `drawAutoDrawSegments(feature,
+  plan)` → `applyAutoDrawToCase(feature, created, plan)` (rows, tasks, tracks, unwanted, labels; saved through
+  `saveSearcherTracksChange`); `ensureCalTopoRegionsFolder(map)` (folders captured as `map.folders` by
+  `caltopo_request`; `POST …/Folder {title: 'Regions', visible: false, labelVisible: false}`),
+  `moveCalTopoFeatureToFolder(map, feature, folderId)` (the whole fetched feature with `folderId`, class then
+  Shape).
+- Merge: `#merge-segments-btn` → `openMergeSegmentsTool(btn)` → `showMergeSegmentsPopup(candidates)` →
+  `mergeSegmentsAction(candidates, name)`; candidates via `getMergeableSegments(bundle)`.
+- Forms / Manage Forms / notifications / `showLogSweepsPopup(tag, {region, segment})`: per task segments.
+
+### `styles.css`
+`.task-span-cell` (the pill stretches over the rowspan), `.segment-checklist` dropdown, `.merge-*` popup rows
+(`.is-disabled` grayed), `.auto-draw-target-wrap`.
+
+## Testing
+- `test_maps_merge_multi_segment_tasks.js` (new): union of two adjacent squares = a 2 sq mi rectangle with four
+  corners; overlapping squares; the slices of a rectangle union back to it; neighbors (touching, a gap under /
+  over the tolerance, far apart); target-acre counts; label build / parse; vm: a two-segment assignment (rows,
+  label, activity log); the Search Log table's spanning cells; auto draw with import (rows, source row gone, task
+  rows fanned out, Folder POST + move, unwanted); merge (create POST, moves, rows replaced, tasks collapsed).
+- `test_maps_auto_draw_trim_tracks.js` updated for the auto-import (unaccounted list, Segments rows).
+- `npm test`, `node --check app.js`.
+
+## Delivery Steps
+
+### ✓ Step 4: `map-segment-utils.js` — target-acre count, union / neighbors, per-segment track miles, assignment labels
+### ✓ Step 5: `app.js` — several segments per task (assignment path, checklist popups, Search Log grouping / rowspan, PSR / track miles, forms, sweeps, notifications)
+### ✓ Step 6: `app.js` — Auto Draw: multi-select, target acres, auto-import into the source's region, source row removed, Regions folder, tasks / tracks re-pointed
+### ✓ Step 7: `app.js` — Merge Segments button, popup, action; `styles.css`
+### ✓ Step 8: tests (new suite + updated suite), `package.json`, `?v=20260924`, AGENTS.md §3 / §5 / §7 / §8
+
+Notes from the build (round 2): the `?v=` stamp was already `20260924` (bumped by the concurrent LPB session, whose
+`app.js` / `styles.css` / `map-segment-utils.js` edits landed alongside these without a clash); `npm test` runs 33
+suites green (`test_maps_merge_multi_segment_tasks.js` is the 33rd, 15 checks). `test_custom_search_task.js` still
+fails on its pre-existing `'' vs '40 ft'` assertion (AGENTS.md §8; not in the chain). The Search Log's activity-log
+describer (`PAGE_DATA_LOG_INFO.page4`) is now keyed by task + region + segment so a deleted row's sibling is not
+logged as a "changed segment". The sync layer (`sync-delta.js`, index + `previous`-row identity; `search_log` table
+by `row_index`) never keyed rows by task number, so several rows per task needed no change there.

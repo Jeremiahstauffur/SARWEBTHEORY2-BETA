@@ -463,8 +463,10 @@ check('a Lost Person Behavior change (Incident / Maps page section, Segments swi
 
     // 12 s later (the cooldown is over) the planner imports the IPP at Seg A's
     // centre and switches Hiker on - what the section's controls do on the
-    // Incident page and in its copy on the Maps page. Seg A sits in the 25 %
-    // bracket (25 % over 1 mi = 25 %/mi), Seg B is a few hundred miles away.
+    // Incident page and in its copy on the Maps page. Seg A is a triangle
+    // 69 mi a side, so only the sliver of its area inside the 4 mi rings
+    // gains (the area maths, see test_lost_person_behavior.js); Seg B is a few
+    // hundred miles away.
     await clock.advance(12000);
     const rowsBefore = server.rows().length;
     app.updateLostPersonBehavior((lpb) => {
@@ -473,7 +475,9 @@ check('a Lost Person Behavior change (Incident / Maps page section, Segments swi
         return 'Hiker on';
     });
     const after = psrc();
-    assert.strictEqual(after[0], (parseFloat(before[0]) * 1.25).toFixed(4), 'Seg A gained 25 % of its PSRc the moment the section changed - no visit to the Segments page needed');
+    const factor = app.getLpbPsrFactor(app.loadBundle().pages.page2[0], app.buildLpbContext(app.loadBundle()));
+    assert.ok(factor > 1 && factor < 1.25, `a sliver of Seg A lies inside the rings (x${factor})`);
+    assert.strictEqual(after[0], (parseFloat(before[0]) * factor).toFixed(4), 'Seg A gained its share the moment the section changed - no visit to the Segments page needed');
     assert.strictEqual(after[1], before[1], 'Seg B, beyond the 95 % distance, is unchanged');
     assert.strictEqual(app.getNextCalTopoColorSyncAt(), clock.now, 'the color push is asked for at once (delay 0): the cooldown is over, so it is due now');
     await clock.advance(50);

@@ -188,8 +188,9 @@ check('normalizeLpbDistanceMiles: miles to a tenth, positive numbers only', () =
     assert.strictEqual(utils.isCompleteLpbDistances(null), false);
 });
 
-// Every category off, on the default terrain, without distances.
-const blankCategories = () => Object.fromEntries(utils.LPB_CATEGORIES.map(cat => [cat.key, {enabled: false, terrain: 'Mtn Temperate', distances: null}]));
+// Every category off, on the default terrain, without distances, no rings on the map.
+const NO_RINGS = () => ({shown: false, featureIds: [], ipp: null, distances: null});
+const blankCategories = () => Object.fromEntries(utils.LPB_CATEGORIES.map(cat => [cat.key, {enabled: false, terrain: 'Mtn Temperate', distances: null, rings: NO_RINGS()}]));
 
 check('the categories are listed in their groups, Mental Illness among the Mental State ones', () => {
     assert.deepStrictEqual(utils.LPB_CATEGORY_GROUPS.map(g => g.title), ['External Forces', 'Water', 'Wheel/Motorized', 'Mental State', 'Child', 'Outdoor Activity', 'Snow Activity']);
@@ -224,8 +225,8 @@ check('normalizeLostPersonBehavior always yields the canonical shape', () => {
         psrAdjustmentEnabled: false,
         ipp: {lat: '44.95', lng: -93.05, featureId: 'mk1', featureName: 'IPP', importedAt: 't', importedBy: 'Jane', extra: 1},
         categories: {
-            mentalIllness: {enabled: 'yes', terrain: 'Lunar', distances: {p25: '0.25', p50: 'x', p75: 1.5, p95: 2}},
-            dementia: {enabled: true, terrain: 'Dry', distances: {p25: 1.9, p50: 11.8, p75: 20, p95: 30}},
+            mentalIllness: {enabled: 'yes', terrain: 'Lunar', distances: {p25: '0.25', p50: 'x', p75: 1.5, p95: 2}, rings: 'yes'},
+            dementia: {enabled: true, terrain: 'Dry', distances: {p25: 1.9, p50: 11.8, p75: 20, p95: 30}, rings: {shown: true, featureIds: ['r1', 'r1', 7, '', null], ipp: {lat: '44.95', lng: -93.05, extra: 1}, distances: {p25: '1.9', p50: 'x'}}},
             unknownCategory: {enabled: true}
         }
     });
@@ -234,10 +235,15 @@ check('normalizeLostPersonBehavior always yields the canonical shape', () => {
         ipp: {featureId: 'mk1', featureName: 'IPP', lat: 44.95, lng: -93.05, importedAt: 't', importedBy: 'Jane'},
         categories: {
             ...blankCategories(),
-            mentalIllness: {enabled: false, terrain: 'Mtn Temperate', distances: {p25: 0.3, p75: 1.5, p95: 2}},
-            dementia: {enabled: true, terrain: 'Dry', distances: {p25: 1.9, p50: 11.8, p75: 20, p95: 30}}
+            mentalIllness: {enabled: false, terrain: 'Mtn Temperate', distances: {p25: 0.3, p75: 1.5, p95: 2}, rings: NO_RINGS()},
+            dementia: {enabled: true, terrain: 'Dry', distances: {p25: 1.9, p50: 11.8, p75: 20, p95: 30}, rings: {shown: true, featureIds: ['r1', '7'], ipp: {lat: 44.95, lng: -93.05}, distances: {p25: 1.9}}}
         }
     });
+    // The rings record on its own: ids de-duplicated and stringified, an
+    // unusable position dropped, anything else the canonical blank.
+    assert.deepStrictEqual(utils.normalizeLpbRings(null), NO_RINGS());
+    assert.deepStrictEqual(utils.normalizeLpbRings({shown: 1, featureIds: 'abc', ipp: {lat: 200, lng: 0}}), {shown: false, featureIds: [], ipp: null, distances: null});
+    assert.deepStrictEqual(utils.normalizeLpbRings({shown: true, featureIds: ['a', 'b']}), {shown: true, featureIds: ['a', 'b'], ipp: null, distances: null});
     assert.strictEqual(utils.normalizeLostPersonBehavior({ipp: {lat: 200, lng: 0}}).ipp, null, 'an unusable position is no IPP');
     assert.strictEqual(utils.normalizeLpbTerrain('Dry'), 'Dry');
     assert.strictEqual(utils.getLpbCategory('mental illness').key, 'mentalIllness');
@@ -246,14 +252,15 @@ check('normalizeLostPersonBehavior always yields the canonical shape', () => {
     assert.deepStrictEqual(utils.LPB_SEED_DISTANCES, {p25: 0.5, p50: 1.0, p75: 1.5, p95: 2.0});
 });
 
-const activeBundle = (overrides = {}) => ({
+// `mapOverrides.features` replaces the map's shapes.
+const activeBundle = (overrides = {}, mapOverrides = {}) => ({
     lostPersonBehavior: {
         psrAdjustmentEnabled: true,
         ipp: {featureId: 'mk1', featureName: 'IPP', lat: IPP.lat, lng: IPP.lng},
         categories: {mentalIllness: {enabled: true, terrain: 'Mtn Temperate', distances: DISTANCES}},
         ...overrides
     },
-    maps: [{id: 'MAP1', features: [
+    maps: [{id: 'MAP1', features: mapOverrides.features || [
         segmentShape('Alpha', 'a', 0.3),
         segmentShape('R1 - Bravo', 'gfx-2', 0.7, {closed: false}),
         segmentShape('Charlie', 'c', 5),
@@ -334,9 +341,146 @@ check('getLpbSegmentAdjustment finds the shape by CalTopo id or by name and adds
     assert.strictEqual(far.factor, 1);
 
     const none = utils.getLpbSegmentAdjustment(['R1', 'Delta', '640 ac', '1 mi', '100 ft', '', '', '', '', ''], context);
-    assert.deepStrictEqual(none, {matched: false, distanceMiles: null, contributions: [], addedPercent: 0, factor: 1});
+    assert.deepStrictEqual(none, {matched: false, distanceMiles: null, byArea: false, areaAcres: 0, contributions: [], addedPercent: 0, factor: 1});
 
     assert.strictEqual(utils.getLpbSegmentAdjustment(['R1', 'Alpha'], utils.buildLpbContext(activeBundle({psrAdjustmentEnabled: false}))), null);
+    // A small square wholly inside one ring is placed by its area like before:
+    // the whole segment in one bracket.
+    assert.strictEqual(byId.byArea, true);
+    assert.deepStrictEqual(byId.contributions[0].shares.map(s => [s.percent, s.fraction]), [[25, 1], [50, 0], [75, 0], [95, 0]]);
+    assert.strictEqual(byId.contributions[0].beyondFraction, 0);
+    assert.deepStrictEqual(far.contributions[0].shares.map(s => s.fraction), [0, 0, 0, 0]);
+    assert.strictEqual(far.contributions[0].beyondFraction, 1, 'Charlie lies wholly beyond the 95 % distance');
+});
+
+// ---------------------------------------------------------------------------
+// The area maths: a segment is placed by the share of its area inside each
+// ring around the IPP, not by its centre. The rectangles below are laid out
+// in miles east / north of the IPP on the module's own sphere (one mile =
+// 180 / (pi x 3958.7613) degrees of latitude, so a rectangle's edges land
+// exactly where the maths expects them; the longitude step is stretched by
+// 1 / cos(45 deg)).
+// ---------------------------------------------------------------------------
+const MILE_EXACT_DEG_LAT = 180 / (Math.PI * 3958.7613);
+const MILE_EXACT_DEG_LNG = MILE_EXACT_DEG_LAT / Math.cos(IPP.lat * Math.PI / 180);
+const MILE_IN_DEG_LNG = MILE_EXACT_DEG_LNG;
+const rectangleEast = (x0, x1, y0, y1) => ({type: 'Polygon', coordinates: [[
+    [IPP.lng + x0 * MILE_EXACT_DEG_LNG, IPP.lat + y0 * MILE_EXACT_DEG_LAT],
+    [IPP.lng + x1 * MILE_EXACT_DEG_LNG, IPP.lat + y0 * MILE_EXACT_DEG_LAT],
+    [IPP.lng + x1 * MILE_EXACT_DEG_LNG, IPP.lat + y1 * MILE_EXACT_DEG_LAT],
+    [IPP.lng + x0 * MILE_EXACT_DEG_LNG, IPP.lat + y1 * MILE_EXACT_DEG_LAT],
+    [IPP.lng + x0 * MILE_EXACT_DEG_LNG, IPP.lat + y0 * MILE_EXACT_DEG_LAT]
+]]});
+
+check('measureAreaWithinRadii: the share of a shape inside each disc around the IPP (exact circle clipping, holes, no area)', () => {
+    // A thin strip from the IPP out to 2 mi: half of it within 1 mi, all within 2 mi.
+    const strip = utils.measureAreaWithinRadii(rectangleEast(0, 2, -0.001, 0.001), IPP, [1, 2, 3]);
+    near(strip.areaAcres, 2 * 0.002 * 640, 0.01, 'area in acres');
+    near(strip.fractions[0], 0.5, 1e-4, 'half within 1 mi');
+    near(strip.fractions[1], 1, 1e-3, 'all within 2 mi (its far corners sit on the ring)');
+    assert.strictEqual(strip.fractions[2], 1, 'wholly inside: exactly 1 (snapped)');
+    // A 2 x 2 mi square centred on the IPP and the 1 mi disc: pi / 4 of it.
+    near(utils.measureAreaWithinRadii(rectangleEast(-1, 1, -1, 1), IPP, [1]).fractions[0], Math.PI / 4, 1e-4, 'pi/4 of the square');
+    // A 10 x 10 mi square: the disc is wholly inside, pi / 100.
+    near(utils.measureAreaWithinRadii(rectangleEast(-5, 5, -5, 5), IPP, [1]).fractions[0], Math.PI / 100, 1e-5, 'the whole disc');
+    // Wholly outside a disc: exactly 0 (snapped), wholly inside a big one: 1.
+    assert.deepStrictEqual(utils.measureAreaWithinRadii(rectangleEast(3, 4, -0.5, 0.5), IPP, [1, 6]).fractions, [0, 1]);
+    // A hole is taken out of both the whole and the parts: a 2 x 2 square with a
+    // 1 x 1 hole (area 3); the 0.5 mi disc lies inside the hole, the 1 mi disc
+    // covers (pi - 1) of the remaining ground.
+    const holed = {type: 'Polygon', coordinates: [rectangleEast(-1, 1, -1, 1).coordinates[0], rectangleEast(-0.5, 0.5, -0.5, 0.5).coordinates[0]]};
+    const withHole = utils.measureAreaWithinRadii(holed, IPP, [0.5, 1]);
+    near(withHole.areaAcres, 3 * 640, 0.5);
+    assert.strictEqual(withHole.fractions[0], 0);
+    near(withHole.fractions[1], (Math.PI - 1) / 3, 1e-4);
+    // Open rings (no closing point) measure the same as closed ones.
+    const open = {type: 'Polygon', coordinates: [rectangleEast(0, 2, -0.001, 0.001).coordinates[0].slice(0, 4)]};
+    near(utils.measureAreaWithinRadii(open, IPP, [1]).fractions[0], 0.5, 1e-4);
+    // A line or a point has no area: null. Without a usable centre: null.
+    assert.strictEqual(utils.measureAreaWithinRadii({type: 'LineString', coordinates: [[IPP.lng, IPP.lat], [IPP.lng + MILE_IN_DEG_LNG, IPP.lat]]}, IPP, [1]), null);
+    assert.strictEqual(utils.measureAreaWithinRadii({type: 'Point', coordinates: [IPP.lng, IPP.lat]}, IPP, [1]), null);
+    assert.strictEqual(utils.measureAreaWithinRadii(rectangleEast(0, 1, 0, 1), null, [1]), null);
+    assert.strictEqual(utils.measureAreaWithinRadii(rectangleEast(0, 1, 0, 1), {lat: 'x', lng: 1}, [1]), null);
+});
+
+check('computeLpbCategoryShares: a segment across a bracket edge gains each bracket\'s rate in proportion to the share of its area there', () => {
+    const rates = utils.computeLpbBracketRates(DISTANCES); // 50, 50, 50, 40 %/mi over 0.5 mi steps
+    // A thin strip from the IPP out to 2 mi: a quarter of it in each bracket.
+    const strip = utils.computeLpbCategoryShares(rectangleEast(0, 2, -0.001, 0.001), 1, IPP, rates);
+    assert.strictEqual(strip.byArea, true);
+    strip.shares.forEach(share => near(share.fraction, 0.25, 1e-4, `${share.percent}% bracket holds a quarter`));
+    near(strip.shares[0].addedPercent, 12.5, 0.01, 'a quarter of 50 %/mi');
+    near(strip.shares[3].addedPercent, 10, 0.01, 'a quarter of 40 %/mi');
+    near(strip.addedPercent, 0.25 * 50 + 0.25 * 50 + 0.25 * 50 + 0.25 * 40, 0.01, 'the shares are summed: 47.5 % of the PSRi');
+    near(strip.beyondFraction, 0, 1e-4);
+    // Half in the 25 % bracket, half in the 50 % one: half of each rate.
+    const half = utils.computeLpbCategoryShares(rectangleEast(0.25, 0.75, -0.001, 0.001), 0.5, IPP, rates);
+    near(half.shares[0].fraction, 0.5, 1e-3);
+    near(half.shares[1].fraction, 0.5, 1e-3);
+    near(half.addedPercent, 0.5 * 50 + 0.5 * 50, 0.1);
+    // Half in the 95 % bracket, half beyond: only the inside half counts.
+    const edge = utils.computeLpbCategoryShares(rectangleEast(1.5, 2.5, -0.001, 0.001), 2, IPP, rates);
+    near(edge.shares[3].fraction, 0.5, 1e-3);
+    near(edge.beyondFraction, 0.5, 1e-3);
+    near(edge.addedPercent, 0.5 * 40, 0.1, 'half of the 40 %/mi, nothing for the part beyond');
+    assert.strictEqual(edge.bracket, null, 'no single bracket holds more than the part beyond');
+    // With different rates the halves weigh differently: 25 % at 1.9 mi
+    // (13.16 %/mi) and 50 % at 11.8 mi (2.53 %/mi), a strip from 0.9 to 2.9 mi.
+    const dementia = utils.computeLpbCategoryShares(rectangleEast(0.9, 2.9, -0.001, 0.001), 1.9, IPP, utils.computeLpbBracketRates(DEMENTIA_DISTANCES));
+    near(dementia.shares[0].fraction, 0.5, 1e-3);
+    near(dementia.shares[1].fraction, 0.5, 1e-3);
+    near(dementia.addedPercent, 0.5 * 25 / 1.9 + 0.5 * 25 / 9.9, 0.05, 'half of 13.16 plus half of 2.53');
+    assert.ok([25, 50].includes(dementia.bracket.percent), 'one of the two (equal) shares names the bracket');
+    // A bracket whose distance does not lie beyond the previous one has no
+    // width and no rate: its share is 0 and the next bracket starts where the
+    // previous distance ended - no ground is counted twice.
+    const flat = utils.computeLpbCategoryShares(rectangleEast(0, 2, -0.001, 0.001), 1, IPP, utils.computeLpbBracketRates({p25: 1, p50: 1, p75: 0.8, p95: 2}));
+    near(flat.shares[0].fraction, 0.5, 1e-3);
+    assert.strictEqual(flat.shares[1].fraction, 0);
+    assert.strictEqual(flat.shares[2].fraction, 0);
+    near(flat.shares[3].fraction, 0.5, 1e-3);
+    near(flat.shares.reduce((sum, s) => sum + s.fraction, 0) + flat.beyondFraction, 1, 1e-6, 'the shares and the part beyond add up to the whole segment');
+    // A shape without area (a line) counts as a whole in its centre's bracket.
+    const line = utils.computeLpbCategoryShares({type: 'LineString', coordinates: [[IPP.lng, IPP.lat], [IPP.lng + MILE_IN_DEG_LNG, IPP.lat]]}, 0.7, IPP, rates);
+    assert.strictEqual(line.byArea, false);
+    assert.deepStrictEqual(line.shares.map(s => s.fraction), [0, 1, 0, 0]);
+    assert.strictEqual(line.addedPercent, 50);
+    assert.strictEqual(line.bracket.percent, 50);
+    assert.deepStrictEqual(utils.computeLpbCategoryShares(null, 5, IPP, rates).shares.map(s => s.fraction), [0, 0, 0, 0], 'a centre beyond every distance');
+    assert.strictEqual(utils.computeLpbCategoryShares(null, 5, IPP, rates).beyondFraction, 1);
+});
+
+check('getLpbSegmentAdjustment: a segment straddling a bracket edge gains a weighted share, and the PSRi follows', () => {
+    // Alpha's shape is a 1 x 0.002 mi strip from 0.25 to 1.25 mi east of the
+    // IPP: a quarter in the 25 % bracket, half in the 50 % one, a quarter in
+    // the 75 % one - all at 50 %/mi, so 50 % of the PSRi in total, but the
+    // tooltip lists the three shares.
+    const features = [
+        markerAt('IPP', 'ipp-1', IPP.lat, IPP.lng),
+        {geometry: rectangleEast(0.25, 1.25, -0.001, 0.001), attributes: {name: 'Alpha', id: 'a', class: 'Assignment', ObjectID: 1}}
+    ];
+    const context = utils.buildLpbContext(activeBundle({}, {features}));
+    const alpha = utils.getLpbSegmentAdjustment(['R1', 'Alpha', '640 ac', '1 mi', '100 ft', '', '', '', '', 'a'], context);
+    assert.strictEqual(alpha.matched, true);
+    assert.strictEqual(alpha.byArea, true);
+    near(alpha.areaAcres, 1 * 0.002 * 640, 0.01);
+    const shares = alpha.contributions[0].shares;
+    near(shares[0].fraction, 0.25, 1e-3);
+    near(shares[1].fraction, 0.5, 1e-3);
+    near(shares[2].fraction, 0.25, 1e-3);
+    near(shares[3].fraction, 0, 1e-6);
+    near(alpha.addedPercent, 50, 0.05);
+    assert.strictEqual(alpha.contributions[0].bracket.percent, 50, 'the bracket holding most of the segment');
+    // The same segment with the 50 % distance moved to 0.7 mi: the brackets
+    // are 0.5 wide (50 %/mi), 0.2 wide (125 %/mi) and 0.8 wide (31.25 %/mi),
+    // and the strip has a quarter, a fifth and the rest of itself in them.
+    const moved = utils.buildLpbContext(activeBundle({categories: {mentalIllness: {enabled: true, terrain: 'Mtn Temperate', distances: {p25: 0.5, p50: 0.7, p75: 1.5, p95: 2.0}}}}, {features}));
+    const shifted = utils.getLpbSegmentAdjustment(['R1', 'Alpha', '640 ac', '1 mi', '100 ft', '', '', '', '', 'a'], moved);
+    near(shifted.contributions[0].shares[0].fraction, 0.25, 1e-3);
+    near(shifted.contributions[0].shares[1].fraction, 0.2, 1e-3);
+    near(shifted.contributions[0].shares[2].fraction, 0.55, 1e-3);
+    near(shifted.addedPercent, 0.25 * 50 + 0.2 * 125 + 0.55 * 31.25, 0.1, 'each share at its own rate');
+    assert.ok(shifted.addedPercent > alpha.addedPercent, 'more of the segment in a steeper bracket: a larger gain');
 });
 
 check('with several categories on, each works out its own addition and the additions are summed', () => {

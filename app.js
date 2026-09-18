@@ -260,18 +260,23 @@ function normalizeSegmentNameForMatch(value) {
 // lost-person categories (listed under their group titles: External Forces,
 // Water, Wheel/Motorized, Mental State, Child, Outdoor Activity, Snow
 // Activity), picks a terrain for each and imports the IPP marker from the
-// CalTopo map. The maths (segment centre, distance to the IPP, which
-// 25/50/75/95 % bracket it falls into, that bracket's percentage per mile and
-// the sum over the categories that becomes the PSR factor) lives in
-// map-segment-utils.js so the server and the tests share it; these wrappers
-// only fall back to "not active" on a page that loads app.js without it.
+// CalTopo map. The maths (the share of a segment's area inside each of the
+// 25/50/75/95 % distance rings around the IPP, each bracket's percentage per
+// mile weighed by that share, and the sum over the categories that becomes
+// the PSR factor) lives in map-segment-utils.js so the server and the tests
+// share it; these wrappers only fall back to "not active" on a page that
+// loads app.js without it.
 //
 // What the case stores (bundle.lostPersonBehavior, mirrored to the
 // lost_person_behavior table and - for the IPP - lpb_ipp on the server):
 //   psrAdjustmentEnabled  the Segments page switch; off keeps every setting
 //                         but leaves the PSR values alone
 //   ipp                   {featureId, featureName, lat, lng, importedAt, importedBy}
-//   categories.<key>      {enabled, terrain, distances: {p25, p50, p75, p95}}
+//   categories.<key>      {enabled, terrain, distances: {p25, p50, p75, p95},
+//                          rings: {shown, featureIds, ipp, distances}}
+//                         `rings` is the category's "Rings on map" switch and
+//                         the discs it drew on the CalTopo map (see
+//                         syncLpbRingsToCalTopo)
 // The four distances of a category are copied INTO the case (from the login's
 // values on the server, see loadLpbDistances) when the category is switched on
 // or its terrain changes, and edited in place afterwards. Every device
@@ -371,10 +376,13 @@ function buildLpbContext(bundle) {
 }
 
 // null when the adjustment is not active; otherwise {matched, distanceMiles,
-// contributions, addedPercent, factor} for one Segments row: one contribution
-// per applied category (its bracket and the percentage of the PSRi it adds),
-// their sum, and factor = 1 + sum / 100 (1 for a segment without a shape on
-// the map or beyond every category's 95 % distance).
+// byArea, contributions, addedPercent, factor} for one Segments row: one
+// contribution per applied category - the share of the segment's area in each
+// of its brackets (`shares`, each fraction x that bracket's rate) and the
+// percentage of the PSRi they add together -, their sum over the categories,
+// and factor = 1 + sum / 100 (1 for a segment without a shape on the map or
+// wholly beyond every category's 95 % distance). A shape without area (a
+// line) counts as a whole in its centre's bracket (byArea false).
 function getLpbSegmentAdjustment(row, context) {
     const utils = getMapSegmentUtils();
     return typeof utils.getLpbSegmentAdjustment === 'function' ? utils.getLpbSegmentAdjustment(row, context) : null;
@@ -383,8 +391,22 @@ function getLpbSegmentAdjustment(row, context) {
 // The PSR factor of one Segments row under the current settings (1 when the
 // adjustment is not active or does not reach this segment).
 function getLpbPsrFactor(row, context) {
-    const adjustment = getLpbSegmentAdjustment(row, context);
-    return adjustment && Number.isFinite(adjustment.factor) && adjustment.factor > 0 ? adjustment.factor : 1;
+  const adjustment = getLpbSegmentAdjustment(row, context);
+  return adjustment && Number.isFinite(adjustment.factor) && adjustment.factor > 0 ? adjustment.factor : 1;
+}
+
+// The discs of one category's rings on the CalTopo map (see planLpbRingFeatures
+// in map-segment-utils.js): one per bracket with a distance, each {key,
+// percent, miles, geometry, properties}. None without the shared module.
+function planLpbRingFeatures(categoryLabel, terrain, distances, ipp) {
+  const utils = getMapSegmentUtils();
+  return typeof utils.planLpbRingFeatures === 'function' ? utils.planLpbRingFeatures(categoryLabel, terrain, distances, ipp) : [];
+}
+
+// A fetched shape that is one of the ring discs the app drew (by its title).
+function isLpbRingMapFeature(feature) {
+  const utils = getMapSegmentUtils();
+  return typeof utils.isLpbRingFeature === 'function' ? utils.isLpbRingFeature(feature) : false;
 }
 
 // The login's distance tables from the server (GET /api/lpb/distances):
@@ -660,21 +682,115 @@ function buildActiveSearchSegmentNameSet(bundle, rows) {
         return addCustomSearchActiveSegmentNames(bundle, utilNames);
     }
 
+    // Every segment of every task a team is out on (a task may cover several
+    // segments - one Search Log row each - so the segments come from the
+    // task's rows, not from the label alone).
     const names = new Set();
     const currentAssignments = bundle?.currentAssignments || {};
     const teamStatuses = bundle?.teamStatuses || {};
-    (rows || ensureSegmentsPageRows(bundle)).forEach(row => {
-        const fullName = formatSegmentAssignmentLabel(row?.[0], row?.[1]);
-        if (!fullName) return;
-        const isSearching = Object.entries(currentAssignments).some(([teamName, assignment]) => {
-            const status = String(teamStatuses[teamName] || '').trim().toLowerCase();
-            return String(assignment || '').includes(fullName) && status && !status.includes('finished segment') && !status.startsWith('at base');
+    Object.keys(currentAssignments).forEach(teamName => {
+        const status = String(teamStatuses[teamName] || '').trim().toLowerCase();
+        if (!status || status.includes('finished segment') || status.startsWith('at base')) return;
+        getTeamAssignmentSegmentPairs(bundle, teamName).forEach(pair => {
+            const fullName = formatSegmentAssignmentLabel(pair.region, pair.segment);
+            if (!fullName) return;
+            names.add(normalizeSegmentNameForMatch(pair.segment));
+            names.add(normalizeSegmentNameForMatch(fullName));
         });
-        if (!isSearching) return;
-        names.add(normalizeSegmentNameForMatch(row?.[1]));
-        names.add(normalizeSegmentNameForMatch(fullName));
     });
     return addCustomSearchActiveSegmentNames(bundle, names);
+}
+
+// ---------------------------------------------------------------------------
+// Several segments in one task #.
+//
+// A task # may own several Search Log rows - one per segment, with the task
+// number, date, time and team repeated on each (the Search Log page draws
+// those four cells once, spanning the rows). The team's current assignment is
+// the label "#3 R1 - 4D, 4C" (buildTaskAssignmentLabel, map-segment-utils.js).
+// The rows are the source of truth for which segments a task covers; the
+// label is parsed only when its rows are gone.
+// ---------------------------------------------------------------------------
+
+function buildTaskAssignmentLabel(taskNumber, pairs) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.buildTaskAssignmentLabel === 'function') return utils.buildTaskAssignmentLabel(taskNumber, pairs);
+    const tag = normalizeSearchTaskTag(taskNumber);
+    const text = normalizeSegmentPairs(pairs).map(pair => formatSegmentAssignmentLabel(pair.region, pair.segment)).join(', ');
+    return [tag, text].filter(Boolean).join(' ');
+}
+
+function parseTaskAssignmentLabel(label) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.parseTaskAssignmentLabel === 'function') return utils.parseTaskAssignmentLabel(label);
+    const match = String(label || '').trim().match(/^(#\d+)\s*(.*)$/);
+    if (!match) return {taskTag: '', pairs: []};
+    const dash = match[2].indexOf(' - ');
+    return {taskTag: match[1], pairs: normalizeSegmentPairs(dash >= 0 ? match[2].slice(0, dash) : '', dash >= 0 ? match[2].slice(dash + 3) : match[2])};
+}
+
+// [{region, segment}] from a (region, segment) pair of arguments, a list of
+// such pairs or a list of [region, segment] rows: trimmed, blank segments
+// and duplicates dropped, order kept.
+function normalizeSegmentPairs(regionOrPairs, segment) {
+    const list = Array.isArray(regionOrPairs)
+        ? regionOrPairs.map(entry => (Array.isArray(entry) ? {region: entry[0], segment: entry[1]} : entry))
+        : [{region: regionOrPairs, segment}];
+    const out = [];
+    list.forEach(entry => {
+        const pair = {region: String(entry && entry.region || '').trim(), segment: String(entry && entry.segment || '').trim()};
+        if (!pair.segment) return;
+        if (!out.some(other => other.region === pair.region && other.segment === pair.segment)) out.push(pair);
+    });
+    return out;
+}
+
+// The Search Log rows of a task, in page order (the row objects themselves).
+function getTaskSearchLogRows(bundle, taskTag) {
+    const tag = normalizeSearchTaskTag(taskTag);
+    if (!tag) return [];
+    return (bundle?.pages?.page4 || []).filter(row => Array.isArray(row) && normalizeSearchTaskTag(row[0]) === tag);
+}
+
+// The segments a task covers, from its rows: [{region, segment}].
+function getTaskSegmentPairs(bundle, taskTag) {
+    return normalizeSegmentPairs(getTaskSearchLogRows(bundle, taskTag).map(row => ({region: row[3], segment: row[4]})));
+}
+
+// "R1 - 4D, 4C": the task's segments as the form and the printout show them
+// ('' for a task without rows).
+function describeTaskSegments(bundle, taskTag) {
+    return buildTaskAssignmentLabel(taskTag, getTaskSegmentPairs(bundle, taskTag)).replace(/^#\d+\s*/, '');
+}
+
+// The segments behind a team's current assignment: the task's rows, else
+// (rows gone) what the label says. [] for a team at base / unassigned.
+function getTeamAssignmentSegmentPairs(bundle, teamName) {
+    const parsed = parseTaskAssignmentLabel(bundle?.currentAssignments?.[teamName]);
+    if (!parsed.taskTag) return [];
+    const fromRows = getTaskSegmentPairs(bundle, parsed.taskTag);
+    return fromRows.length ? fromRows : parsed.pairs;
+}
+
+// Every team's assignment label rebuilt from its task's rows - after rows
+// were added, removed or pointed at other segments (an auto-drawn or merged
+// segment). Returns true when a label changed.
+function rebuildTeamAssignmentLabels(bundle) {
+    const assignments = bundle && bundle.currentAssignments;
+    if (!assignments || typeof assignments !== 'object') return false;
+    let changed = false;
+    Object.keys(assignments).forEach(teamName => {
+        const parsed = parseTaskAssignmentLabel(assignments[teamName]);
+        if (!parsed.taskTag) return;
+        const pairs = getTaskSegmentPairs(bundle, parsed.taskTag);
+        if (!pairs.length) return;
+        const label = buildTaskAssignmentLabel(parsed.taskTag, pairs);
+        if (label !== assignments[teamName]) {
+            assignments[teamName] = label;
+            changed = true;
+        }
+    });
+    return changed;
 }
 
 function isFeatureActivelyBeingSearched(feature, activeSearchNames) {
@@ -6890,9 +7006,16 @@ const PAGE_DATA_LOG_INFO = {
   },
   page4: {
     type: 'Search Log Entry',
-    keyCols: [0],
+    // A task # may own one row per segment, so a row is keyed by its task
+    // AND its segment (else a deleted row's sibling would be diffed against
+    // it and logged as a changed segment).
+    keyCols: [0, 3, 4],
     columns: {1: 'Date', 2: 'Time', 3: 'Region', 4: 'Segment', 7: 'Team', 8: 'Sweep Width', 9: 'Num of Sweeps'},
-    rowName: row => String(row?.[0] || '').trim() || 'unnumbered task'
+    rowName: row => {
+      const tag = String(row?.[0] || '').trim();
+      const segment = formatSegmentAssignmentLabel(row?.[3], row?.[4]);
+      return tag ? (segment ? `${tag} ${segment}` : tag) : 'unnumbered task';
+    }
   }
 };
 
@@ -7277,10 +7400,11 @@ function recalculateEverything(options = {}) {
   updateConsensusCells(regionsData);
 
   // Lost Person Behavior (Incident page): every switched-on category adds its
-  // bracket's percentage per mile (as a share of the unadjusted PSRi) to a
-  // segment within its distances of the IPP; the additions are summed once
-  // (factor = 1 + sum / 100). The factor goes into the initial share, so PSRi,
-  // PSRc and the search log's PSR before/after all move together.
+  // brackets' percentages per mile (as a share of the unadjusted PSRi), each
+  // weighed by the share of the segment's area that lies in that bracket's
+  // ring around the IPP; the additions are summed once (factor = 1 + sum /
+  // 100). The factor goes into the initial share, so PSRi, PSRc and the
+  // search log's PSR before/after all move together.
   const lpbContext = buildLpbContext(bundle);
 
   // Search Log "Map Tracking": with the switch on, the miles of imported
@@ -7355,9 +7479,11 @@ function recalculateEverything(options = {}) {
       const psrBefore = (length / timePerSweep * sweepWidth * info.share) / (area / 640);
       logRow[5] = isFinite(psrBefore) ? psrBefore.toFixed(4) : '';
 
+      // With Map Tracking on: the task's track miles inside THIS row's
+      // segment (a task may cover several segments, one row each).
       const z = calculateSearchCoverage({
         area, length, sweepWidth, numSweeps, numMembers,
-        trackMiles: mapTracking ? getTaskTrackMiles(trackAllocation, logRow[0]) : null
+        trackMiles: mapTracking ? getTaskTrackMiles(trackAllocation, logRow[0], region, segment) : null
       });
       if (z > 0) {
         info.share *= Math.exp(-z);
@@ -7385,14 +7511,10 @@ function recalculateEverything(options = {}) {
     }
   }
 
-  // Map back to original searchLogData
-  searchLogData.forEach(row => {
-     const sortedRow = sortedSearchLog.find(sr => sr[0] === row[0]);
-     if (sortedRow) {
-       row[5] = sortedRow[5];
-       row[6] = sortedRow[6];
-     }
-  });
+  // The sorted list holds the very row objects of searchLogData, so the PSR
+  // values written above are already in place - nothing to map back (a
+  // lookup by task number would copy the first row's values onto every row
+  // of a task that covers several segments).
 
   if (JSON.stringify(bundle.pages) === pagesBefore) return Promise.resolve(false);
 
@@ -7891,16 +8013,28 @@ function bindLpbSegmentsPanel(bundle, context) {
   }
 }
 
-// One line of the PSRi tooltip per applied category: the bracket the segment
-// fell into and the percentage of the PSRi that bracket adds, or why the
-// category adds nothing.
+// One line of the PSRi tooltip per applied category: the bracket(s) the
+// segment's ground lies in - with the share of the segment in each when it
+// straddles a bracket edge - and the percentage of the PSRi they add, or why
+// the category adds nothing. Shares under 0.05 % are not worth a mention.
 function describeLpbContribution(contribution) {
   const name = `${contribution.category.label} (${contribution.terrain})`;
-  const bracket = contribution.bracket;
-  if (!bracket) return `${name}: beyond its 95% distance, adds nothing.`;
-  if (typeof bracket.ratePercentPerMile !== 'number') return `${name}: ${bracket.percent}% bracket, but its distance does not lie beyond the previous bracket's, so it adds nothing.`;
-  const span = `${formatLpbMiles(bracket.previousDistance) || '0.0 mi'} to ${formatLpbMiles(bracket.distance)}`;
-  return `${name}: ${bracket.percent}% bracket (${bracket.percent - bracket.previousPercent}% over ${span} = ${formatLpbPercent(bracket.ratePercentPerMile)} per mile), adds ${formatLpbPercent(contribution.addedPercent)} of the PSRi.`;
+  const shares = (Array.isArray(contribution.shares) ? contribution.shares : []).filter(share => share.fraction > 0.0005);
+  const beyond = contribution.beyondFraction > 0.0005 ? contribution.beyondFraction : 0;
+  if (!shares.length) return `${name}: beyond its 95% distance, adds nothing.`;
+  const describeBracket = (share) => {
+    if (typeof share.ratePercentPerMile !== 'number') return `${share.percent}% bracket (its distance does not lie beyond the previous bracket's, so it has no rate)`;
+    const span = `${formatLpbMiles(share.previousDistance) || '0.0 mi'} to ${formatLpbMiles(share.distance)}`;
+    return `${share.percent}% bracket (${share.percent - share.previousPercent}% over ${span} = ${formatLpbPercent(share.ratePercentPerMile)} per mile)`;
+  };
+  if (shares.length === 1 && !beyond) {
+    const share = shares[0];
+    if (typeof share.ratePercentPerMile !== 'number') return `${name}: ${share.percent}% bracket, but its distance does not lie beyond the previous bracket's, so it adds nothing.`;
+    return `${name}: ${describeBracket(share)}, adds ${formatLpbPercent(contribution.addedPercent)} of the PSRi.`;
+  }
+  const parts = shares.map(share => `${formatLpbPercent(share.fraction * 100)} of the segment in the ${describeBracket(share)} adds ${formatLpbPercent(share.addedPercent)}`);
+  if (beyond) parts.push(`${formatLpbPercent(beyond * 100)} beyond its 95% distance adds nothing`);
+  return `${name}: ${parts.join('; ')} - together ${formatLpbPercent(contribution.addedPercent)} of the PSRi.`;
 }
 
 // The small tag on the top-right border of a PSRi pill showing what the
@@ -7918,14 +8052,19 @@ function appendLpbBracketTag(container, cell, row, context) {
   const miles = Number.isFinite(adjustment.distanceMiles) ? adjustment.distanceMiles.toFixed(1) : '?';
   const contributions = Array.isArray(adjustment.contributions) ? adjustment.contributions : [];
   const breakdown = contributions.map(describeLpbContribution).join('\n');
+  // How the segment was placed: by the share of its area in each bracket, or
+  // - for a shape without area - by its centre alone.
+  const placed = adjustment.byArea
+    ? 'Each category is counted by the share of the segment\'s area inside its brackets.'
+    : 'The shape has no area, so the whole segment counts in its centre\'s bracket.';
   if (!(adjustment.addedPercent > 0)) {
-    cell.title = `Lost Person Behavior: ${miles} mi from the IPP - nothing is added to the PSRi.\n${breakdown}`;
+    cell.title = `Lost Person Behavior: ${miles} mi from the IPP - nothing is added to the PSRi. ${placed}\n${breakdown}`;
     return;
   }
   const tag = document.createElement('span');
   tag.className = 'psri-bracket-tag';
   tag.textContent = `+${formatLpbPercent(adjustment.addedPercent)}`;
-  tag.title = `Lost Person Behavior: ${miles} mi from the IPP, PSRi + ${formatLpbPercent(adjustment.addedPercent)} of itself (x${adjustment.factor.toFixed(4)}).\n${breakdown}`;
+  tag.title = `Lost Person Behavior: ${miles} mi from the IPP, PSRi + ${formatLpbPercent(adjustment.addedPercent)} of itself (x${adjustment.factor.toFixed(4)}). ${placed}\n${breakdown}`;
   cell.title = tag.title;
   container.classList.add('has-lpb-tag');
   container.appendChild(tag);
@@ -7977,16 +8116,15 @@ function buildSegmentsTable() {
     }
   });
 
+  // Every segment of every task a team is still out on (a task may cover
+  // several segments - see getTeamAssignmentSegmentPairs).
   const activeSegments = new Set();
   if (bundle.currentAssignments && bundle.teamStatuses) {
     for (const team in bundle.currentAssignments) {
       const status = bundle.teamStatuses[team] || '';
       const assignment = bundle.currentAssignments[team] || '';
       if (!status.includes('at base') && assignment !== 'Base' && assignment !== 'None' && assignment !== '') {
-        const match = assignment.match(/#\d+ (.+) - (.+)/);
-        if (match) {
-          activeSegments.add(`${match[1]}|${match[2]}`);
-        }
+        getTeamAssignmentSegmentPairs(bundle, team).forEach(pair => activeSegments.add(`${pair.region}|${pair.segment}`));
       }
     }
   }
@@ -8180,18 +8318,21 @@ function buildSegmentsTable() {
           if (isDue) {
             actionBtn.textContent = 'log sweeps';
             actionBtn.classList.add('log-sweeps-active');
-            actionBtn.onclick = () => showLogSweepsPopup(isDue.taskNum);
+            actionBtn.onclick = () => showLogSweepsPopup(isDue.taskNum, {region: isDue.region, segment: isDue.segment});
           } else {
             actionBtn.textContent = 'search';
             actionBtn.onclick = () => {
               showTeamSelectionPopup((teamName) => {
                 // Same assignment process as the Personnel page's "Assign New
-                // Task" (Search Log row, team status, activity log entry).
-                showMissingStepsPopup(teamName, null, (currentStamp) => {
-                  const region = sortedData[r][0] || '';
-                  const segment = sortedData[r][1] || '';
-                  assignSearchTaskToTeam(teamName, region, segment, currentStamp);
-                  navigateToPage('page4.html?scroll=latest');
+                // Task" (Search Log row per segment, team status, activity log
+                // entry) - after the team is picked, the other segments the
+                // same task may cover are offered.
+                const primary = {region: sortedData[r][0] || '', segment: sortedData[r][1] || ''};
+                showAdditionalSegmentsPopup(teamName, primary, (pairs) => {
+                  showMissingStepsPopup(teamName, null, (currentStamp) => {
+                    assignSearchTaskToTeamSegments(teamName, pairs, currentStamp);
+                    navigateToPage('page4.html?scroll=latest');
+                  });
                 });
               }, {
                 // "Custom" team: no roster team, no status workflow - the search
@@ -8952,9 +9093,10 @@ function calculatePSRAfter(row, bundle, segDataOverride = null) {
   const teamInfo = row[7] || '';
   const sweepWidth = parseNumeric(row[8]);
   const numSweeps = parseNumeric(row[9]);
-  // Map Tracking: the task's track miles stand in for Num of Sweeps x length.
+  // Map Tracking: the task's track miles inside this row's segment stand in
+  // for Num of Sweeps x length.
   const mapTracking = isMapTrackingEnabled(bundle);
-  const trackMiles = mapTracking ? getTaskTrackMiles(allocateSearcherTracksForBundle(bundle), row[0]) : null;
+  const trackMiles = mapTracking ? getTaskTrackMiles(allocateSearcherTracksForBundle(bundle), row[0], region, segment) : null;
 
   if (!region || !segment || sweepWidth <= 0 || (mapTracking ? trackMiles <= 0 : numSweeps <= 0)) return '';
 
@@ -9175,33 +9317,39 @@ function getNextTaskNumber() {
   return max + 1;
 }
 
-function addAutoSearchLogEntry(teamName, region, segment) {
+// The Search Log rows of a new task: one per segment (`regionOrPairs` is a
+// region with `segment`, or a list of {region, segment} pairs), all with the
+// same task number, date, time and team; the PSR before and the sweep width
+// come from each segment's row. Returns the task number.
+function addAutoSearchLogEntry(teamName, regionOrPairs, segment) {
+  const pairs = normalizeSegmentPairs(regionOrPairs, segment);
+  if (!pairs.length) pairs.push({region: String(regionOrPairs || '').trim(), segment: ''});
   const bundle = loadBundle();
   const logData = bundle.pages.page4 || [];
   const now = new Date();
   const dateStr = `${(now.getMonth() + 1).toString().padStart(2, '0')}-${now.getDate().toString().padStart(2, '0')}-${now.getFullYear()}`;
   const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
   
-  const psrBefore = getLatestPSR(region, segment);
   const teamMembers = getTeamMembers(teamName);
   const teamPillText = `${teamName} (${teamMembers.length})`;
-  const segInfo = getSegmentInfo(region, segment);
   const taskNumber = getNextTaskNumber();
 
-  const newRow = [
-    `#${taskNumber}`,
-    dateStr,
-    timeStr,
-    region,
-    segment,
-    psrBefore,
-    '', // PSR After
-    teamPillText,
-    segInfo.sweep,
-    '' // Num of Sweeps
-  ];
+  pairs.forEach(pair => {
+    const segInfo = getSegmentInfo(pair.region, pair.segment);
+    logData.push([
+      `#${taskNumber}`,
+      dateStr,
+      timeStr,
+      pair.region,
+      pair.segment,
+      getLatestPSR(pair.region, pair.segment),
+      '', // PSR After
+      teamPillText,
+      segInfo.sweep,
+      '' // Num of Sweeps
+    ]);
+  });
   
-  logData.push(newRow);
   bundle.pages.page4 = logData;
   logCreation('Search Log Entry', '#' + taskNumber, bundle);
   saveBundle(bundle);
@@ -9222,15 +9370,18 @@ function buildCurrentTimeStamp() {
 // Assigns a new task to a roster team. This is the ONE process behind both the
 // Personnel page ("Assign New Task") and the Segments page ("search" button),
 // so a search shows up identically in the Search Log and the activity log no
-// matter where it was started from: a Search Log row is created, the team is
-// put on the assignment with status "assigned" and a fresh par-check timer, and
-// a single "Assigned to segment: #N Region - Segment" activity log entry is
-// written with the timestamp the user confirmed. Returns the task number and
-// the full assignment label.
-function assignSearchTaskToTeam(teamName, region, segment, currentStamp = null) {
+// matter where it was started from: a Search Log row is created per segment
+// (a task may cover several - `pairs` is the list of {region, segment}), the
+// team is put on the assignment with status "assigned" and a fresh par-check
+// timer, and a single "Assigned to segment: #N Region - Segment" (or
+// "Assigned to segments: #N Region - A, B") activity log entry is written
+// with the timestamp the user confirmed. Returns the task number and the
+// full assignment label.
+function assignSearchTaskToTeamSegments(teamName, pairs, currentStamp = null) {
+  const list = normalizeSegmentPairs(pairs);
   const stamp = currentStamp || buildCurrentTimeStamp();
-  const taskNumber = addAutoSearchLogEntry(teamName, region, segment);
-  const fullAssignment = `#${taskNumber} ${formatSegmentAssignmentLabel(region, segment)}`;
+  const taskNumber = addAutoSearchLogEntry(teamName, list);
+  const fullAssignment = buildTaskAssignmentLabel(taskNumber, list) || `#${taskNumber}`;
 
   const b = loadBundle();
   if (!b.currentAssignments) b.currentAssignments = {};
@@ -9243,8 +9394,14 @@ function assignSearchTaskToTeam(teamName, region, segment, currentStamp = null) 
   b.parChecks[teamName] = { lastTime: stamp.timestampMs };
   saveBundle(b);
   markTaskUpdated(teamName);
-  addActivityLogEntry(teamName, 'Assigned to segment: ' + fullAssignment, null, null, stamp.date, stamp.time);
+  addActivityLogEntry(teamName, `Assigned to segment${list.length > 1 ? 's' : ''}: ` + fullAssignment, null, null, stamp.date, stamp.time);
   return { taskNumber, fullAssignment };
+}
+
+// The one-segment form of assignSearchTaskToTeamSegments (`region` may also
+// be a list of {region, segment} pairs).
+function assignSearchTaskToTeam(teamName, region, segment, currentStamp = null) {
+  return assignSearchTaskToTeamSegments(teamName, normalizeSegmentPairs(region, segment), currentStamp);
 }
 
 // ---------------------------------------------------------------------------
@@ -9294,13 +9451,17 @@ function buildCustomSearchTeamCell(form) {
 function syncCustomSearchTaskLogRow(bundle, taskNum) {
   const form = getCustomSearchTaskForm(bundle, taskNum);
   if (!form) return false;
-  const tag = '#' + String(taskNum).replace('#', '');
-  const row = (bundle.pages?.page4 || []).find(r => r && r[0] === tag);
-  if (!row) return false;
+  // Every row of the task (one per segment) carries the same team cell.
+  const rows = getTaskSearchLogRows(bundle, taskNum);
+  if (!rows.length) return false;
   const cell = buildCustomSearchTeamCell(form);
-  if (row[7] === cell) return false;
-  row[7] = cell;
-  return true;
+  let changed = false;
+  rows.forEach(row => {
+    if (row[7] === cell) return;
+    row[7] = cell;
+    changed = true;
+  });
+  return changed;
 }
 
 // Search-log task tags ("#N") of custom searches whose form is not finished yet.
@@ -9999,67 +10160,190 @@ function showParCheckPopup(teamName, parentPopup) {
   content.appendChild(inputContainer);
 }
 
+// The segments a task can be assigned to: every Segments row with a region
+// and a name, as [{region, segment, psr, key}] - by region, the highest PSRc
+// first within a region.
+function getAssignableSegments(bundle) {
+  const list = (bundle.pages.page2 || [])
+    .filter(s => Array.isArray(s) && s[0] && s[1])
+    .map(s => ({region: s[0], segment: s[1], psr: getLatestPSR(s[0], s[1]), key: `${s[0]}|${s[1]}`}));
+  list.sort((a, b) => {
+    if (a.region !== b.region) return String(a.region).localeCompare(String(b.region));
+    return (parseFloat(b.psr) || 0) - (parseFloat(a.psr) || 0);
+  });
+  return list;
+}
+
+// The dropdown a task's segments are picked from - one or several: a pill
+// button summarising the picks ("Select segments...", "4D, 4C (2)") that
+// opens the checklist under it, one row per segment ("Segment (PSRc: x)")
+// grouped under its region. `segments` as getAssignableSegments lists them;
+// options.selected pre-ticks keys ("region|segment"), options.open shows the
+// list at once, options.onChange(pairs) follows every tick. Returns
+// {element, getSelected() -> [{region, segment}]}.
+function buildSegmentChecklist(segments, options = {}) {
+  const selected = new Set(Array.isArray(options.selected) ? options.selected : []);
+  const wrap = document.createElement('div');
+  wrap.className = 'segment-checklist';
+
+  const toggle = document.createElement('button');
+  toggle.type = 'button';
+  toggle.className = 'pill-input segment-checklist-toggle';
+  const list = document.createElement('div');
+  list.className = 'segment-checklist-list';
+  list.style.display = options.open ? '' : 'none';
+  toggle.onclick = () => {
+    const open = list.style.display === 'none';
+    list.style.display = open ? '' : 'none';
+    toggle.classList.toggle('is-open', open);
+  };
+  if (options.open) toggle.classList.add('is-open');
+
+  const getSelected = () => segments.filter(seg => selected.has(seg.key)).map(seg => ({region: seg.region, segment: seg.segment}));
+  const summarize = () => {
+    const picks = getSelected();
+    toggle.textContent = picks.length
+      ? `${picks.map(pair => pair.segment).join(', ')} (${picks.length})`
+      : (options.placeholder || 'Select segments...');
+    toggle.classList.toggle('has-selection', picks.length > 0);
+  };
+
+  let lastRegion = null;
+  segments.forEach(seg => {
+    if (seg.region !== lastRegion) {
+      lastRegion = seg.region;
+      const header = document.createElement('div');
+      header.className = 'segment-checklist-region';
+      header.textContent = seg.region || 'No region';
+      list.appendChild(header);
+    }
+    const item = document.createElement('label');
+    item.className = 'segment-checklist-item';
+    const box = document.createElement('input');
+    box.type = 'checkbox';
+    box.className = 'segment-checklist-box';
+    box.dataset.key = seg.key;
+    box.checked = selected.has(seg.key);
+    box.onchange = () => {
+      if (box.checked) selected.add(seg.key);
+      else selected.delete(seg.key);
+      item.classList.toggle('is-selected', box.checked);
+      summarize();
+      if (typeof options.onChange === 'function') options.onChange(getSelected());
+    };
+    const text = document.createElement('span');
+    text.className = 'segment-checklist-text';
+    text.textContent = `${seg.segment} (PSRc: ${seg.psr || 'N/A'})`;
+    item.appendChild(box);
+    item.appendChild(text);
+    if (box.checked) item.classList.add('is-selected');
+    list.appendChild(item);
+  });
+
+  wrap.appendChild(toggle);
+  wrap.appendChild(list);
+  summarize();
+  return {element: wrap, getSelected};
+}
+
+// After a team was picked for a segment on the Segments page ("search"): the
+// other segments the same task # may cover. `primary` is the {region,
+// segment} the button belongs to; onConfirm(pairs) gets it first, then the
+// ticked ones. With no other segment to offer the task is the one segment.
+function showAdditionalSegmentsPopup(teamName, primary, onConfirm) {
+  const bundle = loadBundle();
+  const others = getAssignableSegments(bundle).filter(seg => !(seg.region === primary.region && seg.segment === primary.segment));
+  if (!others.length) {
+    onConfirm([primary]);
+    return null;
+  }
+  const popup = createPopup(`Task for Team ${teamName}: more segments?`);
+  const content = popup.querySelector('.popup-content');
+  const btnContainer = popup.querySelector('.popup-buttons');
+  const primaryLabel = formatSegmentAssignmentLabel(primary.region, primary.segment);
+
+  const msg = document.createElement('p');
+  msg.className = 'segment-checklist-intro';
+  msg.textContent = `${primaryLabel} is the task's segment. Tick any other segments the team should search under the same task # (each gets its own row in the Search Log).`;
+  content.insertBefore(msg, btnContainer);
+
+  const onlyBtn = document.createElement('button');
+  onlyBtn.className = 'popup-btn';
+  onlyBtn.textContent = `Just ${primary.segment}`;
+  const confirmBtn = document.createElement('button');
+  confirmBtn.className = 'popup-btn primary segment-checklist-confirm';
+  confirmBtn.disabled = true;
+  confirmBtn.textContent = 'Add Segments';
+  const checklist = buildSegmentChecklist(others, {
+    open: true,
+    onChange: (picks) => {
+      confirmBtn.disabled = !picks.length;
+      confirmBtn.textContent = picks.length ? `Assign ${picks.length + 1} Segments` : 'Add Segments';
+    }
+  });
+  content.insertBefore(checklist.element, btnContainer);
+
+  onlyBtn.onclick = () => {
+    closePopup(popup);
+    onConfirm([primary]);
+  };
+  confirmBtn.onclick = () => {
+    const picks = checklist.getSelected();
+    if (!picks.length) return;
+    closePopup(popup);
+    onConfirm([primary, ...picks]);
+  };
+  btnContainer.appendChild(onlyBtn);
+  btnContainer.appendChild(confirmBtn);
+  return popup;
+}
+
 function showNewSegmentPopup(teamName, parentPopup) {
   if (parentPopup) parentPopup.remove();
   const popup = createPopup('Assign New Task - Team ' + teamName);
   const content = popup.querySelector('.popup-content');
   
   const bundle = loadBundle();
-  const segments = (bundle.pages.page2 || []).filter(s => s[0] && s[1]);
-  
-  // Sort by PSR descending
-  segments.sort((a, b) => {
-    const psrA = parseFloat(getLatestPSR(a[0], a[1])) || 0;
-    const psrB = parseFloat(getLatestPSR(b[0], b[1])) || 0;
-    return psrB - psrA;
-  });
+  const segments = getAssignableSegments(bundle);
 
   if (segments.length === 0) {
     const p = document.createElement('p');
     p.textContent = 'No segments defined.';
     content.appendChild(p);
   } else {
-    const select = document.createElement('select');
-    select.className = 'popup-select';
-    select.style.width = '100%';
-    select.style.marginBottom = '15px';
-    select.style.padding = '8px';
-    
-    const defaultOpt = document.createElement('option');
-    defaultOpt.value = "";
-    defaultOpt.textContent = "Select a segment...";
-    select.appendChild(defaultOpt);
-    
-    segments.forEach(seg => {
-      const region = seg[0];
-      const segment = seg[1];
-      const psr = getLatestPSR(region, segment);
-      const val = `${region} - ${segment}`;
-      
-      const opt = document.createElement('option');
-      opt.value = JSON.stringify({region, segment, val});
-      opt.textContent = `${segment} (PSRc: ${psr || 'N/A'})`;
-      select.appendChild(opt);
-    });
-    
-    content.appendChild(select);
-    
+    // One segment - or several, which go into one task # (one Search Log
+    // row each).
+    const hint = document.createElement('p');
+    hint.className = 'segment-checklist-intro';
+    hint.textContent = 'Tick the segment to search - or several, to put them in one task #.';
+    content.appendChild(hint);
+
     const assignBtn = document.createElement('button');
     assignBtn.className = 'popup-btn primary';
     assignBtn.textContent = 'Assign Selected Task';
+    assignBtn.disabled = true;
+    const checklist = buildSegmentChecklist(segments, {
+      open: true,
+      onChange: (picks) => {
+        assignBtn.disabled = !picks.length;
+        assignBtn.textContent = picks.length > 1 ? `Assign ${picks.length} Segments as One Task` : 'Assign Selected Task';
+      }
+    });
+    content.appendChild(checklist.element);
+    
     assignBtn.onclick = () => {
-      if (!select.value) return;
-      
-      const {region, segment} = JSON.parse(select.value);
+      const pairs = checklist.getSelected();
+      if (!pairs.length) return;
       
       showMissingStepsPopup(teamName, null, (currentStamp) => {
-        assignSearchTaskToTeam(teamName, region, segment, currentStamp);
+        assignSearchTaskToTeamSegments(teamName, pairs, currentStamp);
         closePopup(popup);
         refreshCurrentPageTable();
       });
     };
     content.appendChild(assignBtn);
   }
+  return popup;
 }
 
 function showTeamSelectionPopup(onTeamSelected, options = {}) {
@@ -10303,13 +10587,11 @@ function showMissingStepsPopup(teamName, targetStatus, onComplete) {
             const assignment = b.currentAssignments[teamName] || '';
             const match = assignment.match(/#\d+/);
             if (match) {
-                const tag = match[0];
-                const searchLog = b.pages.page4 || [];
-                const logEntry = searchLog.find(r => r[0] === tag);
-                if (logEntry) {
+                // Every row of the task (one per segment) keeps the same stamp.
+                getTaskSearchLogRows(b, match[0]).forEach(logEntry => {
                     logEntry[1] = d;
                     logEntry[2] = t;
-                }
+                });
             }
         }
 
@@ -11781,7 +12063,7 @@ function buildSearchLogTable() {
     sortLabel.textContent = isRecentFirst ? 'Sorted by Most Recent at Top' : 'Sorted Chronologically (Oldest at Top)';
   }
 
-  const sortedData = [...data].sort((a, b) => {
+  const timeSortedData = [...data].sort((a, b) => {
     // Column 1: MM-DD-YYYY, Column 2: HH:mm
     const [m1, d1, y1] = (a[1] || '').split('-').map(Number);
     const [m2, d2, y2] = (b[1] || '').split('-').map(Number);
@@ -11797,6 +12079,11 @@ function buildSearchLogTable() {
       return date1 - date2; // Oldest at Top (Ascending)
     }
   });
+  // The rows of a task that covers several segments stay together; the
+  // first row's Task #, Date, Time and Team cells span the group (`spans`).
+  const grouped = groupSearchLogRowsByTask(timeSortedData);
+  const sortedData = grouped.rows;
+  const taskSpans = grouped.spans;
 
   const params = new URLSearchParams(window.location.search);
   if (params.get('scroll') === 'latest') {
@@ -11867,11 +12154,27 @@ function buildSearchLogTable() {
 
     // If this is the last entry by chronological order and we just arrived, we might scroll to it
     // But since it's sorted, latest might be top or bottom.
+
+    // A task covering several segments: its first row draws the Task #,
+    // Date, Time and Team cells once, spanning every row of the task (one
+    // rounded rectangle each); the later rows leave those columns out. The
+    // rows of the group share their date, time and team, so an edit to one
+    // of those cells is written to all of them.
+    const spanCount = taskSpans.has(sortedData[r]) ? taskSpans.get(sortedData[r]) : 0;
+    const isSpanColumn = c => [0, 1, 2, 7].includes(c);
+    const groupRows = spanCount > 1 ? sortedData.slice(r, r + spanCount) : [sortedData[r]];
+    if (spanCount > 1) tr.classList.add('task-group-first');
+    if (spanCount === 0) tr.classList.add('task-group-more');
     
     const headers = ['Task #', 'Date', 'Time', 'Region', 'Segment', 'PSR Before', 'PSR After', 'Team', 'Sweep Width (ft)', 'Num of Sweeps', 'Delete'];
     for (let c = 0; c < 10; c++) {
+      if (spanCount === 0 && isSpanColumn(c)) continue;
       const td = document.createElement('td');
       td.dataset.label = headers[c];
+      if (spanCount > 1 && isSpanColumn(c)) {
+        td.rowSpan = spanCount;
+        td.classList.add('task-span-cell');
+      }
       const cellContainer = document.createElement('div');
       cellContainer.className = 'pill-cell-container';
 
@@ -11975,6 +12278,8 @@ function buildSearchLogTable() {
         const oldVal = originalRow[c];
         const newVal = cell.textContent.trim();
         originalRow[c] = newVal;
+        // Date, Time and Team are one cell for the whole task.
+        if (isSpanColumn(c)) groupRows.forEach(row => { row[c] = newVal; });
         
         // If Num of Sweeps (9), Sweep Width (8), or Team (7) was changed, recalculate PSR After (6)
         if ([7, 8, 9].includes(c)) {
@@ -12008,7 +12313,7 @@ function buildSearchLogTable() {
       cellContainer.appendChild(cell);
 
       if (fadedSweeps) {
-        appendTrackMilesTag(cellContainer, cell, taskNum, trackAllocation);
+        appendTrackMilesTag(cellContainer, cell, taskNum, trackAllocation, sortedData[r]);
       }
       // A task whose segment carries two assignments cannot tell which one an
       // imported track belongs to: the red question mark opens the picker.
@@ -12037,38 +12342,46 @@ function buildSearchLogTable() {
             const taskNum = rowToDelete[0]; // e.g. "#1"
             let bundle = loadBundle();
             let changed = false;
-            
-            if (bundle.currentAssignments && taskNum) {
-                for (const team in bundle.currentAssignments) {
-                    const assignment = bundle.currentAssignments[team] || '';
-                    if (assignment.startsWith(taskNum + ' ')) {
-                        const now = new Date();
-                        const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
-                        bundle.teamStatuses[team] = `at base (${timeStr})`;
-                        bundle.currentAssignments[team] = 'Base';
-                        bundle.teamAssignmentTimes[team] = Date.now();
-                        
-                        // Delete log entries that referred to that team performing that task
-                        bundle.activityLog = bundle.activityLog.filter(entry => 
-                            !(entry.team === team && entry.tag === taskNum)
-                        );
-                        changed = true;
+            data.splice(indexInData, 1);
+            // The other rows of the task (one per segment), if any: the task
+            // goes on with those and only the team's label changes.
+            const remaining = taskNum ? data.filter(row => Array.isArray(row) && normalizeSearchTaskTag(row[0]) === normalizeSearchTaskTag(taskNum)) : [];
+            bundle.pages.page4 = data;
+
+            if (remaining.length) {
+                if (rebuildTeamAssignmentLabels(bundle)) changed = true;
+            } else {
+                if (bundle.currentAssignments && taskNum) {
+                    for (const team in bundle.currentAssignments) {
+                        const assignment = bundle.currentAssignments[team] || '';
+                        if (assignment.startsWith(taskNum + ' ')) {
+                            const now = new Date();
+                            const timeStr = `${now.getHours().toString().padStart(2, '0')}:${now.getMinutes().toString().padStart(2, '0')}`;
+                            bundle.teamStatuses[team] = `at base (${timeStr})`;
+                            bundle.currentAssignments[team] = 'Base';
+                            bundle.teamAssignmentTimes[team] = Date.now();
+                            
+                            // Delete log entries that referred to that team performing that task
+                            bundle.activityLog = bundle.activityLog.filter(entry => 
+                                !(entry.team === team && entry.tag === taskNum)
+                            );
+                            changed = true;
+                        }
                     }
                 }
-            }
 
-            const taskNumId = taskNum.startsWith('#') ? taskNum.substring(1) : taskNum;
-            if (bundle.forms && bundle.forms[taskNumId]) {
-                delete bundle.forms[taskNumId];
-                changed = true;
+                const taskNumId = taskNum.startsWith('#') ? taskNum.substring(1) : taskNum;
+                if (bundle.forms && bundle.forms[taskNumId]) {
+                    delete bundle.forms[taskNumId];
+                    changed = true;
+                }
             }
             
             if (changed) {
                 saveBundle(bundle);
             }
 
-            data.splice(indexInData, 1);
-            logDeletion('Search Log Entry', taskNum);
+            logDeletion('Search Log Entry', remaining.length ? `${taskNum} (${formatSegmentAssignmentLabel(rowToDelete[3], rowToDelete[4])})` : taskNum);
             if (data.length === 0) data.push(Array.from({ length: 10 }, () => ''));
             saveCurrentPageData(data);
             buildSearchLogTable();
@@ -12146,6 +12459,38 @@ function buildSearchLogTable() {
   initCharts();
 }
 
+// The Search Log rows in the given (date / time) order, except that the rows
+// of one task # - one per segment - are pulled together behind the task's
+// first row. Returns {rows, spans}: `spans` maps a task's first row (and any
+// row without a task) to the number of rows the task covers, so the table
+// can draw the Task #, Date, Time and Team cells once, spanning the group.
+function groupSearchLogRowsByTask(orderedRows) {
+  const rows = [];
+  const spans = new Map();
+  const byTag = new Map();
+  (Array.isArray(orderedRows) ? orderedRows : []).forEach(row => {
+    const tag = normalizeSearchTaskTag(Array.isArray(row) ? row[0] : '');
+    if (!tag) return;
+    if (!byTag.has(tag)) byTag.set(tag, []);
+    byTag.get(tag).push(row);
+  });
+  const placed = new Set();
+  (Array.isArray(orderedRows) ? orderedRows : []).forEach(row => {
+    const tag = normalizeSearchTaskTag(Array.isArray(row) ? row[0] : '');
+    if (!tag) {
+      rows.push(row);
+      spans.set(row, 1);
+      return;
+    }
+    if (placed.has(tag)) return;
+    placed.add(tag);
+    const group = byTag.get(tag);
+    group.forEach(entry => rows.push(entry));
+    spans.set(group[0], group.length);
+  });
+  return {rows, spans};
+}
+
 // ---------------------------------------------------------------------------
 // Searchers Tracks (Search Log page, "Map Tracking").
 //
@@ -12199,9 +12544,11 @@ function allocateSearcherTracksForBundle(bundle = null) {
     return {byTask: {}, tracks: [], ambiguousTasks: []};
 }
 
-function getTaskTrackMiles(allocation, taskTag) {
+// The track miles a task gets; with a region / segment named, only the
+// miles inside that segment (one Search Log row of a task covering several).
+function getTaskTrackMiles(allocation, taskTag, region, segment) {
     const utils = getMapSegmentUtils();
-    if (typeof utils.getTaskTrackMiles === 'function') return utils.getTaskTrackMiles(allocation, taskTag);
+    if (typeof utils.getTaskTrackMiles === 'function') return utils.getTaskTrackMiles(allocation, taskTag, region, segment);
     const tag = normalizeSearchTaskTag(taskTag);
     const entry = allocation && allocation.byTask && tag ? allocation.byTask[tag] : null;
     return entry && Number.isFinite(entry.miles) ? entry.miles : 0;
@@ -12347,16 +12694,22 @@ function bindMapTrackingToggle(enabled) {
 }
 
 // The tag riding the faded Num of Sweeps pill: the miles of searcher track
-// allocated to this task, with the tracks behind them as the tooltip.
-function appendTrackMilesTag(container, cell, taskNum, allocation) {
+// allocated to this task - inside this row's segment when `row` (the Search
+// Log row) is given, since a task may cover several segments - with the
+// tracks behind them as the tooltip.
+function appendTrackMilesTag(container, cell, taskNum, allocation, row = null) {
     const tag = normalizeSearchTaskTag(taskNum);
     const entry = allocation && allocation.byTask ? allocation.byTask[tag] : null;
-    const miles = entry ? entry.miles : 0;
-    const lines = entry ? entry.portions.map(portion => {
+    const region = Array.isArray(row) ? String(row[3] || '').trim() : '';
+    const segment = Array.isArray(row) ? String(row[4] || '').trim() : '';
+    const inRow = portion => !segment || (normalizeSegmentNameForMatch(portion.region) === normalizeSegmentNameForMatch(region) && normalizeSegmentNameForMatch(portion.segment) === normalizeSegmentNameForMatch(segment));
+    const portions = entry ? entry.portions.filter(inRow) : [];
+    const miles = segment ? portions.reduce((sum, portion) => sum + portion.miles, 0) : (entry ? entry.miles : 0);
+    const lines = portions.map(portion => {
         const owner = (allocation.tracks || []).find(t => t.id === portion.trackId);
         const name = owner ? getSearcherTrackLabel(owner) : portion.trackId;
         return `${name}: ${formatTrackMiles(portion.miles)} in ${portion.segment}${portion.home ? '' : ' (spill-over from its home segment)'}`;
-    }) : [];
+    });
     const summary = miles > 0
         ? `Map Tracking: ${formatTrackMiles(miles)} of searcher track inside this task's segment stand in for Num of Sweeps x segment length x team count.\n${lines.join('\n')}`
         : 'Map Tracking: no searcher track has miles in this task\'s segment yet, so this task searches nothing off in the PSR maths. Import tracks (or add a custom track) below.';
@@ -15313,6 +15666,9 @@ function updateLostPersonBehavior(mutate) {
     bundle.lostPersonBehavior = normalizeLostPersonBehavior(lpb);
     if (message) addActivityLogEntry('System', message, bundle);
     saveLostPersonBehaviorChange(bundle).catch(() => {});
+    // The rings on the CalTopo map follow: a category's switch, a moved IPP
+    // or a changed distance may mean discs to draw, redraw or remove.
+    syncLpbRingsToCalTopo().catch(() => {});
     return bundle.lostPersonBehavior;
 }
 
@@ -15474,7 +15830,7 @@ function renderLostPersonBehaviorSection() {
           <h2><span class="geek-full">Lost Person Behavior</span><span class="geek-abbr">LPB</span></h2>
           <div class="lpb-section-ipp"></div>
         </div>
-        <p>Import the IPP marker from the CalTopo map, then switch on everything that describes the lost person and pick the terrain for each. Every category turns its distances into a percentage per mile (25% over the first distance, then each bracket's extra percentage over its extra miles); a segment within a category's distances gains that bracket's percentage of its PSRi, and with several categories on the gains are summed onto the PSRi (the Segments page has a switch to apply or lift this).</p>
+        <p>Import the IPP marker from the CalTopo map, then switch on everything that describes the lost person and pick the terrain for each. Every category turns its distances into a percentage per mile (25% over the first distance, then each bracket's extra percentage over its extra miles); a segment gains each bracket's percentage of its PSRi in proportion to the share of its area that lies in that bracket's ring around the IPP (half in one ring and half in the next gains half of each), and with several categories on the gains are summed onto the PSRi (the Segments page has a switch to apply or lift this). <strong>Rings on map</strong> draws a category's distances as purple discs on the CalTopo map.</p>
       </div>
     `;
     section.querySelector('.lpb-section-ipp').appendChild(buildLpbIppControl(lpb));
@@ -15530,7 +15886,7 @@ function buildLpbIppControl(lpb) {
 }
 
 function buildLpbCategoryRow(category, lpb) {
-    const entry = lpb.categories[category.key] || {enabled: false, terrain: getLpbTerrains()[0], distances: null};
+    const entry = lpb.categories[category.key] || {enabled: false, terrain: getLpbTerrains()[0], distances: null, rings: null};
     const row = document.createElement('div');
     row.className = `accordion-container lpb-category${entry.enabled ? '' : ' collapsed'}`;
     row.dataset.category = category.key;
@@ -15597,6 +15953,7 @@ function buildLpbCategoryRow(category, lpb) {
         renderLostPersonBehaviorSection();
     };
     extras.appendChild(terrainSelect);
+    extras.appendChild(buildLpbRingsSwitch(category, entry, lpb));
 
     // Clicking the row itself folds the graph away and back while the
     // category is on; the controls inside the row do not fold it.
@@ -15654,7 +16011,7 @@ function buildLpbDistanceChart(category, entry) {
         bar.style.height = `${percent}%`;
         const rate = rates.find(r => r.key === bracket.key);
         const rateText = rate && typeof rate.ratePercentPerMile === 'number'
-            ? ` - ${formatLpbPercent(rate.ratePercentPerMile)} per mile (${bracket.percent - rate.previousPercent}% over ${formatLpbMiles(rate.previousDistance) || '0.0 mi'} to ${formatLpbMiles(value)}), what a segment in this bracket gains`
+            ? ` - ${formatLpbPercent(rate.ratePercentPerMile)} per mile (${bracket.percent - rate.previousPercent}% over ${formatLpbMiles(rate.previousDistance) || '0.0 mi'} to ${formatLpbMiles(value)}), what the part of a segment in this bracket gains`
             : (value !== null ? ' - no rate: the distance must lie beyond the previous bracket\'s' : '');
         bar.title = value !== null ? `${bracket.percent}% of subjects found within ${formatLpbMiles(value)} of the IPP${rateText}` : `${bracket.percent}%: no distance entered`;
         barWrap.appendChild(bar);
@@ -15731,7 +16088,7 @@ function buildLpbDistanceChart(category, entry) {
         const rateEl = document.createElement('div');
         rateEl.className = 'lpb-chart-rate';
         rateEl.textContent = rate && typeof rate.ratePercentPerMile === 'number' ? `${formatLpbPercent(rate.ratePercentPerMile)} / mi` : '';
-        rateEl.title = 'What a segment whose centre falls in this bracket gains: this percentage of its PSRi';
+        rateEl.title = 'What the part of a segment lying in this bracket gains: this percentage of the PSRi, weighed by the share of the segment\'s area in the bracket';
         column.appendChild(rateEl);
         columns.appendChild(column);
     });
@@ -15755,6 +16112,287 @@ function setLpbCaseDistance(category, bracket, miles, previousMiles) {
     const defaultMiles = getLpbDefaultDistance(category.label, terrain, bracket.key);
     saveLpbOverrideDistance(category.label, terrain, bracket.key, miles === defaultMiles ? null : miles);
     renderLostPersonBehaviorSection();
+}
+
+// ---------------------------------------------------------------------------
+// Lost Person Behavior rings on the CalTopo map.
+//
+// Each category row carries a "Rings on map" switch next to its terrain. On,
+// the category's distances are drawn around the IPP on the case's CalTopo map
+// as filled discs - purple at 10 % opacity, one per bracket, so the ground
+// shades darker towards the IPP and every bracket edge shows - and off they
+// are deleted again. The discs are plain CalTopo Shapes titled "LPB ring:
+// <category> <percent>% (<miles>)"; the case remembers their ids together
+// with the IPP position and distances they were drawn for (categories.<key>
+// .rings), so a moved IPP or an edited distance redraws them and a device
+// that merely receives the section does nothing (the discs are already
+// there). The map is brought in step by syncLpbRingsToCalTopo after every
+// change of the section; the discs count as accounted for below the map
+// (isFeatureAccountedFor) and are never offered as polygons to cut.
+// ---------------------------------------------------------------------------
+
+// The CalTopo class a disc is created under.
+const LPB_RING_OBJECT_TYPES = ['Shape'];
+
+// Whether the rings of a category are wanted on the map right now: the
+// category on, its switch on, an IPP to centre them on and at least one
+// distance to draw.
+function areLpbRingsWanted(lpb, entry) {
+    return !!(entry && entry.enabled && entry.rings && entry.rings.shown && lpb && lpb.ipp && entry.distances);
+}
+
+// Whether the discs recorded for a category were drawn for the IPP position
+// and distances the case has now.
+function areLpbRingsCurrent(lpb, entry) {
+    const rings = entry && entry.rings;
+    if (!rings || !rings.featureIds.length || !rings.ipp || !lpb.ipp) return false;
+    if (rings.ipp.lat !== lpb.ipp.lat || rings.ipp.lng !== lpb.ipp.lng) return false;
+    return JSON.stringify(rings.distances || null) === JSON.stringify(entry.distances || null);
+}
+
+// What the map needs for each category: [{category, entry, removeIds, draw}]
+// - the discs to delete (stale or no longer wanted) and whether a fresh set
+// is to be drawn. Empty when the map is in step.
+function planLpbRingSync(lpb) {
+    const steps = [];
+    getLpbCategories().forEach(category => {
+        const entry = lpb.categories[category.key];
+        if (!entry || !entry.rings) return;
+        const wanted = areLpbRingsWanted(lpb, entry);
+        const drawn = entry.rings.featureIds.length > 0;
+        if (wanted && areLpbRingsCurrent(lpb, entry)) return;
+        if (!wanted && !drawn) return;
+        steps.push({category, entry, removeIds: entry.rings.featureIds.slice(), draw: wanted});
+    });
+    return steps;
+}
+
+// The "Rings on map" switch of a category row, with the state of its discs as
+// the tooltip.
+function buildLpbRingsSwitch(category, entry, lpb) {
+    const rings = (entry && entry.rings) || {shown: false, featureIds: [], ipp: null, distances: null};
+    const label = document.createElement('label');
+    label.className = `lpb-rings-switch${rings.featureIds.length ? ' is-drawn' : ''}`;
+    const control = document.createElement('span');
+    control.className = 'toggle-switch lpb-rings-switch-control';
+    const toggle = document.createElement('input');
+    toggle.type = 'checkbox';
+    toggle.className = 'lpb-rings-toggle';
+    toggle.checked = !!rings.shown;
+    toggle.setAttribute('aria-label', `${category.label} rings on the CalTopo map`);
+    const slider = document.createElement('span');
+    slider.className = 'slider';
+    control.appendChild(toggle);
+    control.appendChild(slider);
+    const text = document.createElement('span');
+    text.className = 'lpb-rings-switch-text';
+    text.textContent = 'Rings on map';
+    label.appendChild(control);
+    label.appendChild(text);
+
+    let state;
+    if (rings.featureIds.length) {
+        state = `${rings.featureIds.length} disc${rings.featureIds.length === 1 ? '' : 's'} on the map now.`;
+    } else if (rings.shown && !(lpb && lpb.ipp)) {
+        state = 'Waiting for the IPP: the rings are drawn as soon as one is imported.';
+    } else if (rings.shown && !(entry && entry.distances)) {
+        state = 'Waiting for the distances: the rings are drawn as soon as one is entered.';
+    } else if (rings.shown) {
+        state = 'Switched on; the discs are drawn as soon as CalTopo takes them.';
+    } else {
+        state = 'Off: nothing of this category is on the map.';
+    }
+    label.title = `Draw the ${category.label} distances (25 / 50 / 75 / 95%) as purple discs at 10% opacity around the IPP on the CalTopo map; off removes them again. ${state}`;
+
+    toggle.onchange = () => {
+        setLpbRingsShown(category, toggle.checked);
+        renderLostPersonBehaviorSection();
+    };
+    return label;
+}
+
+// The switch: remember the wish in the case (so every device shows it) and
+// let syncLpbRingsToCalTopo - which updateLostPersonBehavior calls - do the
+// drawing; a wish that cannot be met yet is explained.
+function setLpbRingsShown(category, shown) {
+    const bundle = loadBundle();
+    const before = getLostPersonBehavior(bundle);
+    const entry = before.categories[category.key];
+    if (!entry || !!entry.rings.shown === !!shown) return;
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    updateLostPersonBehavior((next) => {
+        const target = next.categories[category.key];
+        target.rings.shown = !!shown;
+        return `Lost Person Behavior: ${lpbCategoryLogName(category, target)} rings on the CalTopo map switched ${shown ? 'on' : 'off'}`;
+    });
+    if (!shown) return;
+    if (!map || !map.id) {
+        showToast('No CalTopo map is linked to this case yet; the rings are drawn once one is added on the Maps page.', 'Lost Person Behavior');
+    } else if (!before.ipp) {
+        showToast('Import the IPP marker first; the rings are drawn around it as soon as there is one.', 'Lost Person Behavior');
+    } else if (!entry.distances) {
+        showToast('Enter the distances first; the rings are drawn as soon as there is one.', 'Lost Person Behavior');
+    }
+}
+
+// Bring the CalTopo map in step with the categories' ring switches: for every
+// category whose discs are stale or unwanted the recorded discs are deleted,
+// for every category whose rings are wanted a fresh set is created (one POST
+// per disc), and the case remembers the ids - plus, in its copy of the map,
+// the discs themselves - in one save with a log line per category. Runs one
+// pass at a time; a call during a pass queues one more pass, since the case
+// may have changed meanwhile. Problems are logged and told in a toast, never
+// thrown; the wish stays in the case so the next change tries again. Resolves
+// {drawn, removed, failed}.
+let _lpbRingSyncPromise = null;
+let _lpbRingSyncQueued = false;
+
+function syncLpbRingsToCalTopo() {
+    if (_lpbRingSyncPromise) {
+        _lpbRingSyncQueued = true;
+        return _lpbRingSyncPromise;
+    }
+    _lpbRingSyncPromise = runLpbRingSync()
+        .catch(error => {
+            console.warn('[LPB] ring sync failed:', error && error.message ? error.message : error);
+            return {drawn: 0, removed: 0, failed: 0};
+        })
+        .then(result => {
+            _lpbRingSyncPromise = null;
+            if (_lpbRingSyncQueued) {
+                _lpbRingSyncQueued = false;
+                return syncLpbRingsToCalTopo();
+            }
+            return result;
+        });
+    return _lpbRingSyncPromise;
+}
+
+async function runLpbRingSync() {
+    const outcome = {drawn: 0, removed: 0, failed: 0};
+    const bundle = loadBundle();
+    const lpb = getLostPersonBehavior(bundle);
+    const steps = planLpbRingSync(lpb);
+    if (!steps.length) return outcome;
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    // Without a map there is nothing to draw on and nothing to delete from.
+    if (!map || !map.id) return outcome;
+    const features = getMapFeatures(bundle);
+    const knownIds = new Set(features.map(getCalTopoWritableFeatureId).filter(Boolean));
+
+    const results = new Map();
+    const removedIds = new Set();
+    const createdFeatures = [];
+    const logLines = [];
+    const failedCategories = [];
+    for (const step of steps) {
+        const {category, entry} = step;
+        const name = lpbCategoryLogName(category, entry);
+        // The stale or unwanted discs. A disc CalTopo refuses to delete keeps
+        // its id for the next pass - unless the fetched map no longer has it,
+        // in which case it is gone already.
+        const leftover = [];
+        for (const id of step.removeIds) {
+            let ok = false;
+            try {
+                ok = await deleteCalTopoMapFeature(map, {attributes: {id, class: LPB_RING_OBJECT_TYPES[0]}});
+            } catch (error) {
+                console.warn(`[LPB] delete of ring ${id} failed: ${error && error.message ? error.message : error}`);
+            }
+            if (ok || (features.length && !knownIds.has(id))) {
+                removedIds.add(id);
+                if (ok) outcome.removed++;
+            } else {
+                leftover.push(id);
+                outcome.failed++;
+            }
+        }
+        if (step.removeIds.length && !step.draw) {
+            logLines.push(leftover.length
+                ? `Lost Person Behavior: ${name} rings removed from the CalTopo map (${leftover.length} could not be removed yet)`
+                : `Lost Person Behavior: ${name} rings removed from the CalTopo map`);
+        }
+
+        let featureIds = leftover;
+        let complete = false;
+        if (step.draw) {
+            const planned = planLpbRingFeatures(category.label, entry.terrain, entry.distances, lpb.ipp);
+            const created = [];
+            for (const disc of planned) {
+                let result = null;
+                try {
+                    result = await createCalTopoMapFeature(map, LPB_RING_OBJECT_TYPES, disc.geometry, disc.properties);
+                } catch (error) {
+                    console.warn(`[LPB] drawing of "${disc.properties.title}" failed: ${error && error.message ? error.message : error}`);
+                }
+                if (!result) {
+                    outcome.failed++;
+                    continue;
+                }
+                outcome.drawn++;
+                created.push({disc, id: result.id, objectType: result.objectType});
+            }
+            // A disc CalTopo took without telling its id cannot be deleted
+            // later; it is on the map but not in the record.
+            created.forEach(item => {
+                if (item.id) featureIds = featureIds.concat([item.id]);
+                else console.warn(`[LPB] CalTopo took "${item.disc.properties.title}" without an id; remove it by hand if need be.`);
+            });
+            createdFeatures.push(...created);
+            complete = created.length === planned.length && created.every(item => !!item.id);
+            if (created.length) {
+                const miles = created.map(item => formatLpbMiles(item.disc.miles)).join(', ');
+                logLines.push(`Lost Person Behavior: ${name} rings drawn on the CalTopo map around IPP "${lpb.ipp.featureName || 'IPP'}": ${miles}${complete ? '' : ` (${planned.length - created.length} of ${planned.length} not taken)`}`);
+            }
+            if (!complete) failedCategories.push(category.label);
+        } else if (leftover.length) {
+            failedCategories.push(category.label);
+        }
+        // The record: what is on the map now, and - only when the whole set
+        // was drawn - what it was drawn for, so a partial set is completed on
+        // the next pass.
+        results.set(category.key, {
+            featureIds,
+            ipp: complete ? {lat: lpb.ipp.lat, lng: lpb.ipp.lng} : null,
+            distances: complete ? Object.assign({}, entry.distances) : null
+        });
+    }
+
+    // The case may have been saved meanwhile: write into the latest copy only
+    // (the switches themselves are left as the planner has them now).
+    const latest = loadBundle();
+    const latestLpb = normalizeLostPersonBehavior(latest.lostPersonBehavior);
+    results.forEach((record, key) => {
+        if (!latestLpb.categories[key]) return;
+        latestLpb.categories[key].rings = Object.assign({}, latestLpb.categories[key].rings, record);
+    });
+    latest.lostPersonBehavior = normalizeLostPersonBehavior(latestLpb);
+    const latestMap = Array.isArray(latest.maps) && latest.maps[0] ? latest.maps[0] : null;
+    if (latestMap) {
+        let list = (Array.isArray(latestMap.features) ? latestMap.features : []).filter(feature => !removedIds.has(getCalTopoWritableFeatureId(feature)));
+        createdFeatures.forEach(item => {
+            list.push(buildCreatedMapFeature(item.disc.geometry, item.disc.properties, item.objectType, item.id, item.disc.properties.title, list.length + 1));
+        });
+        latestMap.features = list;
+    }
+    logLines.forEach(line => addActivityLogEntry('System', line, latest));
+    saveBundle(latest);
+
+    if (outcome.drawn || outcome.removed) {
+        const parts = [];
+        if (outcome.drawn) parts.push(`${outcome.drawn} ring${outcome.drawn === 1 ? '' : 's'} drawn`);
+        if (outcome.removed) parts.push(`${outcome.removed} ring${outcome.removed === 1 ? '' : 's'} removed`);
+        showToast(`${parts.join(', ')} on the CalTopo map.`, 'Lost Person Behavior');
+        finishCalTopoMapWrite();
+    }
+    if (failedCategories.length) {
+        showToast(`CalTopo did not take every ring for ${failedCategories.join(', ')}. Check the proxy status on the Maps page and the service account's write access; the next change tries again.`, 'Lost Person Behavior');
+    }
+    // The switches' tooltips say what is on the map now; redraw the section
+    // unless the planner is typing in it (the save above is still flushing,
+    // so isUserActionActive() would always say no here).
+    if (document.getElementById('lpb-section') && !isEditingActive()) renderLostPersonBehaviorSection();
+    return outcome;
 }
 
 let currentFormsSubpage = 'task-assignment';
@@ -16543,6 +17181,8 @@ function buildTaskAssignmentForm() {
     }
   }
 
+  // One pill per task; a task covering several segments (one row each)
+  // lists them all.
   const tasks = [];
   searchLog.forEach(row => {
     if (row[0] && row[0].startsWith('#')) {
@@ -16555,8 +17195,9 @@ function buildTaskAssignmentForm() {
         teamName = teamWithCount.split(' (')[0];
       }
 
-      if (!tasks.some(t => t.num === num)) {
-        tasks.push({ num, region, segment, teamName });
+      const existing = tasks.find(t => t.num === num);
+      if (!existing) {
+        tasks.push({ num, region, segment, teamName, segments: describeTaskSegments(bundle, row[0]) || formatSegmentAssignmentLabel(region, segment) });
       }
     }
   });
@@ -16566,7 +17207,7 @@ function buildTaskAssignmentForm() {
   tasks.forEach(task => {
     const btn = document.createElement('button');
     btn.className = 'mini-pill';
-    btn.textContent = `#${task.num} ${task.region} ${task.segment} ${task.teamName}`;
+    btn.textContent = `#${task.num} ${task.segments} ${task.teamName}`;
     
     const isUnfinished = unfinishedTasks.has(task.num);
     const form = bundle.forms?.[task.num];
@@ -16884,6 +17525,11 @@ function renderTaskForm(container, taskNum, formData) {
   addGroup('Date/Time', 'dateTime');
   addGroup('Task #', 'taskNumDisplay', 'text', true);
   formData.taskNumDisplay = '#' + taskNum;
+  // The segment(s) the task covers - one Search Log row each - as the
+  // printout's Region/Segment field shows them (a custom search keeps the
+  // segment it was created with).
+  formData.segmentsDisplay = describeTaskSegments(bundle, taskTag) || formData.segment || '';
+  addGroup('Assigned Segments', 'segmentsDisplay', 'text', true);
   if (isCustom) {
     formData.searchTypeDisplay = 'Custom search (manual entry)';
     addGroup('Search Type', 'searchTypeDisplay', 'text', true);
@@ -17587,7 +18233,7 @@ function getTaskFormPrintHTML(num, f, bundle, options = {}) {
                     <div class="form-section">
                         <div class="form-section-title">3. ASSIGNMENT DETAILS</div>
                         <div class="form-row">
-                             <div class="form-field"><span class="field-label">Region/Segment</span><div class="field-value">${f.segment || ''}</div></div>
+                             <div class="form-field"><span class="field-label">Region/Segment</span><div class="field-value">${describeTaskSegments(bundle, num) || f.segment || f.segmentsDisplay || ''}</div></div>
                              <div class="form-field"><span class="field-label">Team ID</span><div class="field-value">${f.teamName || ''}</div></div>
                              <div class="form-field" style="flex:0.6;"><span class="field-label">Team Type</span><div class="field-value">${teamTypeStr}</div></div>
                         </div>
@@ -17998,15 +18644,23 @@ function buildManageFormsTable() {
     }
   }
   
+  // One entry per task; a task covering several segments (one row each)
+  // lists every segment.
   const taskMap = new Map();
   searchLog.forEach(row => {
     if (row[0] && row[0].startsWith('#')) {
       const num = row[0].substring(1);
+      if (taskMap.has(num)) {
+        const entry = taskMap.get(num);
+        if (row[4] && !entry.segments.includes(row[4])) entry.segments.push(row[4]);
+        return;
+      }
       taskMap.set(num, {
         num: num,
         timestamp: row[1] + ' ' + (row[2] || ''),
         region: row[3],
-        segment: row[4]
+        segment: row[4],
+        segments: row[4] ? [row[4]] : []
       });
     }
   });
@@ -18064,7 +18718,7 @@ function buildManageFormsTable() {
     tdInfo.setAttribute('data-label', 'Region/Segment');
     const infoCell = document.createElement('div');
     infoCell.className = 'pill-cell readonly-pill';
-    infoCell.textContent = task.isEmpty ? '-' : `${task.region} - ${task.segment}`;
+    infoCell.textContent = task.isEmpty ? '-' : `${task.region} - ${Array.isArray(task.segments) && task.segments.length > 1 ? task.segments.join(', ') : task.segment}`;
     tdInfo.appendChild(infoCell);
     tr.appendChild(tdInfo);
 
@@ -18239,11 +18893,26 @@ function getLogSweepsDue() {
   return due;
 }
 
-function showLogSweepsPopup(taskNumWithHash) {
+// The sweep count of one Search Log row: the task's row for `segmentRef`
+// ({region, segment}) when given, else the task's first row whose count is
+// still blank (a task covering several segments is asked row by row), else
+// its first row.
+function findSearchLogRowForSweeps(searchLog, taskNumWithHash, segmentRef = null) {
+  const rows = (Array.isArray(searchLog) ? searchLog : []).filter(r => Array.isArray(r) && r[0] === taskNumWithHash);
+  if (!rows.length) return null;
+  if (segmentRef && segmentRef.segment) {
+    const byRef = rows.find(r => String(r[3] || '') === String(segmentRef.region || '') && String(r[4] || '') === String(segmentRef.segment || ''));
+    if (byRef) return byRef;
+  }
+  return rows.find(r => !String(r[9] || '').trim()) || rows[0];
+}
+
+function showLogSweepsPopup(taskNumWithHash, segmentRef = null) {
   const bundle = loadBundle();
   const searchLog = bundle.pages.page4 || [];
-  const row = searchLog.find(r => r[0] === taskNumWithHash);
+  const row = findSearchLogRowForSweeps(searchLog, taskNumWithHash, segmentRef);
   if (!row) return;
+  const rowRef = {region: row[3], segment: row[4]};
 
   const popup = createPopup('Log Sweeps');
   const content = popup.querySelector('.popup-content');
@@ -18298,7 +18967,7 @@ function showLogSweepsPopup(taskNumWithHash) {
     
     const b = loadBundle();
     const log = b.pages.page4 || [];
-    const target = log.find(r => r[0] === taskNumWithHash);
+    const target = findSearchLogRowForSweeps(log, taskNumWithHash, rowRef);
     if (target) {
       const previousSweeps = String(target[9] || '').trim();
       target[9] = val; // Num of Sweeps is at index 9
@@ -18747,12 +19416,18 @@ function updateNotifications() {
 
   const searchLog = bundle.pages.page4 || [];
   const forms = bundle.forms || {};
+  const formTasksSeen = new Set();
   searchLog.forEach(row => {
     if (row[0] && row[0].startsWith('#')) {
       const num = row[0].substring(1);
+      // One notification per task, whatever the number of segments (rows).
+      if (formTasksSeen.has(num)) return;
+      formTasksSeen.add(num);
       // Custom searches are finished BY completing the form, so they always need it.
       if ((isCustomSearchTaskForm(forms[num]) || !isTaskUnfinished(row[0])) && (!forms[num] || !forms[num].completed)) {
-        add('Fill Form', `Task #${num} (${row[3]}/${row[4]}) form needs completion.`, () => {
+        const pairs = getTaskSegmentPairs(bundle, row[0]);
+        const where = pairs.length > 1 ? `${row[3]}/${pairs.map(pair => pair.segment).join(', ')}` : `${row[3]}/${row[4]}`;
+        add('Fill Form', `Task #${num} (${where}) form needs completion.`, () => {
           navigateToPage(`page5.html?task=${num}`);
         });
       }
@@ -20537,6 +21212,11 @@ async function caltopo_request(btn = null, options = {}) {
     if (proxyResp.ok) {
       const data = await proxyResp.json();
       console.log('CalTopo Proxy Data:', data);
+
+      // The map's folders (no geometry, so the shape filter below drops them):
+      // kept as {id, title, visible, labelVisible} so the tools can find the
+      // hidden "Regions" folder (ensureCalTopoRegionsFolder).
+      const folders = extractCalTopoFolders(data.features || []);
       
       const features = (data.features || []).filter(f => {
         const props = f.properties || f;
@@ -20600,6 +21280,7 @@ async function caltopo_request(btn = null, options = {}) {
         const b = loadBundle();
         if (b.maps && b.maps[0]) {
           b.maps[0].features = features;
+          b.maps[0].folders = folders;
           // A fetch the user asked for is recorded; silent fetches (the 5-minute
           // background check, the overlay loading missing shapes) are not, so
           // they cannot flood the log.
@@ -21453,8 +22134,9 @@ function buildMapsPage() {
                 </span>
               </label>
               <button id="fetch-shapes-btn" class="clear-btn">Fetch Shapes</button>
-              <button id="auto-draw-segments-btn" class="clear-btn" title="Pick a CalTopo polygon and cut it into equal slices of 10-15 acres (vertical, horizontal or at an angle), drawn on the map as new assignments.">Auto Draw Segments</button>
+              <button id="auto-draw-segments-btn" class="clear-btn" title="Pick one or several CalTopo polygons and cut each into equal slices - 10-15 acres, or the acreage you type in - vertical, horizontal or at an angle; the slices are drawn on the map and imported as segments in the source segment's region, which is removed and its shape filed in the hidden Regions folder.">Auto Draw Segments</button>
               <button id="trim-tracks-btn" class="clear-btn" title="Pick the routes / tracks on the map and the parts to cut off them (by segment, or the miles outside every segment); a track cut in several pieces becomes ... p1, ... p2 and so on.">Trim Tracks</button>
+              <button id="merge-segments-btn" class="clear-btn" title="Tick neighboring segments of one region and merge them into one: a shape along their outer border is drawn on the map and becomes the segment; the old segments (with their tasks and tracks) fold into it and their shapes go to the hidden Regions folder.">Merge Segments</button>
             </div>
           </div>
           <iframe id="map-iframe" style="width: 100%; height: calc(100% - 62px); border: none;" allow="geolocation" referrerpolicy="strict-origin-when-cross-origin"></iframe>
@@ -21761,12 +22443,14 @@ function buildMapsPage() {
 
   fetchShapesBtn.onclick = () => caltopo_request(fetchShapesBtn);
   if (refreshFeaturesBtn) refreshFeaturesBtn.onclick = () => caltopo_request(refreshFeaturesBtn);
-  // The two map tools (see "Maps page tools" below): both fetch the shapes
+  // The map tools (see "Maps page tools" below): all fetch the shapes
   // quietly first when the case has none yet.
   const autoDrawBtn = document.getElementById('auto-draw-segments-btn');
   if (autoDrawBtn) autoDrawBtn.onclick = () => openAutoDrawSegmentsTool(autoDrawBtn);
   const trimTracksBtn = document.getElementById('trim-tracks-btn');
   if (trimTracksBtn) trimTracksBtn.onclick = () => openTrimTracksTool(trimTracksBtn);
+  const mergeSegmentsBtn = document.getElementById('merge-segments-btn');
+  if (mergeSegmentsBtn) mergeSegmentsBtn.onclick = () => openMergeSegmentsTool(mergeSegmentsBtn);
 
   const checkUnaccountedBtn = document.getElementById('check-unaccounted-btn');
   if (checkUnaccountedBtn) {
@@ -21795,17 +22479,20 @@ function buildMapsPage() {
 }
 
 // ---------------------------------------------------------------------------
-// Maps page tools: "Auto Draw Segments" and "Trim Tracks".
+// Maps page tools: "Auto Draw Segments", "Trim Tracks" and "Merge Segments".
 //
-// Both work on the case's copy of the CalTopo map (fetched quietly first when
+// All work on the case's copy of the CalTopo map (fetched quietly first when
 // the case has no shapes yet), write to CalTopo through the sync server's
 // signed proxy (caltopo_api_call) and then bring the case's copy of the map
-// up to date at once - the new slices appended, a trimmed track's line
-// replaced, a split track replaced by its parts - before a quiet re-fetch
-// makes it exactly what CalTopo has (ids, properties). The maths are pure and
-// live in map-segment-utils.js (planAutoDrawSegments, summarizeTrackPortions,
-// trimTrackPaths); the wrappers below only fall back to "nothing" should the
-// module fail to load.
+// up to date at once - the new slices or the merged outline appended, a
+// trimmed track's line replaced, a split track replaced by its parts - before
+// a quiet re-fetch makes it exactly what CalTopo has (ids, properties). Auto
+// Draw and Merge also carry the case along: the new shapes become Segments
+// rows in place of the old one(s), whose Search Log rows are re-pointed at
+// them and whose shapes go to the map's hidden "Regions" folder. The maths
+// are pure and live in map-segment-utils.js (planAutoDrawSegments,
+// unionPolygonOutline, summarizeTrackPortions, trimTrackPaths); the wrappers
+// below only fall back to "nothing" should the module fail to load.
 // ---------------------------------------------------------------------------
 
 function planAutoDrawSegments(feature, options = {}) {
@@ -21814,10 +22501,10 @@ function planAutoDrawSegments(feature, options = {}) {
     return {ok: false, reason: 'no-area', totalAcres: 0, count: 0, acresEach: 0, undersized: false, angleDegrees: 0, pieces: []};
 }
 
-function computeAutoDrawSliceCount(totalAcres) {
+function computeAutoDrawSliceCount(totalAcres, options = {}) {
     const utils = getMapSegmentUtils();
-    if (typeof utils.computeAutoDrawSliceCount === 'function') return utils.computeAutoDrawSliceCount(totalAcres);
-    return {count: 0, acresEach: 0, undersized: false, minAcres: 10, maxAcres: 15};
+    if (typeof utils.computeAutoDrawSliceCount === 'function') return utils.computeAutoDrawSliceCount(totalAcres, options);
+    return {count: 0, acresEach: 0, undersized: false, minAcres: 10, maxAcres: 15, targetAcres: null};
 }
 
 function getAutoDrawAcreBounds() {
@@ -21958,6 +22645,196 @@ async function deleteCalTopoMapFeature(map, feature) {
     return false;
 }
 
+// The CalTopo folder the shapes of segments that were cut up (Auto Draw) or
+// merged go to. Created hidden - "visible on map open" and labels off - so
+// the old outlines stay on the map for the record without cluttering it.
+const CALTOPO_REGIONS_FOLDER_TITLE = 'Regions';
+
+// The map's folders out of a fetched object list (a folder has no geometry,
+// so the shape filter of caltopo_request drops it): [{id, title, visible,
+// labelVisible}] for every object of class Folder with an id.
+function extractCalTopoFolders(objects) {
+    return (Array.isArray(objects) ? objects : []).map(object => {
+        const props = (object && (object.properties || object)) || {};
+        if (String(props.class || props.type || '').toLowerCase() !== 'folder') return null;
+        const id = resolveCalTopoFeatureId(object, props, '');
+        if (!id) return null;
+        return {
+            id,
+            title: String(props.title || props.name || props.label || '').trim(),
+            visible: props.visible !== false,
+            labelVisible: props.labelVisible !== false
+        };
+    }).filter(Boolean);
+}
+
+// The map's "Regions" folder: the one the case's copy of the folder list
+// knows, else created on CalTopo (POST /api/v1/map/<map>/Folder, hidden by
+// default). Resolves {id, created} - `id` '' when CalTopo refused. The
+// caller records a created folder on the case (applyAutoDrawToCase,
+// mergeSegmentsAction) so it is found again before the next fetch.
+async function ensureCalTopoRegionsFolder(map) {
+    const wanted = normalizeSegmentNameForMatch(CALTOPO_REGIONS_FOLDER_TITLE);
+    const known = (Array.isArray(map.folders) ? map.folders : []).find(folder => folder && folder.id && normalizeSegmentNameForMatch(folder.title) === wanted);
+    if (known) return {id: known.id, created: false};
+    let result = null;
+    try {
+        result = await createCalTopoMapFeature(map, ['Folder'], null, {title: CALTOPO_REGIONS_FOLDER_TITLE, visible: false, labelVisible: false});
+    } catch (error) {
+        console.warn(`[MAPS] the "${CALTOPO_REGIONS_FOLDER_TITLE}" folder could not be created: ${error && error.message ? error.message : error}`);
+    }
+    return {id: result && result.id ? result.id : '', created: !!(result && result.id)};
+}
+
+// Put a shape into a folder on CalTopo: the fetched feature (title, style
+// and all) with `folderId`, POSTed to its id under its class then Shape.
+// Resolves true when CalTopo took it.
+async function moveCalTopoFeatureToFolder(map, feature, folderId) {
+    const featureId = getCalTopoWritableFeatureId(feature);
+    if (!featureId || !folderId) return false;
+    const payload = buildCalTopoFeatureUpdatePayload(feature);
+    payload.id = featureId;
+    payload.properties.folderId = folderId;
+    // A copy fetched without a title must not blank the shape's name.
+    if (!payload.properties.title) payload.properties.title = getMapFeatureDisplayName(feature);
+    for (const objectType of getCalTopoApiObjectTypeCandidates(feature)) {
+        const endpoint = `${getCalTopoMapEndpointBase(map)}/${encodeURIComponent(objectType)}/${encodeURIComponent(featureId)}`;
+        const result = await caltopo_api_call('POST', endpoint, payload, map.domain || 'caltopo.com', {silent: true});
+        if (isCalTopoCallAccepted(result)) return true;
+    }
+    return false;
+}
+
+// Records a folder CalTopo created for us on the case's copy of the map.
+function rememberCalTopoFolder(map, folder, title = CALTOPO_REGIONS_FOLDER_TITLE) {
+    if (!map || !folder || !folder.id) return;
+    const folders = Array.isArray(map.folders) ? map.folders : [];
+    if (!folders.some(entry => entry && entry.id === folder.id)) folders.push({id: folder.id, title, visible: false, labelVisible: false});
+    map.folders = folders;
+}
+
+// Notes on the case's copy of a shape that it now sits in `folderId`.
+function markStoredMapFeatureFolder(map, feature, folderId) {
+    if (!map || !folderId) return;
+    const key = getMapFeatureIdentityKey(feature);
+    const stored = (Array.isArray(map.features) ? map.features : []).find(entry => getMapFeatureIdentityKey(entry) === key);
+    if (stored) stored.attributes = {...(stored.attributes || stored.properties || {}), folderId};
+}
+
+// The Segments row a fetched shape belongs to: the row carrying the shape's
+// CalTopo id in column 9, else the row named like the shape (the segment
+// alone or "Region - Segment"). null when the shape was never imported.
+function findSegmentRowForMapFeature(bundle, feature) {
+    const rows = ensureSegmentsPageRows(bundle);
+    const featureId = getCalTopoWritableFeatureId(feature);
+    if (featureId) {
+        const byId = rows.find(row => Array.isArray(row) && String(row[9] || '').trim() === featureId);
+        if (byId) return byId;
+    }
+    const name = normalizeSegmentNameForMatch(getMapFeatureDisplayName(feature));
+    if (!name) return null;
+    return rows.find(row => Array.isArray(row) && String(row[1] || '').trim()
+        && (normalizeSegmentNameForMatch(row[1]) === name || normalizeSegmentNameForMatch(formatSegmentAssignmentLabel(row[0], row[1])) === name)) || null;
+}
+
+// A Segments row for a shape the tools created: the import columns
+// (buildCalTopoSegmentImportItem) under `options.region`, with the sweep
+// width `options.sweep` (as the Segments page stores it, e.g. "100 ft") and
+// the shape's CalTopo id in column 9.
+function buildSegmentRowFromMapFeature(feature, options = {}) {
+    const item = buildCalTopoSegmentImportItem(feature);
+    const lengthVal = parseFloat(item.length) || 0;
+    const timeVal = lengthVal / 0.5;
+    const sweepText = String(options.sweep || '').trim();
+    const sweep = sweepText ? (/ft/i.test(sweepText) ? sweepText : `${sweepText} ft`) : '20 ft';
+    return [
+        String(options.region || '').trim(),
+        item.segment,
+        item.area ? `${item.area} ac` : '',
+        item.length ? `${item.length} mi` : '',
+        sweep,
+        timeVal > 0 ? `${timeVal.toFixed(2)} hr` : '',
+        '',
+        '',
+        '',
+        getCalTopoWritableFeatureId(feature)
+    ];
+}
+
+// Replaces `oldRows` (Segments rows) by `newRows` where the first old row
+// stood - at the end when none of them is on the page - dropping blank
+// filler rows and padding back to the page's minimum. Returns the new list.
+function replaceSegmentsPageRows(rows, oldRows, newRows) {
+    const kept = (Array.isArray(rows) ? rows : []).filter(row => Array.isArray(row) && row.some(cell => cell !== '' && cell !== undefined && cell !== null));
+    const firstIndex = kept.findIndex(row => oldRows.includes(row));
+    const remaining = kept.filter(row => !oldRows.includes(row));
+    const insertAt = firstIndex >= 0 ? Math.min(firstIndex, remaining.length) : remaining.length;
+    remaining.splice(insertAt, 0, ...newRows);
+    const minRows = typeof ROWS !== 'undefined' ? ROWS : 50;
+    while (remaining.length < minRows) remaining.push(Array.from({length: 10}, () => ''));
+    return remaining;
+}
+
+// Points the Search Log rows of `oldPairs` ([{region, segment}]) at
+// `newPairs`: every row of an old segment becomes one row per new segment
+// (same task #, date, time, team, sweep width and sweep count; PSR before /
+// after are recomputed), rows of several old segments of one task collapse
+// to one row per new segment. Team labels and custom-search forms follow.
+// Returns how many rows were re-pointed.
+function repointSearchLogSegments(bundle, oldPairs, newPairs) {
+    const oldKeys = new Set(normalizeSegmentPairs(oldPairs).map(pair => `${normalizeSegmentNameForMatch(pair.region)}|${normalizeSegmentNameForMatch(pair.segment)}`));
+    const targets = normalizeSegmentPairs(newPairs);
+    if (!oldKeys.size || !targets.length) return 0;
+    const log = Array.isArray(bundle.pages?.page4) ? bundle.pages.page4 : [];
+    const rebuilt = [];
+    const seen = new Set();
+    let count = 0;
+    log.forEach(row => {
+        const key = Array.isArray(row) ? `${normalizeSegmentNameForMatch(row[3])}|${normalizeSegmentNameForMatch(row[4])}` : '';
+        if (!Array.isArray(row) || !row[0] || !oldKeys.has(key)) {
+            rebuilt.push(row);
+            return;
+        }
+        count++;
+        targets.forEach(target => {
+            const dedupe = `${normalizeSearchTaskTag(row[0])}|${target.region}|${target.segment}`;
+            if (seen.has(dedupe)) return;
+            seen.add(dedupe);
+            rebuilt.push([row[0], row[1], row[2], target.region, target.segment, '', '', row[7], row[8], row[9]]);
+        });
+    });
+    if (!count) return 0;
+    bundle.pages.page4 = rebuilt;
+    rebuildTeamAssignmentLabels(bundle);
+    Object.keys(bundle.forms || {}).forEach(num => {
+        const form = bundle.forms[num];
+        if (!isCustomSearchTaskForm(form)) return;
+        const description = describeTaskSegments(bundle, num);
+        if (description) form.segment = description;
+    });
+    return count;
+}
+
+// Re-measures every imported searcher track against the segment shapes
+// (after segments were cut up or merged). Returns true when a record changed.
+function remeasureSearcherTracks(bundle) {
+    const tracks = getSearcherTracks(bundle);
+    const features = getMapFeatures(bundle);
+    let changed = false;
+    tracks.forEach((track, index) => {
+        if (track.custom) return;
+        const shape = findFeatureForSearcherTrack(track, features);
+        if (!shape) return;
+        const record = buildSearcherTrackRecord(shape, bundle, track);
+        if (record && JSON.stringify(record.segmentMiles) !== JSON.stringify(track.segmentMiles)) {
+            tracks[index] = record;
+            changed = true;
+        }
+    });
+    if (changed) bundle.searcherTracks = tracks;
+    return changed;
+}
+
 // Reload the map card's iframe so a write shows on the map.
 function reloadMapsPageIframe() {
     if (typeof document === 'undefined') return;
@@ -22029,10 +22906,11 @@ function buildCreatedMapFeature(geometry, properties, objectType, id, name, obje
 // --- Auto Draw Segments -------------------------------------------------------
 
 // The fetched shapes a polygon can be cut from: every area with an outline,
-// whatever its class, A-Z.
+// whatever its class, A-Z - except the Lost Person Behavior ring discs the
+// app drew itself.
 function getAutoDrawCandidateFeatures(features) {
     return sortMapFeaturesByName((Array.isArray(features) ? features : []).filter(feature =>
-        getFeatureAreaPolygons(feature).length > 0 && calculateGeometry(feature).area > 0));
+        !isLpbRingMapFeature(feature) && getFeatureAreaPolygons(feature).length > 0 && calculateGeometry(feature).area > 0));
 }
 
 // "Auto Draw Segments": the button. Fetches the shapes when the case has none
@@ -22048,27 +22926,29 @@ async function openAutoDrawSegmentsTool(btn = null) {
     return showAutoDrawSegmentsPopup(areas);
 }
 
-// The popup: the polygon (one radio per shape), the slice direction (three
-// pills, the angle pill live for "Custom angle"), a preview of the plan and
-// the confirm button. Resolves the popup element.
+// The popup: the polygons (a checkbox per shape - several can be cut in one
+// go), the slice direction (three pills, the angle pill live for "Custom
+// angle"), the target acreage box (empty = the 10-15 acre rule), a preview
+// of every plan and the confirm button. Resolves the popup element.
 function showAutoDrawSegmentsPopup(areas) {
     const bounds = getAutoDrawAcreBounds();
+    const bundle = loadBundle();
     const popup = createPopup('Auto Draw Segments', null);
     const content = popup.querySelector('.popup-content');
     const btnContainer = popup.querySelector('.popup-buttons');
     content.style.width = '90vw';
-    content.style.maxWidth = '860px';
+    content.style.maxWidth = '900px';
     content.style.maxHeight = '90vh';
     content.style.display = 'flex';
     content.style.flexDirection = 'column';
 
-    const state = {feature: null, direction: 'vertical', angle: '', plan: null, busy: false};
+    const state = {selected: new Set(), direction: 'vertical', angle: '', target: '', plans: new Map(), busy: false};
 
     const body = document.createElement('div');
     body.className = 'map-tool-body auto-draw-body';
     const intro = document.createElement('p');
     intro.className = 'track-import-intro';
-    intro.textContent = `Pick the CalTopo polygon to cut, choose the slice direction and confirm. The shape is cut into equal slices of at most ${bounds.max} acres - and at least ${bounds.min} acres wherever the shape allows it - as many as it takes to fill it, and the slices are drawn on the map as new assignments named after the shape (Alpha-1, Alpha-2, ...), ready to be imported as segments below the map. The original shape stays on the map.`;
+    intro.textContent = `Tick the CalTopo polygons to cut (one or several), choose the slice direction and confirm. Each shape is cut into equal slices - of at most ${bounds.max} acres and at least ${bounds.min} acres wherever the shape allows it, or as close as possible to the acreage typed into the target box - as many as it takes to fill it. The slices are drawn on the map as new assignments named after the shape (Alpha-1, Alpha-2, ...) and imported as segments at once, in the region of the segment the shape belongs to; that segment leaves the Segments page (its tasks and tracks go to the new segments) and its shape moves to the map's hidden "${CALTOPO_REGIONS_FOLDER_TITLE}" folder.`;
     body.appendChild(intro);
 
     const listWrap = document.createElement('div');
@@ -22076,52 +22956,78 @@ function showAutoDrawSegmentsPopup(areas) {
     const table = document.createElement('table');
     table.className = 'grid-table';
     const thead = document.createElement('thead');
-    thead.innerHTML = '<tr><th style="width: 40px;"></th><th>Shape</th><th>Type</th><th>Area (acres)</th><th>Slices</th></tr>';
+    const headRow = document.createElement('tr');
+    const checkAllTh = document.createElement('th');
+    checkAllTh.style.width = '40px';
+    const checkAll = document.createElement('input');
+    checkAll.type = 'checkbox';
+    checkAll.className = 'auto-draw-check-all';
+    checkAll.title = 'Tick / untick every shape';
+    checkAllTh.appendChild(checkAll);
+    headRow.appendChild(checkAllTh);
+    ['Shape', 'Type', 'Segment', 'Area (acres)', 'Slices'].forEach(text => {
+        const th = document.createElement('th');
+        th.textContent = text;
+        headRow.appendChild(th);
+    });
+    thead.appendChild(headRow);
     table.appendChild(thead);
     const tbody = document.createElement('tbody');
-    const radios = [];
+    const rows = [];
     areas.forEach((feature, index) => {
         const tr = document.createElement('tr');
         tr.className = 'auto-draw-feature-row';
-        const radioTd = document.createElement('td');
-        const radio = document.createElement('input');
-        radio.type = 'radio';
-        radio.name = 'auto-draw-feature';
-        radio.className = 'auto-draw-feature-radio';
-        radio.value = String(index);
-        radio.onchange = () => {
-            if (!radio.checked) return;
-            state.feature = feature;
+        const checkTd = document.createElement('td');
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.className = 'auto-draw-feature-check';
+        check.value = String(index);
+        check.onchange = () => {
+            if (check.checked) state.selected.add(feature);
+            else state.selected.delete(feature);
+            tr.classList.toggle('is-selected', check.checked);
             update();
         };
-        radios.push(radio);
-        radioTd.appendChild(radio);
-        tr.appendChild(radioTd);
+        checkTd.appendChild(check);
+        tr.appendChild(checkTd);
         const acres = calculateGeometry(feature).area;
-        const sizing = computeAutoDrawSliceCount(acres);
+        const segmentRow = findSegmentRowForMapFeature(bundle, feature);
         const cells = [
             getMapFeatureDisplayName(feature),
             getMapFeatureCategoryLabel(feature),
+            segmentRow ? (formatSegmentAssignmentLabel(segmentRow[0], segmentRow[1]) || 'not imported') : 'not imported',
             acres.toFixed(2),
-            sizing.count > 1 ? `${sizing.count} x ~${sizing.acresEach.toFixed(1)} ac` : `already \u2264 ${bounds.max} ac`
+            ''
         ];
-        cells.forEach(text => {
+        let sliceCell = null;
+        cells.forEach((text, cellIndex) => {
             const td = document.createElement('td');
             const pill = document.createElement('div');
             pill.className = 'pill-cell readonly-pill';
             pill.textContent = text;
+            if (cellIndex === 2) pill.title = segmentRow ? 'The slices are imported into this row\'s region; the row itself is removed.' : 'This shape is not a segment yet: the slices are imported without a region.';
+            if (cellIndex === 4) sliceCell = pill;
             td.appendChild(pill);
             tr.appendChild(td);
         });
-        // The whole row picks the shape.
+        // The whole row ticks the shape.
         tr.onclick = (event) => {
-            if (event && event.target === radio) return;
-            radios.forEach(other => { other.checked = other === radio; });
-            state.feature = feature;
-            update();
+            if (event && event.target === check) return;
+            check.checked = !check.checked;
+            check.onchange();
         };
+        rows.push({feature, check, sliceCell, acres});
         tbody.appendChild(tr);
     });
+    checkAll.onchange = () => {
+        rows.forEach(row => {
+            if (row.check.checked === checkAll.checked) return;
+            row.check.checked = checkAll.checked;
+            if (checkAll.checked) state.selected.add(row.feature);
+            else state.selected.delete(row.feature);
+        });
+        update();
+    };
     table.appendChild(tbody);
     listWrap.appendChild(table);
     body.appendChild(listWrap);
@@ -22174,6 +23080,37 @@ function showAutoDrawSegmentsPopup(areas) {
     directionRow.appendChild(angleWrap);
     body.appendChild(directionRow);
 
+    // The target acreage: empty = the 10-15 acre rule; a number = the
+    // division whose slices come closest to it.
+    const targetRow = document.createElement('div');
+    targetRow.className = 'auto-draw-direction-row auto-draw-target-row';
+    const targetLabel = document.createElement('span');
+    targetLabel.className = 'custom-track-label';
+    targetLabel.textContent = 'Acres per segment';
+    targetRow.appendChild(targetLabel);
+    const targetWrap = document.createElement('label');
+    targetWrap.className = 'auto-draw-angle-wrap auto-draw-target-wrap';
+    targetWrap.title = `The acreage each new segment should have. Leave it empty for the ${bounds.min}-${bounds.max} acre rule; with a number, the shape is cut into whichever number of equal slices comes closest to it.`;
+    const targetInput = document.createElement('input');
+    targetInput.type = 'number';
+    targetInput.id = 'auto-draw-target-acres';
+    targetInput.className = 'pill-input auto-draw-target';
+    targetInput.placeholder = `${bounds.min}-${bounds.max}`;
+    targetInput.min = '0.1';
+    targetInput.step = '1';
+    targetInput.inputMode = 'decimal';
+    targetInput.oninput = () => {
+        state.target = targetInput.value;
+        update();
+    };
+    targetWrap.appendChild(targetInput);
+    const targetUnit = document.createElement('span');
+    targetUnit.className = 'auto-draw-angle-unit';
+    targetUnit.textContent = `acres (empty = ${bounds.min}-${bounds.max})`;
+    targetWrap.appendChild(targetUnit);
+    targetRow.appendChild(targetWrap);
+    body.appendChild(targetRow);
+
     const preview = document.createElement('div');
     preview.className = 'auto-draw-preview';
     body.appendChild(preview);
@@ -22199,51 +23136,93 @@ function showAutoDrawSegmentsPopup(areas) {
         const value = parseFloat(state.angle);
         return Number.isFinite(value) ? value : null;
     };
+    // null = no target (the 10-15 rule), a number = the target, 'invalid' =
+    // something typed that is not a usable acreage.
+    const currentTarget = () => {
+        const text = String(state.target || '').trim();
+        if (!text) return null;
+        const value = parseFloat(text);
+        return Number.isFinite(value) && value > 0 ? value : 'invalid';
+    };
 
     const update = () => {
         const angle = currentAngle();
-        state.plan = null;
-        if (!state.feature) {
-            preview.textContent = 'Pick the shape to cut above.';
+        const target = currentTarget();
+        const targetAcres = typeof target === 'number' ? target : null;
+        state.plans = new Map();
+        const lines = [];
+        let undersized = false;
+        const selected = areas.filter(feature => state.selected.has(feature));
+        if (!selected.length) {
+            lines.push('Tick the shape(s) to cut above.');
         } else if (angle === null) {
-            preview.textContent = 'Type the slice angle in degrees clockwise from north (0 = vertical, 90 = horizontal).';
+            lines.push('Type the slice angle in degrees clockwise from north (0 = vertical, 90 = horizontal).');
+        } else if (target === 'invalid') {
+            lines.push(`The acres per segment must be a number above 0 - or leave the box empty for the ${bounds.min}-${bounds.max} acre rule.`);
         } else {
-            const plan = planAutoDrawSegments(state.feature, {angleDegrees: angle});
-            const name = getMapFeatureDisplayName(state.feature);
-            if (!plan.ok) {
-                preview.textContent = `"${name}" has no area to cut.`;
-            } else if (plan.count <= 1) {
-                preview.textContent = `"${name}" is ${plan.totalAcres.toFixed(1)} acres - already at or under ${bounds.max} acres, so there is nothing to cut.`;
-            } else {
-                state.plan = plan;
-                const parts = [`"${name}": ${plan.totalAcres.toFixed(1)} acres \u2192 ${plan.count} slices of ~${plan.acresEach.toFixed(1)} acres (${describeAutoDrawDirection(plan.angleDegrees)})`];
-                if (plan.pieces.length !== plan.count) parts.push(`the outline leaves ${plan.pieces.length} pieces`);
-                if (plan.undersized) parts.push(`under the ${bounds.min}-acre minimum: a shape of ${bounds.max}-${bounds.min * 2} acres cannot be cut into ${bounds.min}-${bounds.max} acre slices`);
-                preview.textContent = `${parts.join('; ')}. Names: ${buildAutoDrawSegmentName(name, 1)} to ${buildAutoDrawSegmentName(name, plan.pieces.length)}.`;
+            selected.forEach(feature => {
+                const plan = planAutoDrawSegments(feature, {angleDegrees: angle, targetAcres});
+                const name = getMapFeatureDisplayName(feature);
+                if (!plan.ok) {
+                    lines.push(`"${name}" has no area to cut.`);
+                } else if (plan.count <= 1) {
+                    lines.push(`"${name}" is ${plan.totalAcres.toFixed(1)} acres - ${targetAcres === null ? `already at or under ${bounds.max} acres` : `not more than the ${targetAcres} acre target`}, so there is nothing to cut.`);
+                } else {
+                    state.plans.set(feature, plan);
+                    const parts = [`"${name}": ${plan.totalAcres.toFixed(1)} acres \u2192 ${plan.count} slices of ~${plan.acresEach.toFixed(1)} acres`];
+                    if (plan.pieces.length !== plan.count) parts.push(`the outline leaves ${plan.pieces.length} pieces`);
+                    if (plan.undersized) {
+                        undersized = true;
+                        parts.push(`under the ${bounds.min}-acre minimum: a shape of ${bounds.max}-${bounds.min * 2} acres cannot be cut into ${bounds.min}-${bounds.max} acre slices`);
+                    }
+                    lines.push(`${parts.join('; ')}. Names: ${buildAutoDrawSegmentName(name, 1)} to ${buildAutoDrawSegmentName(name, plan.pieces.length)}.`);
+                }
+            });
+            if (state.plans.size) {
+                lines.push(`${describeAutoDrawDirection(angle)}${targetAcres !== null ? `, aiming at ${targetAcres} acres per segment` : ''}; the segments are imported at once.`);
             }
         }
-        preview.classList.toggle('is-warning', !!(state.plan && state.plan.undersized));
-        confirmBtn.disabled = state.busy || !state.plan || !state.plan.pieces.length;
-        confirmBtn.textContent = state.plan
-            ? `Draw ${state.plan.pieces.length} Segment${state.plan.pieces.length === 1 ? '' : 's'}`
+        preview.textContent = lines.join('\n');
+        preview.classList.toggle('is-warning', undersized);
+        rows.forEach(row => {
+            const sizing = computeAutoDrawSliceCount(row.acres, {targetAcres});
+            row.sliceCell.textContent = sizing.count > 1
+                ? `${sizing.count} x ~${sizing.acresEach.toFixed(1)} ac`
+                : (targetAcres !== null ? 'nothing to cut' : `already \u2264 ${bounds.max} ac`);
+        });
+        const pieceTotal = Array.from(state.plans.values()).reduce((sum, plan) => sum + plan.pieces.length, 0);
+        confirmBtn.disabled = state.busy || !pieceTotal;
+        confirmBtn.textContent = pieceTotal
+            ? `Draw ${pieceTotal} Segment${pieceTotal === 1 ? '' : 's'}${state.plans.size > 1 ? ` from ${state.plans.size} Shapes` : ''}`
             : 'Draw Segments';
     };
 
     confirmBtn.onclick = async () => {
-        if (!state.plan || state.busy) return;
+        if (!state.plans.size || state.busy) return;
         state.busy = true;
         status.style.display = 'none';
         update();
-        const outcome = await drawAutoDrawSegments(state.feature, state.plan, {
-            onProgress: (done, total) => { confirmBtn.textContent = `Drawing ${done} / ${total}\u2026`; }
-        });
+        const entries = Array.from(state.plans.entries());
+        const outcomes = [];
+        for (let i = 0; i < entries.length; i++) {
+            const [feature, plan] = entries[i];
+            const name = getMapFeatureDisplayName(feature);
+            outcomes.push(await drawAutoDrawSegments(feature, plan, {
+                skipFinish: true,
+                onProgress: (done, total) => {
+                    confirmBtn.textContent = `Drawing "${name}" ${done} / ${total}${entries.length > 1 ? ` (shape ${i + 1} of ${entries.length})` : ''}\u2026`;
+                }
+            }));
+        }
         state.busy = false;
-        if (outcome.created.length) {
+        if (outcomes.some(outcome => outcome.created.length)) {
+            finishCalTopoMapWrite();
             closePopup(popup);
             return;
         }
-        status.textContent = outcome.errors.length
-            ? `CalTopo did not take the new shapes (${outcome.errors.join(', ')}). Check the proxy status and the service account\u2019s write access, then try again.`
+        const errors = outcomes.reduce((all, outcome) => all.concat(outcome.errors), []);
+        status.textContent = errors.length
+            ? `CalTopo did not take the new shapes (${errors.join(', ')}). Check the proxy status and the service account\u2019s write access, then try again.`
             : 'Nothing was drawn.';
         status.style.display = 'block';
         update();
@@ -22255,14 +23234,18 @@ function showAutoDrawSegmentsPopup(areas) {
 
 // Draw the slices of `plan` on the case's map: one POST per piece (an
 // Assignment, else a Shape) carrying the source shape's style and folder,
-// named "<source>-<n>". The pieces CalTopo took are appended to the case's
-// copy of the map and logged; refused ones are reported. `options.onProgress
-// (done, total)` follows the POSTs. Resolves {created, errors}.
+// named "<source>-<n>". The pieces CalTopo took become segments at once
+// (applyAutoDrawToCase: Segments rows in the source's region, the source's
+// row, tasks and tracks re-pointed) and the source shape is moved into the
+// map's hidden "Regions" folder; refused pieces are reported.
+// `options.onProgress(done, total)` follows the POSTs; `options.skipFinish`
+// leaves the panel / iframe / re-fetch to the caller (several shapes in one
+// go). Resolves {created, errors, imported}.
 async function drawAutoDrawSegments(feature, plan, options = {}) {
     const bundle = loadBundle();
     const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
     const pieces = plan && Array.isArray(plan.pieces) ? plan.pieces : [];
-    if (!map || !map.id || !pieces.length) return {created: [], errors: []};
+    if (!map || !map.id || !pieces.length) return {created: [], errors: [], imported: null};
     const baseName = getMapFeatureDisplayName(feature);
     const sourceAttrs = feature.attributes || feature.properties || {};
     const style = captureCalTopoFeatureStyle(sourceAttrs);
@@ -22292,26 +23275,416 @@ async function drawAutoDrawSegments(feature, plan, options = {}) {
         created.push({name, acres: piece.acres, geometry, properties, objectType: result.objectType, id: result.id});
     }
 
+    let imported = null;
     if (created.length) {
-        // The case may have been saved meanwhile: append to the latest copy.
-        const latest = loadBundle();
-        const latestMap = Array.isArray(latest.maps) && latest.maps[0] ? latest.maps[0] : null;
-        if (latestMap) {
-            const list = Array.isArray(latestMap.features) ? latestMap.features : [];
-            created.forEach(entry => {
-                list.push(buildCreatedMapFeature(entry.geometry, entry.properties, entry.objectType, entry.id, entry.name, list.length + 1));
-            });
-            latestMap.features = list;
+        // The source shape is done with: into the hidden "Regions" folder.
+        const folder = await ensureCalTopoRegionsFolder(map);
+        let moved = false;
+        if (folder.id) {
+            try {
+                moved = await moveCalTopoFeatureToFolder(map, feature, folder.id);
+            } catch (error) {
+                console.warn(`[MAPS] "${baseName}" could not be moved to the ${CALTOPO_REGIONS_FOLDER_TITLE} folder: ${error && error.message ? error.message : error}`);
+            }
         }
-        addActivityLogEntry('System', `Auto-drew ${created.length} segment${created.length === 1 ? '' : 's'} from "${baseName}" on the CalTopo map (${direction}, ~${Number(plan.acresEach).toFixed(1)} acres each): ${created.map(entry => entry.name).join(', ')}`, latest);
-        saveBundle(latest);
-        showToast(`${created.length} segment${created.length === 1 ? '' : 's'} drawn on the map from "${baseName}". Import them below the map when ready.`, 'Auto Draw Segments');
-        finishCalTopoMapWrite();
+        imported = applyAutoDrawToCase(feature, created, plan, {folder, moved});
+        const where = imported && imported.region ? ` into region "${imported.region}"` : '';
+        showToast(`${created.length} segment${created.length === 1 ? '' : 's'} drawn on the map from "${baseName}" and imported as segments${where}.${imported && imported.sourceRemoved ? ` "${baseName}" was removed from the Segments page.` : ''}`, 'Auto Draw Segments');
+        if (!moved) showToast(`"${baseName}" could not be moved to the "${CALTOPO_REGIONS_FOLDER_TITLE}" folder on CalTopo - move it by hand if you want it out of the way.`, 'Auto Draw Segments');
+        if (!options.skipFinish) finishCalTopoMapWrite();
     }
     if (errors.length && created.length) {
         alert(`CalTopo did not take ${errors.length} of the ${pieces.length} slices: ${errors.join(', ')}.`);
     }
-    return {created, errors};
+    return {created, errors, imported};
+}
+
+// The case's side of an auto draw: the slices appended to the case's copy of
+// the map (the source noted as moved, a created folder remembered), one
+// Segments row per slice in the source's region in place of the source's
+// row, the source's Search Log rows re-pointed at the slices, the searcher
+// tracks re-measured, the source shape marked unwanted, the log entry; saved
+// through saveSearcherTracksChange so the PSR maths follow at once. Returns
+// {region, rows, sourceRemoved, repointed, tracksChanged}.
+function applyAutoDrawToCase(feature, created, plan, options = {}) {
+    const bundle = loadBundle();
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    if (!map) return null;
+    const baseName = getMapFeatureDisplayName(feature);
+    const direction = describeAutoDrawDirection(plan.angleDegrees);
+
+    const features = Array.isArray(map.features) ? map.features : [];
+    const newFeatures = created.map((entry, k) => buildCreatedMapFeature(entry.geometry, entry.properties, entry.objectType, entry.id, entry.name, features.length + k + 1));
+    features.push(...newFeatures);
+    map.features = features;
+    if (options.folder && options.folder.id) {
+        rememberCalTopoFolder(map, options.folder);
+        if (options.moved) markStoredMapFeatureFolder(map, feature, options.folder.id);
+    }
+
+    const sourceRow = findSegmentRowForMapFeature(bundle, feature);
+    const region = sourceRow ? String(sourceRow[0] || '').trim() : '';
+    const newRows = newFeatures.map(shape => buildSegmentRowFromMapFeature(shape, {region, sweep: sourceRow ? sourceRow[4] : ''}));
+    bundle.pages.page2 = replaceSegmentsPageRows(ensureSegmentsPageRows(bundle), sourceRow ? [sourceRow] : [], newRows);
+    newRows.forEach(row => newlyImportedSegments.add(`${row[0]}|${row[1]}`));
+
+    const repointed = sourceRow
+        ? repointSearchLogSegments(bundle, [{region, segment: sourceRow[1]}], newRows.map(row => ({region: row[0], segment: row[1]})))
+        : 0;
+    const tracksChanged = remeasureSearcherTracks(bundle);
+    markMapFeaturesUnwanted([feature], bundle, {reason: 'cut into segments by Auto Draw'});
+
+    const names = created.map(entry => entry.name).join(', ');
+    const notes = [];
+    if (sourceRow) notes.push(`"${baseName}" was removed from the Segments page${repointed ? ` (${repointed} Search Log row${repointed === 1 ? '' : 's'} re-pointed at the new segments)` : ''}`);
+    if (options.moved) notes.push(`its shape moved to the CalTopo "${CALTOPO_REGIONS_FOLDER_TITLE}" folder`);
+    addActivityLogEntry('System', `Auto-drew ${created.length} segment${created.length === 1 ? '' : 's'} from "${baseName}" on the CalTopo map (${direction}, ~${Number(plan.acresEach).toFixed(1)} acres each): ${names}; imported as segments${region ? ` in region "${region}"` : ''}${notes.length ? `; ${notes.join('; ')}` : ''}`, bundle);
+    saveSearcherTracksChange(bundle);
+    return {region, rows: newRows.length, sourceRemoved: !!sourceRow, repointed, tracksChanged};
+}
+
+// --- Merge Segments -------------------------------------------------------------
+
+function unionPolygonOutline(sources, options = {}) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.unionPolygonOutline === 'function') return utils.unionPolygonOutline(sources, options);
+    return {ok: false, reason: 'no-area', ring: [], acres: 0, ringCount: 0};
+}
+
+function polygonsAreNeighbors(a, b, toleranceMiles) {
+    const utils = getMapSegmentUtils();
+    return typeof utils.polygonsAreNeighbors === 'function' ? utils.polygonsAreNeighbors(a, b, toleranceMiles) : false;
+}
+
+// The segments that can be merged: every Segments row with a CalTopo area
+// shape, as [{row, region, segment, feature, key, acres}] - by region, then
+// by name (numbers in order).
+function getMergeableSegments(bundle) {
+    const features = getMapFeatures(bundle);
+    const utils = getMapSegmentUtils();
+    const seen = new Set();
+    const list = ensureSegmentsPageRows(bundle).map(row => {
+        if (!Array.isArray(row) || !String(row[1] || '').trim()) return null;
+        const shape = typeof utils.findFeatureForSegmentRow === 'function' ? utils.findFeatureForSegmentRow(features, row) : null;
+        if (!shape || !getFeatureAreaPolygons(shape).length) return null;
+        const region = String(row[0] || '').trim();
+        const segment = String(row[1] || '').trim();
+        const key = `${normalizeSegmentNameForMatch(region)}|${normalizeSegmentNameForMatch(segment)}`;
+        if (seen.has(key)) return null;
+        seen.add(key);
+        return {row, region, segment, feature: shape, key, acres: calculateGeometry(shape).area};
+    }).filter(Boolean);
+    list.sort((a, b) => a.region.localeCompare(b.region) || a.segment.localeCompare(b.segment, undefined, {numeric: true}));
+    return list;
+}
+
+// The lng/lat bounds of an area feature, grown by `padDegrees`.
+function getMapFeatureBounds(feature, padDegrees = 0) {
+    let minLng = Infinity;
+    let maxLng = -Infinity;
+    let minLat = Infinity;
+    let maxLat = -Infinity;
+    getFeatureAreaPolygons(feature).forEach(rings => (rings || []).forEach(ring => (ring || []).forEach(point => {
+        if (!Array.isArray(point) || !Number.isFinite(point[0]) || !Number.isFinite(point[1])) return;
+        minLng = Math.min(minLng, point[0]);
+        maxLng = Math.max(maxLng, point[0]);
+        minLat = Math.min(minLat, point[1]);
+        maxLat = Math.max(maxLat, point[1]);
+    })));
+    return {minLng: minLng - padDegrees, maxLng: maxLng + padDegrees, minLat: minLat - padDegrees, maxLat: maxLat + padDegrees};
+}
+
+// Whether two mergeable segments are neighbors (their shapes touch, share a
+// border or overlap within the merge tolerance); bounds are compared first so
+// a long list of far-apart segments costs nothing.
+function areMergeableSegmentsNeighbors(a, b) {
+    const utils = getMapSegmentUtils();
+    const tolMiles = Number.isFinite(utils.MERGE_NEIGHBOR_TOLERANCE_MILES) ? utils.MERGE_NEIGHBOR_TOLERANCE_MILES : 0.006;
+    const pad = tolMiles / 69.172 * 2;
+    const ba = getMapFeatureBounds(a.feature, pad);
+    const bb = getMapFeatureBounds(b.feature, pad);
+    if (ba.maxLng < bb.minLng || bb.maxLng < ba.minLng || ba.maxLat < bb.minLat || bb.maxLat < ba.minLat) return false;
+    return polygonsAreNeighbors(a.feature, b.feature, tolMiles);
+}
+
+// "Merge Segments": the button. Fetches the shapes when the case has none
+// yet, then opens the popup on the segments that have a shape.
+async function openMergeSegmentsTool(btn = null) {
+    if (!getCalTopoMapForTools(loadBundle())) return null;
+    await ensureMapFeaturesForTools(btn);
+    const candidates = getMergeableSegments(loadBundle());
+    if (candidates.length < 2) {
+        alert('At least two segments with a CalTopo shape are needed to merge. Import the assignments as segments (below the map) first, then try again.');
+        return null;
+    }
+    return showMergeSegmentsPopup(candidates);
+}
+
+// The popup: one row per segment with a shape. Ticking a segment grays out
+// every segment that is not a neighbor of some ticked one - or lies in
+// another region - so only what can join the merge stays open; the name box
+// is prefilled with the ticked names joined by "+" until it is edited. The
+// preview shows the outline's acreage. Confirm merges. Resolves the popup.
+function showMergeSegmentsPopup(candidates) {
+    const popup = createPopup('Merge Segments', null);
+    const content = popup.querySelector('.popup-content');
+    const btnContainer = popup.querySelector('.popup-buttons');
+    content.style.width = '90vw';
+    content.style.maxWidth = '900px';
+    content.style.maxHeight = '90vh';
+    content.style.display = 'flex';
+    content.style.flexDirection = 'column';
+
+    const state = {selected: [], nameTouched: false, busy: false, outline: null};
+    const neighborCache = new Map();
+    const neighbors = (a, b) => {
+        const key = a.key < b.key ? `${a.key}||${b.key}` : `${b.key}||${a.key}`;
+        if (!neighborCache.has(key)) neighborCache.set(key, areMergeableSegmentsNeighbors(a, b));
+        return neighborCache.get(key);
+    };
+
+    const body = document.createElement('div');
+    body.className = 'map-tool-body merge-segments-body';
+    const intro = document.createElement('p');
+    intro.className = 'track-import-intro';
+    intro.textContent = `Tick the segments to merge - after the first one, only its neighbors in the same region stay open, then the neighbors of those, and so on. Confirm to draw one shape along the outer border of the ticked segments on the CalTopo map and make it the segment; the old segments leave the Segments page (their tasks and tracks go to the new one) and their shapes move to the map's hidden "${CALTOPO_REGIONS_FOLDER_TITLE}" folder.`;
+    body.appendChild(intro);
+
+    const listWrap = document.createElement('div');
+    listWrap.className = 'track-import-table-wrap merge-segments-list';
+    const table = document.createElement('table');
+    table.className = 'grid-table';
+    const thead = document.createElement('thead');
+    thead.innerHTML = '<tr><th style="width: 40px;"></th><th>Segment</th><th>Region</th><th>Area (acres)</th><th>Shape</th></tr>';
+    table.appendChild(thead);
+    const tbody = document.createElement('tbody');
+    const rows = [];
+    candidates.forEach(candidate => {
+        const tr = document.createElement('tr');
+        tr.className = 'merge-segment-row';
+        const checkTd = document.createElement('td');
+        const check = document.createElement('input');
+        check.type = 'checkbox';
+        check.className = 'merge-segment-check';
+        check.onchange = () => {
+            if (check.checked) {
+                if (!state.selected.includes(candidate)) state.selected.push(candidate);
+            } else {
+                state.selected = state.selected.filter(entry => entry !== candidate);
+            }
+            update();
+        };
+        checkTd.appendChild(check);
+        tr.appendChild(checkTd);
+        [candidate.segment, candidate.region || '\u2014', candidate.acres.toFixed(2), getMapFeatureDisplayName(candidate.feature)].forEach(text => {
+            const td = document.createElement('td');
+            const pill = document.createElement('div');
+            pill.className = 'pill-cell readonly-pill';
+            pill.textContent = text;
+            td.appendChild(pill);
+            tr.appendChild(td);
+        });
+        tr.onclick = (event) => {
+            if (event && event.target === check) return;
+            if (check.disabled) return;
+            check.checked = !check.checked;
+            check.onchange();
+        };
+        rows.push({candidate, tr, check});
+        tbody.appendChild(tr);
+    });
+    table.appendChild(tbody);
+    listWrap.appendChild(table);
+    body.appendChild(listWrap);
+
+    const nameRow = document.createElement('div');
+    nameRow.className = 'auto-draw-direction-row merge-name-row';
+    const nameLabel = document.createElement('span');
+    nameLabel.className = 'custom-track-label';
+    nameLabel.textContent = 'Merged segment name';
+    nameRow.appendChild(nameLabel);
+    const nameInput = document.createElement('input');
+    nameInput.type = 'text';
+    nameInput.id = 'merge-segment-name';
+    nameInput.className = 'pill-input merge-segment-name';
+    nameInput.placeholder = 'Tick segments first';
+    nameInput.oninput = () => {
+        state.nameTouched = String(nameInput.value || '').trim() !== '';
+        update();
+    };
+    nameRow.appendChild(nameInput);
+    body.appendChild(nameRow);
+
+    const preview = document.createElement('div');
+    preview.className = 'auto-draw-preview merge-preview';
+    body.appendChild(preview);
+    const status = document.createElement('div');
+    status.className = 'custom-track-error merge-status';
+    status.style.display = 'none';
+    body.appendChild(status);
+    content.insertBefore(body, btnContainer);
+
+    btnContainer.innerHTML = '';
+    const cancelBtn = document.createElement('button');
+    cancelBtn.className = 'popup-btn';
+    cancelBtn.textContent = 'Cancel';
+    cancelBtn.onclick = () => closePopup(popup);
+    btnContainer.appendChild(cancelBtn);
+    const confirmBtn = document.createElement('button');
+    confirmBtn.className = 'popup-btn primary merge-confirm';
+    btnContainer.appendChild(confirmBtn);
+
+    const defaultName = () => state.selected.map(entry => entry.segment).join('+');
+    const currentName = () => (state.nameTouched ? String(nameInput.value || '').trim() : defaultName());
+
+    const update = () => {
+        // What can still be ticked: nothing ticked - everything; otherwise the
+        // ticked ones and every neighbor of a ticked one in the same region.
+        const region = state.selected.length ? state.selected[0].region : null;
+        rows.forEach(row => {
+            const picked = state.selected.includes(row.candidate);
+            const open = !state.selected.length || picked
+                || (row.candidate.region === region && state.selected.some(entry => neighbors(entry, row.candidate)));
+            row.check.disabled = state.busy || !open;
+            row.tr.classList.toggle('is-disabled', !open);
+            row.tr.classList.toggle('is-selected', picked);
+            row.tr.title = open ? '' : (row.candidate.region !== region ? 'Another region: segments of different regions are not merged.' : 'Not a neighbor of any ticked segment.');
+        });
+        if (!state.nameTouched) nameInput.value = defaultName();
+        state.outline = null;
+        const lines = [];
+        if (state.selected.length < 2) {
+            lines.push(state.selected.length ? 'Tick at least one neighboring segment to merge with it.' : 'Tick two or more neighboring segments of one region.');
+        } else {
+            const outline = unionPolygonOutline(state.selected.map(entry => entry.feature));
+            if (!outline.ok) {
+                lines.push('The ticked shapes leave no outline to draw.');
+            } else {
+                state.outline = outline;
+                lines.push(`${state.selected.length} segments (${state.selected.map(entry => entry.segment).join(', ')}) \u2192 "${currentName() || defaultName()}": ${outline.acres.toFixed(1)} acres, ${outline.ring.length - 1} corners${region ? `, region "${region}"` : ''}.`);
+                if (outline.ringCount > 1) lines.push(`The union leaves ${outline.ringCount} rings (a piece apart or a hole); only the largest outline is drawn.`);
+                lines.push('The old segments are removed from the Segments page; their tasks and tracks go to the merged segment.');
+            }
+        }
+        preview.textContent = lines.join('\n');
+        preview.classList.toggle('is-warning', !!(state.outline && state.outline.ringCount > 1));
+        const ready = !!state.outline && !!currentName();
+        confirmBtn.disabled = state.busy || !ready;
+        confirmBtn.textContent = state.selected.length >= 2 ? `Merge ${state.selected.length} Segments` : 'Merge Segments';
+    };
+
+    confirmBtn.onclick = async () => {
+        if (!state.outline || state.busy) return;
+        state.busy = true;
+        status.style.display = 'none';
+        update();
+        confirmBtn.textContent = 'Merging\u2026';
+        const outcome = await mergeSegmentsAction(state.selected.slice(), currentName());
+        state.busy = false;
+        if (outcome.ok) {
+            closePopup(popup);
+            return;
+        }
+        status.textContent = outcome.errors.join(' ');
+        status.style.display = 'block';
+        update();
+    };
+
+    update();
+    return popup;
+}
+
+// Merge `candidates` (getMergeableSegments entries, two or more) into one
+// segment named `name`: the outline of their union is created on CalTopo as
+// an Assignment (else Shape) in the first segment's style and folder, the
+// old shapes move to the hidden "Regions" folder, and the case follows
+// (applyMergeToCase). Resolves {ok, name, errors, ...} - nothing changes when
+// CalTopo refuses the new shape.
+async function mergeSegmentsAction(candidates, name, options = {}) {
+    const bundle = loadBundle();
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    const list = Array.isArray(candidates) ? candidates.filter(Boolean) : [];
+    if (!map || !map.id) return {ok: false, errors: ['No CalTopo map is linked to this case.']};
+    if (list.length < 2) return {ok: false, errors: ['Tick at least two segments to merge.']};
+    const outline = unionPolygonOutline(list.map(entry => entry.feature));
+    if (!outline.ok) return {ok: false, errors: ['The ticked shapes leave no outline to draw.']};
+    const title = String(name || '').trim() || list.map(entry => entry.segment).join('+');
+    const firstAttrs = list[0].feature.attributes || list[0].feature.properties || {};
+    const properties = {
+        title,
+        description: `Merged from ${list.map(entry => `"${entry.segment}"`).join(', ')} (${outline.acres.toFixed(1)} acres).`
+    };
+    if (firstAttrs.folderId) properties.folderId = firstAttrs.folderId;
+    applyCapturedCalTopoFeatureStyle(properties, captureCalTopoFeatureStyle(firstAttrs));
+    const geometry = {type: 'Polygon', coordinates: [outline.ring.map(point => point.slice())]};
+    let result = null;
+    try {
+        result = await createCalTopoMapFeature(map, AUTO_DRAW_OBJECT_TYPES, geometry, properties);
+    } catch (error) {
+        console.warn(`[MAPS] merge into "${title}" failed: ${error && error.message ? error.message : error}`);
+    }
+    if (!result) return {ok: false, errors: [`CalTopo did not take the merged shape "${title}". Check the proxy status and the service account\u2019s write access, then try again.`]};
+
+    const folder = await ensureCalTopoRegionsFolder(map);
+    const moved = [];
+    if (folder.id) {
+        for (const entry of list) {
+            try {
+                if (await moveCalTopoFeatureToFolder(map, entry.feature, folder.id)) moved.push(entry);
+            } catch (error) {
+                console.warn(`[MAPS] "${entry.segment}" could not be moved to the ${CALTOPO_REGIONS_FOLDER_TITLE} folder: ${error && error.message ? error.message : error}`);
+            }
+        }
+    }
+    const applied = applyMergeToCase(list, {name: title, geometry, properties, objectType: result.objectType, id: result.id, acres: outline.acres}, {folder, moved});
+    showToast(`${list.length} segments merged into "${title}" (${outline.acres.toFixed(1)} acres) on the map and the Segments page.`, 'Merge Segments');
+    if (moved.length < list.length) {
+        const left = list.filter(entry => !moved.includes(entry)).map(entry => entry.segment).join(', ');
+        showToast(`${left} could not be moved to the "${CALTOPO_REGIONS_FOLDER_TITLE}" folder on CalTopo - move the old shapes by hand if you want them out of the way.`, 'Merge Segments');
+    }
+    if (!options.skipFinish) finishCalTopoMapWrite();
+    return {ok: true, name: title, errors: [], ...applied};
+}
+
+// The case's side of a merge: the new shape appended to the case's copy of
+// the map (the old ones noted as moved, a created folder remembered), one
+// Segments row for the merged segment in place of the old rows (region and
+// sweep width of the first), the old segments' Search Log rows re-pointed at
+// it (one row per task), the tracks re-measured, the old shapes marked
+// unwanted, the log entry; saved through saveSearcherTracksChange. Returns
+// {region, repointed, tracksChanged}.
+function applyMergeToCase(list, created, options = {}) {
+    const bundle = loadBundle();
+    const map = Array.isArray(bundle.maps) && bundle.maps[0] ? bundle.maps[0] : null;
+    if (!map) return null;
+    const features = Array.isArray(map.features) ? map.features : [];
+    const newFeature = buildCreatedMapFeature(created.geometry, created.properties, created.objectType, created.id, created.name, features.length + 1);
+    features.push(newFeature);
+    map.features = features;
+    if (options.folder && options.folder.id) {
+        rememberCalTopoFolder(map, options.folder);
+        (options.moved || []).forEach(entry => markStoredMapFeatureFolder(map, entry.feature, options.folder.id));
+    }
+
+    const rows = ensureSegmentsPageRows(bundle);
+    const oldRows = list.map(entry => rows.find(row => Array.isArray(row)
+        && normalizeSegmentNameForMatch(row[0]) === normalizeSegmentNameForMatch(entry.region)
+        && normalizeSegmentNameForMatch(row[1]) === normalizeSegmentNameForMatch(entry.segment))).filter(Boolean);
+    const region = list[0].region;
+    const newRow = buildSegmentRowFromMapFeature(newFeature, {region, sweep: oldRows[0] ? oldRows[0][4] : ''});
+    bundle.pages.page2 = replaceSegmentsPageRows(rows, oldRows, [newRow]);
+    newlyImportedSegments.add(`${newRow[0]}|${newRow[1]}`);
+
+    const repointed = repointSearchLogSegments(bundle, list.map(entry => ({region: entry.region, segment: entry.segment})), [{region, segment: newRow[1]}]);
+    const tracksChanged = remeasureSearcherTracks(bundle);
+    markMapFeaturesUnwanted(list.map(entry => entry.feature), bundle, {reason: 'merged into one segment'});
+
+    const names = list.map(entry => entry.segment).join(', ');
+    const notes = [`the old rows were removed from the Segments page${repointed ? ` (${repointed} Search Log row${repointed === 1 ? '' : 's'} re-pointed at the merged segment)` : ''}`];
+    if (options.moved && options.moved.length) notes.push(`the old shapes moved to the CalTopo "${CALTOPO_REGIONS_FOLDER_TITLE}" folder`);
+    addActivityLogEntry('System', `Merged ${list.length} segments (${names}) into "${created.name}" (${Number(created.acres).toFixed(1)} acres)${region ? ` in region "${region}"` : ''}: drawn on the CalTopo map; ${notes.join('; ')}`, bundle);
+    saveSearcherTracksChange(bundle);
+    return {region, repointed, tracksChanged};
 }
 
 // --- Trim Tracks ----------------------------------------------------------------

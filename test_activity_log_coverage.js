@@ -193,14 +193,18 @@ check('assignSearchTaskToTeam creates the Search Log row, assigns the team and w
 });
 
 check('the Segments page "search" button and the Personnel page "Assign New Task" both go through assignSearchTaskToTeam', () => {
+    // Both pages hand the confirmed stamp to the shared assignment - the
+    // one-segment form or the several-segments form (one Search Log row per
+    // segment), which the one-segment form wraps.
+    const sharedCall = /showMissingStepsPopup\(teamName, null, \(currentStamp\) => \{[\s\S]*?assignSearchTaskToTeam(?:Segments\(teamName, pairs|\(teamName, region, segment), currentStamp\)/;
     const segmentsSearch = appSource.slice(appSource.indexOf("actionBtn.textContent = 'search';"), appSource.indexOf("onCustom: () => {"));
-    assert.ok(/showMissingStepsPopup\(teamName, null, \(currentStamp\) => \{[\s\S]*?assignSearchTaskToTeam\(teamName, region, segment, currentStamp\)/.test(segmentsSearch),
-        'Segments page search uses the shared assignment');
+    assert.ok(sharedCall.test(segmentsSearch), 'Segments page search uses the shared assignment');
     assert.ok(!/Started search on/.test(appSource), 'no code path logs "Started search on" any more');
 
     const personnelAssign = appSource.slice(appSource.indexOf('function showNewSegmentPopup('), appSource.indexOf('function showTeamSelectionPopup('));
-    assert.ok(/showMissingStepsPopup\(teamName, null, \(currentStamp\) => \{[\s\S]*?assignSearchTaskToTeam\(teamName, region, segment, currentStamp\)/.test(personnelAssign),
-        'Personnel page Assign New Task uses the shared assignment');
+    assert.ok(sharedCall.test(personnelAssign), 'Personnel page Assign New Task uses the shared assignment');
+    assert.ok(/function assignSearchTaskToTeam\(teamName, region, segment, currentStamp = null\) \{\s*return assignSearchTaskToTeamSegments\(/.test(appSource),
+        'the one-segment form wraps the several-segments form');
 });
 
 check('the Task Assignment form no longer fills Begin Search from the assignment entry', () => {

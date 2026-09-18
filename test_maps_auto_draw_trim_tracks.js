@@ -516,8 +516,12 @@ check('drawAutoDrawSegments: one Assignment POST per slice in the source\'s styl
     assert.deepStrictEqual(plain(outcome.errors), []);
     assert.deepStrictEqual(progress, ['1/5', '2/5', '3/5', '4/5', '5/5']);
 
-    const posts = app.__posted;
-    assert.strictEqual(posts.length, 5, 'one POST per slice');
+    // Five slice POSTs, then the hidden "Regions" folder is created and the
+    // source shape moved into it (test_maps_merge_multi_segment_tasks.js
+    // looks at those two and at the import).
+    assert.strictEqual(app.__posted.length, 7, 'one POST per slice, the folder, the move');
+    assert.deepStrictEqual(app.__posted.slice(5).map(p => p.endpoint), ['/api/v1/map/MAP1/Folder', '/api/v1/map/MAP1/Assignment/area-1']);
+    const posts = app.__posted.slice(0, 5);
     posts.forEach((post, i) => {
         assert.strictEqual(post.method, 'POST');
         assert.strictEqual(post.endpoint, '/api/v1/map/MAP1/Assignment', 'created as an Assignment, no object id in the URL');
@@ -543,12 +547,16 @@ check('drawAutoDrawSegments: one Assignment POST per slice in the source\'s styl
     assert.deepStrictEqual(plain(added.map(f => f.attributes.id)), ['new-1', 'new-2', 'new-3', 'new-4', 'new-5']);
     assert.ok(added.every(f => f.attributes.class === 'Assignment' && f.geometry.type === 'Polygon'));
     assert.deepStrictEqual(plain(added.map(f => f.attributes.ObjectID)), [3, 4, 5, 6, 7]);
-    // ... and they are unaccounted assignments, ready to be imported below the map.
-    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures().map(app.getMapFeatureDisplayName)), ['Alpha', 'Alpha-1', 'Alpha-2', 'Alpha-3', 'Alpha-4', 'Alpha-5']);
+    // ... and they are segments already (imported at once; "Alpha" was never a
+    // segment here, so the slices have no region and the source shape is
+    // marked unwanted rather than left in the unaccounted list).
+    assert.deepStrictEqual(plain(app.getUnaccountedMapFeatures().map(app.getMapFeatureDisplayName)), []);
+    assert.deepStrictEqual(plain(app.loadBundle().pages.page2.filter(r => r[1]).map(r => [r[0], r[1], r[9]])), [['R1', '4D', 'seg-4d'], ['R1', '4C', 'seg-4c'], ['', 'Alpha-1', 'new-1'], ['', 'Alpha-2', 'new-2'], ['', 'Alpha-3', 'new-3'], ['', 'Alpha-4', 'new-4'], ['', 'Alpha-5', 'new-5']]);
+    assert.deepStrictEqual(plain(app.loadBundle().unwantedMapFeatures.map(u => u.name)), ['alpha']);
     const entry = app.loadBundle().activityLog.find(e => /Auto-drew/.test(e.action));
     assert.ok(entry, 'logged');
-    assert.ok(/Auto-drew 5 segments from "Alpha" on the CalTopo map \(vertical slices, ~12\.8 acres each\): Alpha-1, Alpha-2, Alpha-3, Alpha-4, Alpha-5/.test(entry.action), entry.action);
-    assert.ok(toasts(app).some(html => /5 segments drawn on the map from "Alpha"/.test(html)), 'the toast');
+    assert.ok(/Auto-drew 5 segments from "Alpha" on the CalTopo map \(vertical slices, ~12\.8 acres each\): Alpha-1, Alpha-2, Alpha-3, Alpha-4, Alpha-5; imported as segments/.test(entry.action), entry.action);
+    assert.ok(toasts(app).some(html => /5 segments drawn on the map from "Alpha" and imported as segments/.test(html)), 'the toast');
     assert.deepStrictEqual(app.__logs.alerts, [], 'nothing to complain about');
     assert.ok(server.proxyFetches() >= 1, 'the map is fetched again afterwards');
     assert.ok(server.requests.some(r => /\/rows/.test(r.url) && r.method === 'POST'), 'the case was saved');
@@ -563,7 +571,8 @@ check('drawAutoDrawSegments: a refused Assignment class falls back to Shape; eve
     await settle();
     assert.strictEqual(outcome.created.length, 5);
     assert.deepStrictEqual(app.__posted.slice(0, 2).map(p => p.endpoint), ['/api/v1/map/MAP1/Assignment', '/api/v1/map/MAP1/Shape'], 'Assignment first, then Shape');
-    assert.strictEqual(app.__posted.length, 10);
+    // 5 x (Assignment refused, Shape taken), the folder, the move.
+    assert.strictEqual(app.__posted.length, 12);
     const added = app.getMapFeatures(app.loadBundle()).slice(1);
     assert.ok(added.every(f => f.attributes.class === 'Shape'), 'stored under the class that took them');
     assert.deepStrictEqual(plain(added.map(f => f.attributes.id)), ['shape-1', 'shape-2', 'shape-3', 'shape-4', 'shape-5']);
@@ -600,26 +609,27 @@ check('the Auto Draw popup: pick a shape, a direction (or an angle), read the pr
     assert.deepStrictEqual(plain(areas.map(app.getMapFeatureDisplayName)), ['Alpha', 'Tiny'], 'polygons A-Z');
     const popup = app.showAutoDrawSegmentsPopup(areas);
     const rows = byClass(popup, 'auto-draw-feature-row');
-    const radios = byClass(popup, 'auto-draw-feature-radio');
+    const checks = byClass(popup, 'auto-draw-feature-check');
     const pills = byClass(popup, 'auto-draw-direction-btn');
     const angle = byClass(popup, 'auto-draw-angle')[0];
     const preview = byClass(popup, 'auto-draw-preview')[0];
     const confirm = byClass(popup, 'auto-draw-confirm')[0];
     assert.strictEqual(rows.length, 2);
-    assert.strictEqual(radios.length, 2);
+    assert.strictEqual(checks.length, 2, 'a checkbox per shape - several can be cut in one go');
     assert.deepStrictEqual(pills.map(p => p.textContent), ['Vertical', 'Horizontal', 'Custom angle']);
     assert.deepStrictEqual(pills.map(p => p.classList.contains('active')), [true, false, false], 'vertical to start with');
     assert.strictEqual(angle.disabled, true, 'the angle pill waits for Custom angle');
     assert.strictEqual(confirm.disabled, true);
-    assert.ok(/Pick the shape/.test(preview.textContent));
-    // The row's cells: name, type, acres, slices.
-    assert.deepStrictEqual(rows[0].children.slice(1).map(td => td.children[0].textContent), ['Alpha', 'Assignment', '64.00', '5 x ~12.8 ac']);
-    assert.deepStrictEqual(rows[1].children.slice(1).map(td => td.children[0].textContent), ['Tiny', 'Shape', '6.40', 'already \u2264 15 ac']);
+    assert.ok(/Tick the shape/.test(preview.textContent));
+    // The row's cells: name, type, the segment it belongs to, acres, slices.
+    assert.deepStrictEqual(rows[0].children.slice(1).map(td => td.children[0].textContent), ['Alpha', 'Assignment', 'not imported', '64.00', '5 x ~12.8 ac']);
+    assert.deepStrictEqual(rows[1].children.slice(1).map(td => td.children[0].textContent), ['Tiny', 'Shape', 'not imported', '6.40', 'already \u2264 15 ac']);
 
-    // Pick Alpha (clicking the row).
+    // Tick Alpha (clicking the row).
     rows[0].onclick();
-    assert.strictEqual(radios[0].checked, true);
-    assert.ok(/"Alpha": 64\.0 acres \u2192 5 slices of ~12\.8 acres \(vertical slices\)\. Names: Alpha-1 to Alpha-5\./.test(preview.textContent), preview.textContent);
+    assert.strictEqual(checks[0].checked, true);
+    assert.ok(/"Alpha": 64\.0 acres \u2192 5 slices of ~12\.8 acres\. Names: Alpha-1 to Alpha-5\./.test(preview.textContent), preview.textContent);
+    assert.ok(/vertical slices; the segments are imported at once/.test(preview.textContent), preview.textContent);
     assert.strictEqual(confirm.disabled, false);
     assert.strictEqual(confirm.textContent, 'Draw 5 Segments');
     assert.strictEqual(preview.classList.contains('is-warning'), false);
@@ -636,18 +646,42 @@ check('the Auto Draw popup: pick a shape, a direction (or an angle), read the pr
     angle.oninput();
     assert.ok(/slices at 30\u00b0 from north/.test(preview.textContent), preview.textContent);
     assert.strictEqual(confirm.disabled, false);
-    // A shape already under 15 acres has nothing to cut.
-    radios[1].checked = true;
-    radios[1].onchange();
+    // A shape already under 15 acres has nothing to cut; ticked alongside
+    // Alpha it is simply reported and Alpha's plan stands.
+    checks[1].checked = true;
+    checks[1].onchange();
     assert.ok(/"Tiny" is 6\.4 acres - already at or under 15 acres, so there is nothing to cut/.test(preview.textContent), preview.textContent);
-    assert.strictEqual(confirm.disabled, true);
-    // Back to Alpha, vertical, and confirm: five POSTs, the popup closes.
+    assert.strictEqual(confirm.disabled, false, 'Alpha still gets cut');
+    assert.strictEqual(confirm.textContent, 'Draw 5 Segments');
     rows[0].onclick();
+    assert.strictEqual(checks[0].checked, false, 'clicking the row again unticks');
+    assert.strictEqual(confirm.disabled, true, 'only Tiny left: nothing to cut');
+    // The target acreage box: 20 acres -> the closest division (3 x 21.3).
+    const target = byClass(popup, 'auto-draw-target')[0];
+    assert.strictEqual(target.id, 'auto-draw-target-acres');
+    rows[0].onclick();
+    target.value = '20';
+    target.oninput();
+    assert.ok(/"Alpha": 64\.0 acres \u2192 3 slices of ~21\.3 acres/.test(preview.textContent), preview.textContent);
+    assert.ok(/aiming at 20 acres per segment/.test(preview.textContent));
+    assert.strictEqual(rows[0].children[5].children[0].textContent, '3 x ~21.3 ac', 'the Slices column follows the target');
+    assert.strictEqual(rows[1].children[5].children[0].textContent, 'nothing to cut');
+    target.value = '-4';
+    target.oninput();
+    assert.ok(/must be a number above 0/.test(preview.textContent), preview.textContent);
+    assert.strictEqual(confirm.disabled, true);
+    target.value = '';
+    target.oninput();
+    assert.ok(/5 slices of ~12\.8 acres/.test(preview.textContent), 'empty = the 10-15 rule again');
+    // Alpha alone, vertical, and confirm: five slice POSTs (plus the folder
+    // and the move), the popup closes.
+    checks[1].checked = false;
+    checks[1].onchange();
     pills[0].onclick();
     confirm.onclick();
     await settle();
-    assert.strictEqual(app.__posted.length, 5);
-    assert.deepStrictEqual(app.__posted.map(p => p.payload.properties.title), ['Alpha-1', 'Alpha-2', 'Alpha-3', 'Alpha-4', 'Alpha-5']);
+    assert.strictEqual(app.__posted.filter(p => /\/Assignment$/.test(p.endpoint)).length, 5);
+    assert.deepStrictEqual(app.__posted.slice(0, 5).map(p => p.payload.properties.title), ['Alpha-1', 'Alpha-2', 'Alpha-3', 'Alpha-4', 'Alpha-5']);
     assert.ok(popup.classList.contains('fade-out'), 'closed');
     assert.deepStrictEqual(app.__logs.error, []);
 
@@ -898,7 +932,7 @@ check('the Trim Tracks popup: portion pills, the result cell, confirm', async ()
 
 check('the static wiring: the two buttons in the map header, their handlers, the stylesheet', () => {
     const start = appSource.indexOf('function buildMapsPage()');
-    const end = appSource.indexOf('// Maps page tools: "Auto Draw Segments" and "Trim Tracks".');
+    const end = appSource.indexOf('// Maps page tools: "Auto Draw Segments", "Trim Tracks" and "Merge Segments".');
     assert.ok(start !== -1 && end > start);
     const page = appSource.slice(start, end);
     const header = page.slice(page.indexOf('id="current-map-title"'), page.indexOf('id="map-iframe"'));

@@ -3718,6 +3718,27 @@ tr.log-sweeps-due::after {
   cursor: pointer;
 }
 
+/* The "Rings on map" switch beside the terrain: the category's distances as
+   purple discs around the IPP on the CalTopo map. Brightens once discs are
+   on the map. */
+.lpb-rings-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--muted);
+  font-size: 0.85rem;
+  white-space: nowrap;
+  cursor: pointer;
+}
+
+.lpb-rings-switch .toggle-switch {
+  transform: scale(0.85);
+}
+
+.lpb-rings-switch.is-drawn {
+  color: var(--text);
+}
+
 .lpb-import-ipp-btn.clear-btn {
   white-space: nowrap;
 }
@@ -4013,6 +4034,7 @@ tr.log-sweeps-due::after {
 
   .lpb-category-extras.is-visible {
     flex-basis: 100%;
+    flex-wrap: wrap;
   }
 
   .lpb-terrain-select.pill-input {
@@ -4108,6 +4130,7 @@ tr.log-sweeps-due::after {
 
   .lpb-category-extras.is-visible {
     flex-basis: 100%;
+    flex-wrap: wrap;
   }
 
   .lpb-terrain-select.pill-input {
@@ -4425,7 +4448,14 @@ tr.track-row-ambiguous .searcher-track-name {
   cursor: pointer;
 }
 
-.auto-draw-feature-radio {
+.auto-draw-feature-row.is-selected .pill-cell {
+  border-color: rgba(var(--accent-rgb), 0.55);
+  background: rgba(var(--accent-rgb), 0.1);
+}
+
+.auto-draw-feature-radio,
+.auto-draw-feature-check,
+.auto-draw-check-all {
   width: 18px;
   height: 18px;
   cursor: pointer;
@@ -4465,10 +4495,12 @@ tr.track-row-ambiguous .searcher-track-name {
   cursor: not-allowed;
 }
 
+/* The preview lists one line per shape to cut (pre-line keeps the breaks). */
 .auto-draw-preview {
   color: var(--text);
   font-size: 0.95rem;
   line-height: 1.45;
+  white-space: pre-line;
   padding: calc(12px * var(--space-scale, 1)) calc(16px * var(--space-scale, 1));
   border-radius: 12px;
   background: rgba(var(--accent-rgb), 0.08);
@@ -4478,6 +4510,44 @@ tr.track-row-ambiguous .searcher-track-name {
 .auto-draw-preview.is-warning {
   background: rgba(250, 176, 5, 0.12);
   border-color: rgba(250, 176, 5, 0.45);
+}
+
+/* Auto Draw: the target acreage box sits in a row of its own, like the
+   angle pill. Merge Segments: a grayed row is a segment that cannot join the
+   merge (not a neighbor of a ticked one, or another region); the name box
+   takes the width the pills leave. */
+.auto-draw-target-wrap .pill-input {
+  width: 130px;
+}
+
+.merge-segment-row.is-disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+.merge-segment-row.is-disabled .pill-cell {
+  color: var(--muted);
+}
+
+.merge-segment-row.is-selected .pill-cell {
+  border-color: rgba(var(--accent-rgb), 0.55);
+  background: rgba(var(--accent-rgb), 0.1);
+}
+
+.merge-segment-check {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+}
+
+.merge-segment-check:disabled {
+  cursor: not-allowed;
+}
+
+.merge-name-row .pill-input {
+  flex: 1 1 260px;
+  min-width: 0;
+  min-height: calc(40px * var(--space-scale, 1));
 }
 
 /* Trim Tracks: the portion pills are buttons; a struck-through red one is a
@@ -4506,10 +4576,138 @@ tr.trim-track-row.is-selected .trim-track-result {
   border-color: rgba(var(--accent-rgb), 0.65);
 }
 
+/* Search Log: a task that covers several segments has one row per segment;
+   the first row's Task #, Date, Time and Team cells span the group
+   (td[rowspan].task-span-cell, buildSearchLogTable) and their pills stretch
+   over the rows as one rounded rectangle each. Desktop only - below the
+   mobile breakpoint the rows are cards and a rowspan means nothing. */
+@media (min-width: 861px) {
+  .grid-table td.task-span-cell {
+    height: 1px;
+    vertical-align: middle;
+  }
+
+  .grid-table td.task-span-cell .pill-cell-container {
+    height: 100%;
+    align-items: stretch;
+  }
+
+  .grid-table td.task-span-cell .pill-cell {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    height: 100%;
+    min-height: 100%;
+    border-radius: 24px;
+    white-space: normal;
+  }
+
+  .grid-table td.task-span-cell .pill-cell .mini-pill {
+    align-self: center;
+  }
+}
+
 @media (max-width: 860px) {
   .searcher-tracks-header {
     flex-direction: column;
   }
+
+  /* A later row of a task in the card layout: the card has no Task # / Date
+     / Time / Team of its own, so it says which card it belongs to. */
+  body[data-page="page4"] .grid-table tr.task-group-more::before {
+    content: 'Same task # as the card above';
+    flex: 1 1 100%;
+    font-size: 0.65rem;
+    color: var(--muted);
+    text-transform: uppercase;
+    font-weight: 700;
+    margin-left: calc(12px * var(--space-scale, 1));
+  }
+}
+
+/* The segments of a task are picked from a checklist dropdown
+   (buildSegmentChecklist in app.js): a pill summarising the picks over the
+   list of "Segment (PSRc)" rows grouped under their regions. */
+.segment-checklist {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  width: 100%;
+  margin-bottom: calc(15px * var(--space-scale, 1));
+  text-align: left;
+}
+
+.segment-checklist-toggle {
+  width: 100%;
+  min-width: 0;
+  text-align: left;
+  cursor: pointer;
+  color: var(--muted);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.segment-checklist-toggle.has-selection {
+  color: var(--text);
+  border-color: rgba(var(--accent-rgb), 0.55);
+}
+
+.segment-checklist-toggle::after {
+  content: ' \25BE';
+  float: right;
+  opacity: 0.7;
+}
+
+.segment-checklist-toggle.is-open::after {
+  content: ' \25B4';
+}
+
+.segment-checklist-list {
+  max-height: 40vh;
+  overflow-y: auto;
+  border: 1px solid var(--pill-border);
+  border-radius: 16px;
+  background: rgba(0, 0, 0, 0.12);
+  padding: calc(6px * var(--space-scale, 1));
+}
+
+.segment-checklist-region {
+  font-size: 0.7rem;
+  font-weight: 700;
+  text-transform: uppercase;
+  color: var(--muted);
+  padding: calc(8px * var(--space-scale, 1)) calc(12px * var(--space-scale, 1)) calc(2px * var(--space-scale, 1));
+}
+
+.segment-checklist-item {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: calc(8px * var(--space-scale, 1)) calc(12px * var(--space-scale, 1));
+  border-radius: 999px;
+  cursor: pointer;
+}
+
+.segment-checklist-item:hover {
+  background: rgba(255, 255, 255, 0.06);
+}
+
+.segment-checklist-item.is-selected {
+  background: rgba(var(--accent-rgb), 0.14);
+}
+
+.segment-checklist-box {
+  width: 18px;
+  height: 18px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+.segment-checklist-intro {
+  margin-bottom: calc(12px * var(--space-scale, 1));
+  opacity: 0.85;
+  text-align: left;
 }
 
 /* ---------------------------------------------------------------------------
