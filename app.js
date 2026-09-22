@@ -179,6 +179,8 @@ function getMapFeatureCategoryKey(feature) {
     const geomType = String((feature?.geometry && feature.geometry.type) || '').trim().toLowerCase();
     const classOrType = rawClass || (rawType !== 'feature' ? rawType : '');
     if (classOrType === 'assignment' || attrs.assignment) return 'assignment';
+    // A track class (AppTrack, LiveTrack, ...) is a route whatever the geometry says.
+    if (/track/.test(classOrType)) return 'route';
     if (classOrType === 'marker' || geomType === 'point' || geomType === 'multipoint') return 'marker';
     if (['route', 'track', 'line', 'polyline'].includes(classOrType) || ['linestring', 'multilinestring', 'polyline', 'line'].includes(geomType)) return 'route';
     if (['shape', 'polygon', 'area'].includes(classOrType) || ['polygon', 'multipolygon', 'geometrycollection'].includes(geomType)) return 'shape';
@@ -7505,6 +7507,15 @@ function recalculateEverything(options = {}) {
       const timePerSweep = parseNumeric(segmentsData[r][5]);
       const sweep = parseNumeric(segmentsData[r][4]);
       const area = parseNumeric(segmentsData[r][2]);
+
+      // Map Tracking: the miles of searcher track walked in a segment that has
+      // no task search it off too (with the segment's own sweep width); once a
+      // task is logged there the allocation gives the miles to the task above.
+      if (mapTracking) {
+        const idleMiles = getSegmentUnassignedTrackMiles(trackAllocation, region, segment);
+        const idleZ = idleMiles > 0 ? calculateSearchCoverage({area, sweepWidth: sweep, trackMiles: idleMiles}) : 0;
+        if (idleZ > 0) info.share *= Math.exp(-idleZ);
+      }
       
       const psrc = (length / timePerSweep * sweep * info.share) / (area / 640);
       segmentsData[r][7] = isFinite(psrc) ? psrc.toFixed(4) : '';
@@ -8092,6 +8103,11 @@ function buildSegmentsTable() {
   const lpbContext = buildLpbContext(bundle);
   bindLpbSegmentsPanel(bundle, lpbContext);
 
+  // Map Tracking (Search Log page): a segment without a task whose ground was
+  // walked by a searcher track gets a miles tag on its PSRc pill.
+  const mapTracking = isMapTrackingEnabled(bundle);
+  const trackAllocation = mapTracking ? allocateSearcherTracksForBundle(bundle) : null;
+
   const isPSRDescending = sortToggle && sortToggle.checked;
   if (sortLabel) {
     sortLabel.textContent = isPSRDescending ? 'Sorted by PSRc (Descending)' : 'Sorted by Region then Segment';
@@ -8308,6 +8324,7 @@ function buildSegmentsTable() {
         }
 
         if (c === 7) {
+          if (mapTracking) appendUnassignedTrackMilesTag(cellContainer, cell, sortedData[r], trackAllocation);
           const sweepsDue = getLogSweepsDue();
           const isDue = sweepsDue.find(d => d.region === sortedData[r][0] && d.segment === sortedData[r][1]);
           
@@ -10724,7 +10741,97 @@ function closePopup(overlay) {
   setTimeout(() => overlay.remove(), 200);
 }
 
+// The open popups (overlays not already fading out) whose title is `titleText`.
+function findOpenPopupsTitled(titleText) {
+  const wanted = String(titleText === undefined || titleText === null ? '' : titleText);
+  let overlays = [];
+  try {
+    overlays = Array.from((document.querySelectorAll && document.querySelectorAll('.popup-overlay')) || []);
+  } catch (error) {
+    return [];
+  }
+  return overlays.filter(overlay => {
+    if (!overlay || !overlay.classList || overlay.classList.contains('fade-out') || overlay.classList.contains('fade-out-slow')) return false;
+    const title = typeof overlay.querySelector === 'function' ? overlay.querySelector('.popup-title') : null;
+    return !!title && String(title.textContent || '') === wanted;
+  });
+}
+
+// One popup per title: a request for a popup that is already open - typically
+// the button behind the overlay re-fired by Enter / Space while it kept the
+// keyboard focus - replaces the open one instead of stacking a copy on top.
+function replaceOpenPopupsTitled(titleText) {
+  findOpenPopupsTitled(titleText).forEach(overlay => {
+    if (typeof overlay.remove === 'function') overlay.remove();
+  });
+}
+
+// Moves the keyboard focus into the popup so the element that opened it (a
+// button on the page) cannot be re-fired by the next Enter / Space.
+function focusPopupContent(content) {
+  if (!content) return;
+  if (typeof content.setAttribute === 'function') content.setAttribute('tabindex', '-1');
+  content.tabIndex = -1;
+  if (typeof content.focus === 'function') {
+    try {
+      content.focus({preventScroll: true});
+    } catch (error) {
+      try { content.focus(); } catch (ignored) { /* a stand-in element without focus */ }
+    }
+  }
+}
+
+// The popup's confirm button: the first enabled `.popup-btn.primary` of its
+// button row (the convention every popup follows), null when it has none.
+function getPopupPrimaryButton(overlay) {
+  const buttons = overlay && typeof overlay.querySelector === 'function' ? overlay.querySelector('.popup-buttons') : null;
+  const candidates = buttons && typeof buttons.querySelectorAll === 'function' ? Array.from(buttons.querySelectorAll('.popup-btn.primary') || []) : [];
+  return candidates.find(btn => btn && !btn.disabled) || null;
+}
+
+// Where Enter must keep its own meaning: a button or link (activates it), a
+// textarea (new line), a select, an editable cell, and a search box (filters
+// the list - confirming the popup from there would take the wrong action).
+function isPopupEnterReserved(target) {
+  if (!target || typeof target !== 'object') return false;
+  const tag = String(target.tagName || '').toUpperCase();
+  if (tag === 'BUTTON' || tag === 'A' || tag === 'TEXTAREA' || tag === 'SELECT') return true;
+  if (target.isContentEditable === true || String(target.contentEditable || '').toLowerCase() === 'true') return true;
+  if (tag === 'INPUT') {
+    const type = String(target.type || '').toLowerCase();
+    if (type === 'search' || type === 'button' || type === 'submit' || type === 'reset' || type === 'file') return true;
+    if (/search/i.test(String(target.placeholder || ''))) return true;
+  }
+  return false;
+}
+
+// Keyboard on an open popup: Enter clicks the confirm button (so a popup that
+// just opened can be confirmed without reaching for the mouse), Escape closes
+// it the way the "x" does. Other keys, and Enter where it has its own meaning
+// (isPopupEnterReserved) or was already handled, are left alone.
+function handlePopupKeydown(overlay, event, closeBtn) {
+  if (!event || event.defaultPrevented) return;
+  const key = event.key;
+  if (key === 'Escape' || key === 'Esc') {
+    if (closeBtn && typeof closeBtn.onclick === 'function') {
+      if (typeof event.preventDefault === 'function') event.preventDefault();
+      closeBtn.onclick(event);
+    }
+    return;
+  }
+  if (key !== 'Enter' || isPopupEnterReserved(event.target)) return;
+  const primary = getPopupPrimaryButton(overlay);
+  if (!primary) return;
+  if (typeof event.preventDefault === 'function') event.preventDefault();
+  if (typeof primary.click === 'function') primary.click();
+  else if (typeof primary.onclick === 'function') primary.onclick(event);
+}
+
 function createPopup(titleText, originElement = null, onClose = null) {
+  // The transform origin is read before the focus moves into the popup.
+  const origin = originElement || document.activeElement;
+  replaceOpenPopupsTitled(titleText);
+
   const overlay = document.createElement('div');
   overlay.className = 'popup-overlay';
   
@@ -10741,7 +10848,6 @@ function createPopup(titleText, originElement = null, onClose = null) {
   };
   content.appendChild(closeBtn);
   
-  const origin = originElement || document.activeElement;
   if (origin && typeof origin.getBoundingClientRect === 'function') {
     const rect = origin.getBoundingClientRect();
     if (rect.width > 0 && rect.height > 0) {
@@ -10761,7 +10867,9 @@ function createPopup(titleText, originElement = null, onClose = null) {
   content.appendChild(btnContainer);
   
   overlay.appendChild(content);
+  overlay.onkeydown = (event) => handlePopupKeydown(overlay, event, closeBtn);
   document.body.appendChild(overlay);
+  focusPopupContent(content);
   return overlay;
 }
 
@@ -12511,7 +12619,7 @@ function groupSearchLogRowsByTask(orderedRows) {
 // silently.
 // ---------------------------------------------------------------------------
 
-const MAP_TRACKING_COLUMN_HINT = 'Map Tracking is on: the miles of searcher track inside each task\'s segment take the place of Num of Sweeps x segment length x team count in the PSR maths ("tracks" instead of "num of sweeps"; the team count is not used). Sweep-count reminders are off. Switch Map Tracking off to use the typed Num of Sweeps again.';
+const MAP_TRACKING_COLUMN_HINT = 'Map Tracking is on: the miles of searcher track inside each task\'s segment take the place of Num of Sweeps x segment length x team count in the PSR maths ("tracks" instead of "num of sweeps"; the team count is not used). Miles walked in a segment that has no task yet lower that segment\'s PSRc directly. Sweep-count reminders are off. Switch Map Tracking off to use the typed Num of Sweeps again.';
 const MAP_TRACKING_OFF_HINT = 'Map Tracking is off: the typed Num of Sweeps (with the segment length and the team count) drives the PSR maths. Switch it on to use the miles of searcher track inside each task\'s segment instead.';
 // A track whose CalTopo rename failed is not retried for this long, so the
 // 4 s sync polls (which redraw the page) cannot hammer the proxy.
@@ -12541,7 +12649,7 @@ function allocateSearcherTracksForBundle(bundle = null) {
     if (typeof utils.allocateSearcherTracks === 'function') {
         return utils.allocateSearcherTracks(b ? b.searcherTracks : [], b && b.pages ? b.pages.page4 : []);
     }
-    return {byTask: {}, tracks: [], ambiguousTasks: []};
+    return {byTask: {}, tracks: [], ambiguousTasks: [], unassignedBySegment: {}};
 }
 
 // The track miles a task gets; with a region / segment named, only the
@@ -12552,6 +12660,32 @@ function getTaskTrackMiles(allocation, taskTag, region, segment) {
     const tag = normalizeSearchTaskTag(taskTag);
     const entry = allocation && allocation.byTask && tag ? allocation.byTask[tag] : null;
     return entry && Number.isFinite(entry.miles) ? entry.miles : 0;
+}
+
+// The miles of searcher track walked inside a segment that has no task (yet):
+// with Map Tracking on they search the segment off on their own, so the PSRc
+// of a segment nobody was assigned to still falls for the ground covered.
+// Once a task is logged on the segment the allocation hands the miles to the
+// task and this is 0 again - nothing is counted twice.
+function getSegmentUnassignedTrackMiles(allocation, region, segment) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getSegmentUnassignedTrackMiles === 'function') return utils.getSegmentUnassignedTrackMiles(allocation, region, segment);
+    return 0;
+}
+
+// The portions behind getSegmentUnassignedTrackMiles: [{trackId, miles, home}].
+function getSegmentUnassignedTrackPortions(allocation, region, segment) {
+    const utils = getMapSegmentUtils();
+    if (typeof utils.getSegmentUnassignedTrackPortions === 'function') return utils.getSegmentUnassignedTrackPortions(allocation, region, segment);
+    return [];
+}
+
+// Whether a track of the allocation was already imported at `ts` (the charts
+// walk the hours): a track without a usable import stamp always counts.
+function isSearcherTrackImportedBy(allocation, trackId, ts) {
+    const entry = allocation && Array.isArray(allocation.tracks) ? allocation.tracks.find(t => t.id === trackId) : null;
+    const stamp = entry && entry.track && entry.track.importedAt ? new Date(entry.track.importedAt).getTime() : NaN;
+    return !Number.isFinite(stamp) || !Number.isFinite(ts) || stamp <= ts;
 }
 
 function isTrackLikeMapFeature(feature) {
@@ -12724,6 +12858,32 @@ function appendTrackMilesTag(container, cell, taskNum, allocation, row = null) {
     container.appendChild(tagEl);
 }
 
+// The tag riding a Segments page PSRc pill while Map Tracking is on: the
+// miles of searcher track walked in this segment although no task has been
+// assigned to it - they search the segment off on their own (the tooltip
+// names the tracks). Nothing is added for a segment with a task (its rows
+// carry the miles) or without any idle miles.
+function appendUnassignedTrackMilesTag(container, cell, segmentRow, allocation) {
+    const region = Array.isArray(segmentRow) ? String(segmentRow[0] || '').trim() : '';
+    const segment = Array.isArray(segmentRow) ? String(segmentRow[1] || '').trim() : '';
+    if (!segment) return;
+    const portions = getSegmentUnassignedTrackPortions(allocation, region, segment);
+    const miles = portions.reduce((sum, portion) => sum + portion.miles, 0);
+    if (!(miles > 0)) return;
+    const lines = portions.map(portion => {
+        const owner = (allocation.tracks || []).find(t => t.id === portion.trackId);
+        return `${owner ? getSearcherTrackLabel(owner) : portion.trackId}: ${formatTrackMiles(portion.miles)}`;
+    });
+    const summary = `Map Tracking: ${formatTrackMiles(miles)} of searcher track were walked in ${segment} although no task is assigned to it. They search the segment off on their own (sweep width ${segmentRow[4] || 'n/a'}); a task logged on ${segment} takes them over.\n${lines.join('\n')}`;
+    cell.title = summary;
+    const tagEl = document.createElement('span');
+    tagEl.className = 'track-miles-tag';
+    tagEl.textContent = formatTrackMiles(miles);
+    tagEl.title = summary;
+    container.classList.add('has-track-tag');
+    container.appendChild(tagEl);
+}
+
 // The red question mark on a Task # whose segment carries another assignment
 // too: the imported tracks in that segment could belong to either. Clicking
 // it opens the picker for the (first) undecided track.
@@ -12753,7 +12913,7 @@ function buildTrackPortionPill(portion) {
     pill.textContent = `${portion.task ? `${portion.task}-` : ''}${portion.segment} ${formatTrackMiles(portion.miles)}`;
     pill.title = portion.task
         ? `${formatTrackMiles(portion.miles)} inside segment ${portion.segment} count toward task ${portion.task}${portion.home ? ' (the track\'s home segment)' : ' (the latest task of that segment)'}.`
-        : `${formatTrackMiles(portion.miles)} inside segment ${portion.segment}: no task has been assigned to that segment yet, so they wait for the next one.`;
+        : `${formatTrackMiles(portion.miles)} inside segment ${portion.segment}: no task has been assigned to that segment yet, so with Map Tracking on they lower the segment's PSRc directly; the next task logged there takes them over.`;
     return pill;
 }
 
@@ -12904,7 +13064,7 @@ function renderSearcherTracksTable(bundle, allocation, mapTracking) {
             if (undecided) parts.push(`${undecided} track${undecided === 1 ? ' needs' : 's need'} a task # (red question mark).`);
         }
         parts.push(mapTracking
-            ? 'Map Tracking is on: these miles stand in for Num of Sweeps x segment length x team count in the PSR maths.'
+            ? 'Map Tracking is on: these miles stand in for Num of Sweeps x segment length x team count in the PSR maths; miles in a segment without a task lower its PSRc directly.'
             : 'Map Tracking is off: the typed Num of Sweeps drives the PSR maths; switch it on to use these miles.');
         status.textContent = parts.join(' ');
         status.classList.toggle('is-on', !!mapTracking);
@@ -13723,11 +13883,43 @@ function calculateHourlyMetrics(startTimeTs, endTimeTs) {
                 }
             });
 
+            // Map Tracking: the miles walked in a segment that has no task search
+            // it off as well (the segment's own sweep width), counting the tracks
+            // imported by this hour (a track without a stamp always counts) - as
+            // recalculateEverything does for the PSRc.
+            let idleSearched = false;
+            if (mapTracking && area > 0) {
+                const segSweepWidth = parseNumeric(segRow[4]);
+                const idleMiles = getSegmentUnassignedTrackPortions(trackAllocation, regionName, segmentName)
+                    .filter(portion => isSearcherTrackImportedBy(trackAllocation, portion.trackId, currentTs))
+                    .reduce((sum, portion) => sum + portion.miles, 0);
+                if (idleMiles > 0 && segSweepWidth > 0) {
+                    const spacing = (area / 640 / idleMiles) * 5280;
+                    const coverage = segSweepWidth / spacing;
+                    const pod = 1 - Math.exp(-coverage);
+                    const pos = currentPOC * pod;
+                    segTotalPOS += pos;
+                    currentPOC = currentPOC - pos;
+                    currentPSR = (length / timePerSweep) * segSweepWidth * currentPOC / area;
+                    idleSearched = true;
+                    hourMetrics.push({
+                        region: regionName,
+                        segment: segmentName,
+                        spacing: spacing,
+                        coverage: coverage,
+                        pod: pod,
+                        pos: pos,
+                        psrc: currentPSR,
+                        poca: currentPOC
+                    });
+                }
+            }
+
             totalPOS += segTotalPOS;
-            totalPSRc += (logs.length > 0) ? currentPSR : psri;
+            totalPSRc += (logs.length > 0 || idleSearched) ? currentPSR : psri;
             
             // If no logs, still record current state for POCa/PSRc
-            if (logs.length === 0) {
+            if (logs.length === 0 && !idleSearched) {
                 hourMetrics.push({
                     region: regionName,
                     segment: segmentName,

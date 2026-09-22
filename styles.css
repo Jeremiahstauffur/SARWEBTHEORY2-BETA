@@ -1503,6 +1503,13 @@ footer {
   box-shadow: 0 24px 64px rgba(0,0,0,0.4);
 }
 
+/* createPopup moves the keyboard focus onto the popup itself (so the button
+   that opened it cannot be re-fired by Enter / Space); no focus ring for that. */
+.popup-content:focus,
+.popup-content:focus-visible {
+  outline: none;
+}
+
 .popup-title {
   font-size: 1.4rem;
   font-weight: 700;

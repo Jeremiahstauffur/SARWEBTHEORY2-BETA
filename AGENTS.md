@@ -221,6 +221,18 @@ bundle = {
   importable (the unaccounted panel is three tables). Every change goes through
   `saveSearcherTracksChange` (deferred save → `recalculateEverything({colorSyncDelay: 0})`). Plan:
   `.junie/plans/search-log-map-tracking.md`; test: `test_search_log_map_tracking.js`.
+  **Routes = tracks (2026-09-22).** Every CalTopo line is the same search effort: a class naming a track
+  (`AppTrack`, `LiveTrack`, `Track` — `isTrackClassName`) is a `route` in `getFeatureCategoryKey` /
+  `getFeatureTypeKey` *before* the geometry is looked at (a track delivered as a `GeometryCollection` used to be
+  filed as a `shape` and refused for import); `gpstype: TRACK` lines are labelled `Track`. **Segments without a
+  task are searched off too:** `allocateSearcherTracks` also returns `unassignedBySegment` (the portions whose
+  segment has no Search Log task; `getSegmentUnassignedTrackMiles` / `getSegmentUnassignedTrackPortions`), and
+  with the switch on `recalculateEverything` step 4 applies `share *= e^-z`, `z = calculateSearchCoverage({area,
+  sweepWidth: <segment sweep, column 4>, trackMiles})`, to such a segment (the charts do the same per hour for
+  the tracks imported by then, `isSearcherTrackImportedBy`). The Segments page PSRc pill then carries a
+  `.track-miles-tag` (`appendUnassignedTrackMilesTag`). As soon as a task is logged on the segment the
+  allocation hands the miles to the task and the segment term is 0 — nothing is counted twice. Plan:
+  `.junie/plans/tracks-unassigned-psrc-and-single-popup.md`.
 - **Maps page tools — "Auto Draw Segments" / "Trim Tracks"** (two buttons beside *Fetch Shapes*; `app.js`
   section "Maps page tools", maths in `map-segment-utils.js`). Neither adds a bundle key: both write to the
   CalTopo map through `caltopo_api_call` and then update the case's copy of the map (`maps[0].features`) at
@@ -371,7 +383,7 @@ to use, read from `process.env` per request), `/api/health` (also carries it), `
 
 - **Nav changes go through `update_nav.ps1`.** Edit `$navTemplate` / `$bottomNavTemplate`, run the
   script; it regex-replaces `<nav>…</nav>` in every `*.html`. Hand-editing one page desyncs the rest.
-- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260924`).
+- **Cache-busting:** every `<script>`/`<link>` include carries `?v=YYYYMMDD` (currently `20260925`).
   When you change `app.js`, `styles.css`, `sync-delta.js`, `map-segment-utils.js` or `theme-boot.js`,
   bump the stamp in **all** HTML files (search `?v=`).
 - **Panel grids:** `.home-grid` is 2 columns (Segments page), `.home-grid.settings-grid` is 3 equal
@@ -418,6 +430,17 @@ to use, read from `process.env` per request), `/api/health` (also carries it), `
   `rebuildTeamAssignmentLabels(bundle)` so the labels follow. A tool that replaces segments (Auto Draw, Merge)
   goes through `replaceSegmentsPageRows` + `repointSearchLogSegments` + `remeasureSearcherTracks` and saves via
   `saveSearcherTracksChange` (deferred save → `recalculateEverything({colorSyncDelay: 0})`).
+- **Every popup is built by `createPopup(title, origin, onClose)`** — never hand-roll a `.popup-overlay`
+  (`test_popup_single_instance.js` pins the single `className = 'popup-overlay'`). `createPopup` (a) removes an
+  open popup with the **same title** before creating the new one (`replaceOpenPopupsTitled`; a fading one is
+  left to its timer), (b) moves the keyboard focus onto `.popup-content` (`tabindex=-1`, `focusPopupContent`) so
+  the button that opened it cannot be re-fired by Enter / Space, and (c) wires `overlay.onkeydown` →
+  `handlePopupKeydown`: **Enter clicks the first enabled `.popup-btn.primary`** of `.popup-buttons`, Escape
+  clicks the ✕. So: the confirm button of a popup must carry `popup-btn primary` (and only the confirm), and
+  Enter is left alone on buttons / links / textareas / selects / contentEditable / search boxes
+  (`isPopupEnterReserved`: `type="search"` or a placeholder saying "search"). Two popups with **different**
+  titles may still stack (Set Server over Login). Need a second popup of the same title open at once? Give it
+  a different title.
 - **New server table?** Create it in `initDatabaseSchema` (MySQL DDL, `ENGINE=InnoDB … utf8mb4`),
   add to `COLLECTION_TABLES`/`SINGLE_TABLES` so `/api/v1/tables` exposes it, include it in the
   whole-case delete, and extend `test_structured_tables.js`.
@@ -756,6 +779,25 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   (7) A sticky footer with the hovered CalTopo segment was asked for and is **not possible**: the map is a
   cross-origin iframe and CalTopo's embed has no hover / postMessage API — say so rather than fake it.
   (plan: `maps-auto-draw-segments-and-trim-tracks.md`, Round 2)
+- **2026-09-22 — Incident Times popup opened twice on Enter / Space; tracks vs routes; idle track miles.**
+  (1) Symptom: pressing Enter or Space in the "Set Enroute - <name>" prompt stacked another copy of it.
+  Cause: `createPopup` never moved the focus, so the `<button>` that opened the popup kept it and the browser's
+  Enter (click on keydown) / Space (click on keyup) re-fired its `onclick`; **every** popup opened from a
+  focused button had the latent fault. Rule: fix such things in `createPopup`, not in the caller — it now
+  focuses `.popup-content`, replaces a same-titled open popup and maps Enter → `.popup-btn.primary` (§5).
+  Read `document.activeElement` for the animation origin *before* moving the focus. Testing pattern:
+  `test_popup_single_instance.js` extracts the popup helpers by name (as `test_toast_stack_position.js`
+  does) into a fake DOM whose `focus()` tracks `document.activeElement` and whose `click()` runs `onclick`.
+  (2) "Tracks are not importable like routes": no code path named the class, but `getFeatureCategoryKey`
+  looked at the geometry first, so a track CalTopo hands over as a `GeometryCollection` was a `shape` (not
+  importable). Rule: a track class (`/track/i`) decides before the geometry, and `isTrackLikeFeature`
+  (any line that is not an Assignment) stays the import filter. (3) Idle track miles: the allocation's
+  "wait for the next task" left a walked-but-unassigned segment at its PSRi. Rule: whatever is *not* given to
+  a task goes to the segment (`unassignedBySegment`), applied once in `recalculateEverything` step 4 with the
+  **segment's** sweep width (there is no task sweep width to use); the term is 0 the moment a task exists on
+  the segment, so the two paths never overlap. Test trap: `allocateSearcherTracks(null, null)` was pinned as an
+  exact object — a new key on the allocation breaks that `deepStrictEqual`; extend it rather than drop it.
+  (plan: `tracks-unassigned-psrc-and-single-popup.md`)
 
 ---
 
@@ -881,6 +923,21 @@ Manual UI checks have no automation: state exactly what you clicked and on which
   line in the tracks table but its generic columns (Max Dim / Area / W x H) were left as they are; only
   the unaccounted panel got the Searchers Tracks columns. (9) The "…not imported as segments" wording of
   the unaccounted notification is pinned by two suites and was left, although a route now reads oddly there.
+  (10) Idle track miles (2026-09-22): a segment with no task is searched off with its **own** sweep width
+  (Segments column 4) — a blank sweep width there means no reduction (the tag still shows the miles). The
+  charts count an idle portion from the track's `importedAt` on (a track without a stamp always counts), so
+  a chart range that ends before the import shows no reduction; the task path is not gated by import time.
+  The Search Log page itself shows nothing for idle miles (only the Searchers Tracks pill tooltip and the
+  Segments page tag) — the row-less segment has no place in the log table. `MAP_TRACKING_COLUMN_HINT`,
+  the tracks status line and the "unassigned" pill tooltip say the miles lower the PSRc directly.
+- Popup follow-ups (2026-09-22): (1) Enter confirms **any** popup whose confirm button is `.popup-btn.primary`
+  — that includes destructive confirmations (Delete is the primary of `confirmDeleteRow`), which is the
+  usual dialog convention but is new here. (2) A popup with two `.primary` buttons gets the first enabled one
+  on Enter; none has two today. (3) Escape now closes every popup like the ✕ (runs `onClose`); the Login popup's
+  `onCancel` re-opens itself after 300 ms as it always did for the ✕. (4) Space is not mapped to anything on
+  the focused popup. (5) The dedupe is by exact title text — two legitimately different popups sharing one
+  title would replace each other; none do today. (6) The static `#remove-voter-columns-modal` on the Regions
+  page is not a `createPopup` popup (display-toggled markup) and is outside this behaviour.
 - Auto Draw Segments follow-ups: (1) slices are **equal-area strips**, not shape-aware (a long thin or very
   concave outline can leave narrow or many-pieced slices; a strip cut in two by a concave outline becomes
   two numbered shapes — no minimum-width or merge rule). (2) Holes in the source polygon are ignored (outer

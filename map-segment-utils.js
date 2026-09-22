@@ -9,11 +9,24 @@
 })(typeof window !== 'undefined' ? window : null, function () {
     'use strict';
 
+    // A CalTopo class that names a recorded or live track (AppTrack, LiveTrack,
+    // Track): the line is a route for every purpose here, whatever its
+    // geometry says - routes and tracks are one and the same search effort.
+    function isTrackClassName(value) {
+        return /track/i.test(String(value || ''));
+    }
+
     function getFeatureTypeKey(feature) {
         const attrs = feature?.attributes || feature?.properties || {};
         const geomType = (feature?.geometry && feature?.geometry.type) || attrs.class || attrs.type || '';
         
-        if (attrs.class === 'Assignment' || attrs.type === 'Assignment' || attrs.assignment || geomType === 'Assignment' || geomType === 'Polygon' || geomType === 'GeometryCollection' || geomType === 'Shape') {
+        if (attrs.class === 'Assignment' || attrs.type === 'Assignment' || attrs.assignment || geomType === 'Assignment') {
+            return 'assignment';
+        }
+        if (isTrackClassName(attrs.class) || isTrackClassName(attrs.type)) {
+            return 'route';
+        }
+        if (geomType === 'Polygon' || geomType === 'GeometryCollection' || geomType === 'Shape') {
             return 'assignment';
         }
         if (geomType === 'LineString' || geomType === 'Polyline' || geomType === 'Line' || geomType === 'Route' || geomType === 'Track') {
@@ -148,6 +161,10 @@
         const classOrType = rawClass || (rawType !== 'feature' ? rawType : '');
 
         if (classOrType === 'assignment' || attrs.assignment) return 'assignment';
+        // A recorded / live track class wins over the geometry: CalTopo may hand
+        // a track over as a GeometryCollection of lines, which would otherwise
+        // be filed as a shape and refused for import.
+        if (isTrackClassName(classOrType)) return 'route';
         if (classOrType === 'marker' || geomType === 'point' || geomType === 'multipoint') return 'marker';
         if (classOrType === 'route' || classOrType === 'track' || classOrType === 'line' || classOrType === 'polyline'
             || geomType === 'linestring' || geomType === 'multilinestring' || geomType === 'polyline' || geomType === 'line') {
@@ -1418,12 +1435,14 @@
     }
 
     // 'Track' for a line recorded or live-tracked in the field (CalTopo's
-    // AppTrack / LiveTrack classes, or points that carry timestamps), 'Route'
-    // for a line somebody drew.
+    // AppTrack / LiveTrack classes, a line whose GPS type is TRACK, or points
+    // that carry timestamps), 'Route' for a line somebody drew. The label is
+    // information only: both kinds are measured and counted the same way.
     function getTrackTypeLabel(feature) {
         const attrs = (feature && (feature.attributes || feature.properties)) || {};
         const cls = String(attrs.class || attrs.type || '').toLowerCase();
         if (/track/.test(cls)) return 'Track';
+        if (String(attrs.gpstype || attrs.gpsType || '').trim().toLowerCase() === 'track') return 'Track';
         if (Array.isArray(attrs.timestamps) && attrs.timestamps.length) return 'Track';
         const paths = getLineStringPaths(feature && feature.geometry);
         if (paths.some(path => path.some(pt => pt.length >= 4 && Number.isFinite(pt[3])))) return 'Track';
@@ -1698,13 +1717,18 @@
     //                  home}], displayName}
     //   ambiguousTasks the tasks that share a home segment with an ambiguous
     //                  track (they get the red question mark)
+    //   unassignedBySegment {'<region>|<segment>': {region, segment, miles,
+    //                  portions: [{trackId, miles, home}]}} - the miles walked
+    //                  in segments that carry no task (yet): they search that
+    //                  segment off directly (see getSegmentUnassignedTrackMiles)
     // The home segment is the one with the most miles. Its tasks are the
     // Search Log rows for that segment, oldest first; the planner's pick
     // (assignedTask) wins when it is one of them, a single task is taken as
     // is, several make the track ambiguous and the latest gets the miles for
-    // now, none leaves the miles unallocated until a task exists. The miles
-    // in every other segment go to that segment's latest task (or wait for
-    // the next one). displayName carries the "#task-segment " code.
+    // now, none leaves the miles with the segment itself until a task exists
+    // (the task then takes them over). The miles in every other segment go to
+    // that segment's latest task, or likewise to the segment itself while it
+    // has none. displayName carries the "#task-segment " code.
     function allocateSearcherTracks(tracks, searchLogRows) {
         const list = normalizeSearcherTracks(tracks);
         const taskNumber = tag => parseInt(String(tag).replace('#', ''), 10) || 0;
@@ -1725,6 +1749,7 @@
         };
 
         const byTask = {};
+        const unassignedBySegment = {};
         const ambiguousTasks = [];
         const allocated = list.map(track => {
             const ordered = track.segmentMiles.slice().sort((a, b) => b.miles - a.miles);
@@ -1750,13 +1775,39 @@
                     if (!byTask[portionTask]) byTask[portionTask] = {miles: 0, portions: []};
                     byTask[portionTask].miles += portion.miles;
                     byTask[portionTask].portions.push({trackId: track.id, region: portion.region, segment: portion.segment, miles: portion.miles, home: isHome});
+                } else if (portion.miles > 0) {
+                    const key = segmentKey(portion.region, portion.segment);
+                    if (!unassignedBySegment[key]) unassignedBySegment[key] = {region: portion.region, segment: portion.segment, miles: 0, portions: []};
+                    unassignedBySegment[key].miles += portion.miles;
+                    unassignedBySegment[key].portions.push({trackId: track.id, miles: portion.miles, home: isHome});
                 }
                 return {region: portion.region, segment: portion.segment, miles: portion.miles, task: portionTask, home: isHome};
             });
             const displayName = task && home ? formatSearcherTrackName(task, home.segment, track.baseName) : track.baseName;
             return {id: track.id, track, home, homeTasks, task, ambiguous, portions, displayName};
         });
-        return {byTask, tracks: allocated, ambiguousTasks};
+        return {byTask, tracks: allocated, ambiguousTasks, unassignedBySegment};
+    }
+
+    // The miles of searcher track walked inside a segment that has no task
+    // (0 when it has one - the task owns the miles then, or when nothing was
+    // walked there). With Map Tracking on these miles search the segment off
+    // on their own, so a segment nobody was assigned to still loses PSRc for
+    // the ground that was covered.
+    function getSegmentUnassignedTrackMiles(allocation, region, segment) {
+        const entry = getSegmentUnassignedEntry(allocation, region, segment);
+        return entry && Number.isFinite(entry.miles) ? entry.miles : 0;
+    }
+
+    // The portions behind getSegmentUnassignedTrackMiles: [{trackId, miles, home}].
+    function getSegmentUnassignedTrackPortions(allocation, region, segment) {
+        const entry = getSegmentUnassignedEntry(allocation, region, segment);
+        return entry && Array.isArray(entry.portions) ? entry.portions.slice() : [];
+    }
+
+    function getSegmentUnassignedEntry(allocation, region, segment) {
+        if (!allocation || !allocation.unassignedBySegment || !String(segment === undefined || segment === null ? '' : segment).trim()) return null;
+        return allocation.unassignedBySegment[segmentKey(region, segment)] || null;
     }
 
     // The track miles a task gets from an allocation (0 without any). With a
@@ -2595,6 +2646,9 @@
         searchLogRowTimestamp,
         allocateSearcherTracks,
         getTaskTrackMiles,
+        getSegmentUnassignedTrackMiles,
+        getSegmentUnassignedTrackPortions,
+        isTrackClassName,
         getFeatureTypeKey,
         getCalTopoApiObjectType,
         captureCalTopoFeatureStyle,

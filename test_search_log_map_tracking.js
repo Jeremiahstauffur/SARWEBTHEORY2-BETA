@@ -109,6 +109,23 @@ check('isTrackLikeFeature / getTrackTypeLabel: lines are tracks or routes, assig
     assert.strictEqual(utils.getTrackTypeLabel(trackFeature('T', 't', 'LiveTrack')), 'Track');
     const stamped = {geometry: {type: 'LineString', coordinates: [[...at(0, 0), 0, 1700000000], [...at(1, 0), 0, 1700000060]]}, attributes: {id: 's', name: 'S', class: 'Shape'}};
     assert.strictEqual(utils.getTrackTypeLabel(stamped), 'Track', 'timestamped points mean a recorded track');
+    const gpsTrack = {geometry: {type: 'LineString', coordinates: [at(0, 0), at(1, 0)]}, attributes: {id: 'g', name: 'G', class: 'Shape', gpstype: 'TRACK'}};
+    assert.strictEqual(utils.getTrackTypeLabel(gpsTrack), 'Track', 'a CalTopo line whose GPS type is TRACK');
+
+    // Routes and tracks are one and the same search effort: every line class
+    // is a route for import purposes, whatever its geometry says.
+    const collection = {type: 'GeometryCollection', geometries: [{type: 'LineString', coordinates: [at(0, 0), at(1, 0)]}]};
+    [['Shape', {type: 'LineString', coordinates: [at(0, 0), at(1, 0)]}], ['AppTrack', {type: 'LineString', coordinates: [at(0, 0), at(1, 0)]}],
+     ['LiveTrack', {type: 'MultiLineString', coordinates: [[at(0, 0), at(1, 0)]]}], ['AppTrack', collection], ['Track', collection]].forEach(([cls, geometry]) => {
+        const feature = {geometry, attributes: {id: 'x', name: 'X', class: cls}};
+        assert.strictEqual(utils.getFeatureCategoryKey(feature), 'route', `${cls} + ${geometry.type} is a route`);
+        assert.strictEqual(utils.getFeatureTypeKey(feature), 'route', `${cls} + ${geometry.type} is a route (type key)`);
+        assert.strictEqual(utils.getFeatureImportTarget(feature), 'track', `${cls} + ${geometry.type} imports as a searcher track`);
+        assert.strictEqual(utils.isTrackLikeFeature(feature), true, `${cls} + ${geometry.type} is track-like`);
+    });
+    assert.strictEqual(utils.getFeatureCategoryKey({geometry: collection, attributes: {id: 'x', name: 'X', class: 'Shape'}}), 'shape', 'a plain Shape collection is still a shape');
+    assert.strictEqual(utils.isTrackClassName('LiveTrack'), true);
+    assert.strictEqual(utils.isTrackClassName('Shape'), false);
     assert.strictEqual(utils.isTrackLikeFeature(SEG_4D_SHAPE), false, 'an assignment polygon');
     const lineAssignment = {geometry: {type: 'LineString', coordinates: [at(0, 0), at(1, 0)]}, attributes: {id: 'la', name: 'Trail', class: 'Assignment'}};
     assert.strictEqual(utils.isTrackLikeFeature(lineAssignment), false, 'a line assignment is a segment, not a searcher track');
@@ -249,17 +266,37 @@ check('allocateSearcherTracks: the home segment (most miles) decides the task; t
     assert.strictEqual(utils.getTaskTrackMiles(null, '#1'), 0);
 
     // Two tracks add up on the same task; a portion in a segment without a
-    // task waits (no task, no miles for anyone).
+    // task goes to no task - it stays with the segment itself.
     const two = utils.allocateSearcherTracks([...tracks, TRACK('t2', 'Team 2', [{region: 'R1', segment: '4D', miles: 0.7}, {region: 'R1', segment: '4B', miles: 0.2}])], rows);
     near(two.byTask['#1'].miles, 1.7, 1e-9, 'both tracks searched 4D');
     assert.strictEqual(two.tracks[1].portions[1].task, '', '4B has no task yet');
     assert.strictEqual(Object.keys(two.byTask).includes(''), false);
+    assert.deepStrictEqual(plain(two.unassignedBySegment), {'r1|4b': {region: 'R1', segment: '4B', miles: 0.2, portions: [{trackId: 't2', miles: 0.2, home: false}]}}, 'the 4B miles are the segment\'s own');
+    assert.deepStrictEqual(plain(allocation.unassignedBySegment), {}, 'every segment walked had a task');
+    near(utils.getSegmentUnassignedTrackMiles(two, 'R1', '4B'), 0.2, 1e-9, 'the miles walked in 4B, which has no task');
+    near(utils.getSegmentUnassignedTrackMiles(two, 'r1', ' 4b '), 0.2, 1e-9, 'matched like the task rows: case and blanks do not matter');
+    assert.strictEqual(utils.getSegmentUnassignedTrackMiles(two, 'R1', '4D'), 0, '4D has a task: its miles belong to #1');
+    assert.strictEqual(utils.getSegmentUnassignedTrackMiles(two, 'R2', '4B'), 0, 'another region\'s 4B is another segment');
+    assert.strictEqual(utils.getSegmentUnassignedTrackMiles(two, 'R1', ''), 0);
+    assert.strictEqual(utils.getSegmentUnassignedTrackMiles(null, 'R1', '4B'), 0);
+    assert.deepStrictEqual(plain(utils.getSegmentUnassignedTrackPortions(two, 'R1', '4B')), [{trackId: 't2', miles: 0.2, home: false}]);
+    assert.deepStrictEqual(utils.getSegmentUnassignedTrackPortions(two, 'R1', '4D'), []);
+    // A track whose HOME segment has no task leaves its home miles with that
+    // segment; once a task is logged there the task takes them over.
+    const homeless = utils.allocateSearcherTracks([TRACK('t4', 'Team 4', [{region: 'R1', segment: '4B', miles: 0.9}, {region: 'R1', segment: '4D', miles: 0.1}])], rows);
+    assert.strictEqual(homeless.tracks[0].task, '');
+    near(utils.getSegmentUnassignedTrackMiles(homeless, 'R1', '4B'), 0.9, 1e-9, 'the home miles stay with 4B');
+    assert.deepStrictEqual(plain(utils.getSegmentUnassignedTrackPortions(homeless, 'R1', '4B')), [{trackId: 't4', miles: 0.9, home: true}]);
+    near(utils.getTaskTrackMiles(homeless, '#1'), 0.1, 1e-9, 'the 4D spill-over still goes to #1');
+    const taskLater = utils.allocateSearcherTracks([TRACK('t4', 'Team 4', [{region: 'R1', segment: '4B', miles: 0.9}])], [...rows, ROW('#6', '09-01-2026', '12:00', '4B')]);
+    assert.strictEqual(utils.getSegmentUnassignedTrackMiles(taskLater, 'R1', '4B'), 0, 'a task on 4B now owns the miles');
+    near(utils.getTaskTrackMiles(taskLater, '#6'), 0.9, 1e-9);
     // A track outside every segment has no home and no task.
     const nowhere = utils.allocateSearcherTracks([TRACK('t3', 'Lost', [])], rows).tracks[0];
     assert.strictEqual(nowhere.home, null);
     assert.strictEqual(nowhere.task, '');
     assert.strictEqual(nowhere.displayName, 'Lost');
-    assert.deepStrictEqual(utils.allocateSearcherTracks(null, null), {byTask: {}, tracks: [], ambiguousTasks: []});
+    assert.deepStrictEqual(utils.allocateSearcherTracks(null, null), {byTask: {}, tracks: [], ambiguousTasks: [], unassignedBySegment: {}});
 });
 
 check('allocateSearcherTracks: two tasks on the home segment make the track ambiguous - the latest by date/time gets the miles until the planner picks', () => {
@@ -594,6 +631,82 @@ check('the switch off leaves the classic formula alone; on, the task\'s track mi
     empty.recalculateEverything();
     assert.strictEqual(logRow(empty, '#1')[6], PSR_BEFORE.toFixed(4));
     assert.strictEqual(psrc(empty)['4D'], PSR_BEFORE.toFixed(4));
+});
+
+check('a segment without a task is searched off by the miles walked in it (switch on); a task logged there takes them over', async () => {
+    // Only 4D has a task; the track spent 0.4 mi in 4C, which has none.
+    const tracks = [TRACK('trk-1', 'Team 1', [{region: 'R1', segment: '4D', miles: 1.0}, {region: 'R1', segment: '4C', miles: 0.4}])];
+    const onlyFirst = () => [ROW('#1', '09-01-2026', '08:00', '4D', 'Team A (2)', '100 ft', '2')];
+
+    const off = createSandbox({store: seedStore({tracks, searchLog: onlyFirst()}), fetch: createServer().fetch});
+    off.recalculateEverything();
+    assert.strictEqual(psrc(off)['4C'], PSR_BEFORE.toFixed(4), 'switch off: a segment without a task keeps its PSRi');
+
+    const on = createSandbox({store: seedStore({tracks, tracking: true, searchLog: onlyFirst()}), fetch: createServer().fetch});
+    on.recalculateEverything();
+    assert.strictEqual(psrc(on)['4D'], trackedAfter(1.0), 'the task\'s segment as before');
+    assert.strictEqual(psrc(on)['4C'], trackedAfter(0.4), 'switch on: the 0.4 mi walked in 4C lower its PSRc although no task is assigned to it (segment sweep width)');
+    assert.ok(parseFloat(psrc(on)['4C']) < PSR_BEFORE, 'lower than the PSRi');
+
+    // The segment's own sweep width drives the term: a wider sweep searches more off.
+    const wide = createSandbox({store: seedStore({tracks, tracking: true, searchLog: onlyFirst()}), fetch: createServer().fetch});
+    const wideBundle = wide.loadBundle();
+    wideBundle.pages.page2.find(row => row[1] === '4C')[4] = '200 ft';
+    await wide.saveBundle(wideBundle);
+    wide.recalculateEverything();
+    const wideExpected = ((1 / 2 * 200 * 0.3) / (640 / 640) * Math.exp(-(200 / ((640 / 640 / 0.4) * 5280)))).toFixed(4);
+    assert.strictEqual(psrc(wide)['4C'], wideExpected, 'PSRc with a 200 ft sweep: PSR x e^-z with z from 200 ft and 0.4 mi');
+
+    // A task logged on 4C afterwards owns the miles: the task row searches them
+    // off and the segment is not searched off a second time.
+    const later = createSandbox({store: seedStore({tracks, tracking: true}), fetch: createServer().fetch});
+    later.recalculateEverything();
+    assert.strictEqual(psrc(later)['4C'], trackedAfter(0.4), 'the same PSRc, now through task #2');
+    assert.strictEqual(logRow(later, '#2')[6], trackedAfter(0.4), 'the task row carries the miles');
+    assert.strictEqual(logRow(later, '#2')[5], PSR_BEFORE.toFixed(4), 'PSR before is the untouched PSRi: nothing was counted twice');
+
+    // No miles anywhere in a segment without a task: nothing changes for it.
+    const none = createSandbox({store: seedStore({tracking: true, searchLog: onlyFirst(), tracks: [TRACK('trk-1', 'Team 1', [{region: 'R1', segment: '4D', miles: 1.0}])]}), fetch: createServer().fetch});
+    none.recalculateEverything();
+    assert.strictEqual(psrc(none)['4C'], PSR_BEFORE.toFixed(4));
+
+    // The charts agree: 4C adds the POS of its 0.4 mi although it has no log.
+    const start = new Date(2026, 8, 1, 7, 0).getTime();
+    const end = new Date(2026, 8, 1, 12, 0).getTime();
+    const metrics = on.calculateHourlyMetrics(start, end)[10];
+    const pod = miles => 1 - Math.exp(-(100 / ((640 / 640 / miles) * 5280)));
+    near(metrics.totalPOS, 0.3 * pod(1.0) + 0.3 * pod(0.4), 1e-9, 'POS of 4D (task) plus 4C (no task, 0.4 mi walked)');
+    const seg4c = metrics.segments.find(s => s.segment === '4C');
+    near(seg4c.spacing, (640 / 640 / 0.4) * 5280, 1e-9, 'the spacing from the idle miles');
+    near(seg4c.poca, 0.3 * (1 - pod(0.4)), 1e-9);
+    assert.strictEqual(off.calculateHourlyMetrics(start, end)[10].segments.find(s => s.segment === '4C').pos, 0, 'switch off: nothing');
+    // A track imported after the hour does not count yet.
+    const stampedTracks = [Object.assign(TRACK('trk-1', 'Team 1', [{region: 'R1', segment: '4C', miles: 0.4}]), {importedAt: new Date(2026, 8, 1, 11, 0).toISOString()})];
+    const stamped = createSandbox({store: seedStore({tracks: stampedTracks, tracking: true, searchLog: onlyFirst()}), fetch: createServer().fetch});
+    const hours = stamped.calculateHourlyMetrics(start, end);
+    assert.strictEqual(hours[0].segments.find(s => s.segment === '4C').pos, 0, 'at 07:00 the track was not imported yet');
+    near(hours[10].segments.find(s => s.segment === '4C').pos, 0.3 * pod(0.4), 1e-9, 'at 12:00 it counts');
+
+    // The Segments page: the PSRc pill of 4C carries the miles tag, 4D (a task) does not.
+    const page = createSandbox({store: seedStore({tracks, tracking: true, searchLog: onlyFirst()}), fetch: createServer().fetch, page: 'page2'});
+    page.buildSegmentsTable();
+    await settle();
+    assert.deepStrictEqual(page.__logs.error, [], `no errors while rendering: ${page.__logs.error.join(' | ')}`);
+    const segRows = renderedRows(page);
+    const row4c = segRows.find(r => r['Segment'] && r['Segment'].pill.textContent === '4C');
+    const row4d = segRows.find(r => r['Segment'] && r['Segment'].pill.textContent === '4D');
+    const tag4c = row4c['PSRc'].extras.find(el => el.classList.contains('track-miles-tag'));
+    assert.ok(tag4c, 'the idle miles tag is on the PSRc pill of 4C');
+    assert.strictEqual(tag4c.textContent, '0.40 mi');
+    assert.ok(/no task is assigned/.test(tag4c.title) && /Team 1: 0.40 mi/.test(tag4c.title), 'the tooltip explains and names the track');
+    assert.ok(row4c['PSRc'].container.classList.contains('has-track-tag'));
+    assert.strictEqual(row4d['PSRc'].extras.filter(el => el.classList.contains('track-miles-tag')).length, 0, '4D has a task: no tag');
+    assert.strictEqual(row4c['PSRc'].pill.textContent, trackedAfter(0.4));
+    const pageOff = createSandbox({store: seedStore({tracks, searchLog: onlyFirst()}), fetch: createServer().fetch, page: 'page2'});
+    pageOff.buildSegmentsTable();
+    await settle();
+    const off4c = renderedRows(pageOff).find(r => r['Segment'] && r['Segment'].pill.textContent === '4C');
+    assert.strictEqual(off4c['PSRc'].extras.filter(el => el.classList.contains('track-miles-tag')).length, 0, 'switch off: no tag');
 });
 
 check('the charts follow: with the switch on a task without track miles adds no POS, one with miles does', () => {
